@@ -1,0 +1,15 @@
+# cache
+__pycache__/
+
+# data
+data/
+
+# output
+attn_output/
+
+# dcgen
+dcgen/
+
+# conda env
+conda_env/
+stage_env2/
