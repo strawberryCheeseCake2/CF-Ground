@@ -26,6 +26,7 @@ from crop import run_segmentation
 SEED: int = 0
 
 # GPU visibility (e.g., "0", "0,1", "2,3", "1,2,3"...)
+# nvidia-smi 하고 사용할 GPU 넣기
 CUDA_VISIBLE: str = "2,3"
 
 # HF device map / memory hints
@@ -42,6 +43,8 @@ mllm_path: str = "zonghanHZH/ZonUI-3B"
 screenspot_imgs: str = "./data/screenspotv2_imgs"
 screenspot_test: str = "./data"
 save_dir: str = "./attn_output/q50_r20_thumb_s2_agg20_try2/eval_res"
+
+TEST_SAMPLE_LIMIT: int = 12  # test data 개수 (None이면 제한 없이 전체 데이터를 사용)
 
 # Flags
 sampling: bool = False
@@ -382,7 +385,8 @@ def run_stage(msgs, crop_list, top_q, drop_indices: List, attn_vis_dir: str):
     # Step 1. thre 넘은 crop(top_q crop) 가져오기
     top_q_crop_ids = get_top_q_crop_ids(top_q=top_q, attn_df=df)
         
-    print(f"instruction: {instruction}, selected crops: {top_q_crop_ids}")
+    # 전역 의존 최소화: 메시지만 출력
+    print(f"selected crops: {top_q_crop_ids}")
 
     # Get top-q bboxes
     top_q_bboxes = []
@@ -419,9 +423,9 @@ for task in tasks:
     dataset = "screenspot_" + task + "_v2.json"
     screenspot_data = json.load(open(os.path.join(screenspot_test, dataset), 'r'))
     # vanilla_qwen_data = json.load(open(os.path.join(args.screenspot_test, "vanilla_qwen_screenspot_mobile.json"), 'r'))
-    # screenspot_data = screenspot_data[:150]
-    # screenspot_data = screenspot_data[:100]
-    # screenspot_data = screenspot_data[:12]
+    # 테스트 데이터 개수 제한 적용 (None이면 전체 데이터 사용)
+    if TEST_SAMPLE_LIMIT is not None:
+        screenspot_data = screenspot_data[:TEST_SAMPLE_LIMIT]
 
     print("Num of sample: " + str(len(screenspot_data)), flush=True)
     
@@ -489,9 +493,8 @@ for task in tasks:
         original_bbox = [original_bbox[0], original_bbox[1], original_bbox[0] + original_bbox[2], original_bbox[1] + original_bbox[3]]
        
         bbox = original_bbox
-        # item_res['original_bbox'] = copy.copy(original_bbox)
-
-        # item_res['bbox'] = copy.copy(original_bbox)
+        item_res['original_bbox'] = original_bbox.copy()
+        item_res['bbox'] = original_bbox.copy()
 
         question = question_template.format(task_prompt=instruction)        
         
@@ -612,7 +615,9 @@ for task in tasks:
         for crop_id in s1_top_q_crop_ids:
             print(f"[Stage 2 - crop{crop_id} from stage 1]")
             s1_selected_crop = next((c for c in crop_list if c.get('id') == crop_id), None)
-            if crop is None:
+            # if crop is None:
+            if s1_selected_crop is None:
+                print(f"crop_id {crop_id} not found; skip")
                 continue  
             
             thumbnail_crop = next((c for c in crop_list if c.get('level') == 0), None)

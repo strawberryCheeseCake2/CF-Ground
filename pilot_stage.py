@@ -465,7 +465,7 @@ for task in tasks:
     # vanilla_qwen_data = json.load(open(os.path.join(args.screenspot_test, "vanilla_qwen_screenspot_mobile.json"), 'r'))
     # screenspot_data = screenspot_data[:150]
     # screenspot_data = screenspot_data[:100]
-    # screenspot_data = screenspot_data[:12]
+    screenspot_data = screenspot_data[:12]
 
     print("Num of sample: " + str(len(screenspot_data)), flush=True)
     
