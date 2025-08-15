@@ -1,0 +1,64 @@
+# conda env create -p ./conda_env -f environment.yml
+# conda activate ./conda_env
+
+#! 아직 수정중 - 불필요한거 없애려고 작은 거부터 설치하면서 필요한거만 설치 후 yml화할 예정
+
+name: cf-ground
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+  - defaults
+dependencies:
+  # Python 및 기본 패키지
+  - python=3.10
+  - pip
+  - numpy<2.0
+  - pandas=2.2.1
+  - pillow=10.2.0
+  - matplotlib
+  - tqdm=4.66.2
+  - scikit-image
+  - scikit-learn
+  - flask=3.0.3
+  - pyqt=5
+  - lxml=5.2.2
+  - requests
+  - ipykernel
+  - ipywidgets
+
+  # PyTorch 및 CUDA
+  - pytorch=2.1.2
+  - pytorch-cuda=12.1
+  - torchvision  # vision_process.py에서 사용됨
+
+  # 추가 패키지
+  - selenium=4.18.1
+  - rapidfuzz=3.6.2
+  - transformers=4.49.0
+  - accelerate=1.8.1
+  - deepspeed=0.13.1
+  - bitsandbytes=0.43.1
+  - ninja
+  - opencv
+  - tensorboard
+  - nltk
+  - jupyterlab
+
+  # pip로 설치해야 하는 패키지
+  - pip:
+      - qwen-vl-utils
+      - pillow-avif-plugin==1.4.3
+      - google-generativeai
+      - BeautifulSoup4
+      - httpx==0.27.2
+      - openai==1.13.3
+      - anthropic
+      - peft==0.14.0
+      - datasets
+      - ultralytics
+      - wandb
+      - pycocotools
+      - packaging  # vision_process.py에서 사용됨
+      - decord  # 선택적 비디오 처리
+      - torchcodec  # 선택적 비디오 디코딩
