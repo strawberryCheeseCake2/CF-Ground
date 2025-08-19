@@ -1,7 +1,7 @@
 import os
 
 os.environ["CUDA_DEVICE_ORDER"]="PCI_BUS_ID"
-os.environ["CUDA_VISIBLE_DEVICES"]= "2,3"  # 몇번 GPU 사용할지 ("0,1", "2" 등)
+os.environ["CUDA_VISIBLE_DEVICES"]= "0, 1"  # 몇번 GPU 사용할지 ("0,1", "2" 등)
 max_memory = {
     0: "75GiB",
     1: "75GiB",
@@ -27,12 +27,13 @@ from PIL import Image, ImageDraw, ImageFont
 import pandas as pd
 from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor, AutoTokenizer, set_seed
 from qwen_vl_utils import process_vision_info
-from crop import run_segmentation_recursive
+from crop2 import run_segmentation_recursive
 import torch.nn.functional as F
 from collections import deque
 import matplotlib.patches as patches
 from matplotlib.lines import Line2D
 import time
+import shutil
 
 #! Argument =======================
 
@@ -45,7 +46,7 @@ SEED = 0
 MLLM_PATH = "zonghanHZH/ZonUI-3B"
 SCREENSPOT_IMGS = "./data/screenspotv2_imgs"  # input image 경로
 SCREENSPOT_TEST = "./data"  # json파일 경로
-SAVE_DIR = "./attn_output/" + "0819_crop"  #! 결과 저장 경로 (방법을 바꾼다면 바꿔서 기록하기)
+SAVE_DIR = "./attn_output/" + "0820_crop"  #! 결과 저장 경로 (방법을 바꾼다면 바꿔서 기록하기)
 
 # Data Processing
 SAMPLING = False  # data 섞을지
@@ -916,11 +917,35 @@ def visualize_aggregated_attention(
     # --- Grounding Accuracy 측정 로직 ---
     is_grounding_success = False
     highest_point = None
+    
+    # 시각화와 동일한 방식으로 highest_point 계산
+    #! 이거 시각화는 영역으로 했는데, 기존코드는 제일 높은 점 찍어버렸었음.
+    # if aggregated_attention_map.max() > 0:
+    #     max_yx = np.unravel_index(np.argmax(aggregated_attention_map, axis=None), aggregated_attention_map.shape)
+    #     highest_point = (max_yx[1], max_yx[0])
+    #     is_grounding_success = point_in_bbox(highest_point, gt_bbox)
+    #     print(f"Highest attention point (Grounding Point): {highest_point}, GT bbox: {gt_bbox}, Success: {is_grounding_success}")
+
     if aggregated_attention_map.max() > 0:
-        max_yx = np.unravel_index(np.argmax(aggregated_attention_map, axis=None), aggregated_attention_map.shape)
-        highest_point = (max_yx[1], max_yx[0])
-        is_grounding_success = point_in_bbox(highest_point, gt_bbox)
-        print(f"Highest attention point (Grounding Point): {highest_point}, GT bbox: {gt_bbox}, Success: {is_grounding_success}")
+        normalized_map = aggregated_attention_map / aggregated_attention_map.max()
+        if np.any(normalized_map > 0):
+            threshold = np.percentile(normalized_map[normalized_map > 0], 99)
+        else:
+            threshold = 1.0
+        
+        # 어텐션이 높은 영역들 찾기
+        temp_bounding_boxes = find_bounding_boxes_from_heatmap(normalized_map, threshold=threshold)
+        
+        if temp_bounding_boxes:
+            # 가장 높은 confidence를 가진 bbox 선택
+            highest_bbox = max(temp_bounding_boxes, key=lambda x: x[1])
+            bbox_left, bbox_top, bbox_right, bbox_bottom = highest_bbox[0]
+            # bbox 중심점을 grounding point로 사용 (시각화와 동일)
+            highest_point = (int((bbox_left + bbox_right) / 2), int((bbox_top + bbox_bottom) / 2))
+            is_grounding_success = point_in_bbox(highest_point, gt_bbox)
+            print(f"Highest attention point (Grounding Point): {highest_point}, GT bbox: {gt_bbox}, Success: {is_grounding_success}")
+        else:
+            print("No high-attention regions found. Grounding failed.")
     else:
         print("Aggregated attention map is all zeros. Grounding failed.")
 
@@ -967,7 +992,6 @@ def visualize_aggregated_attention(
     bbox_left, bbox_top, bbox_right, bbox_bottom = highest_bbox[0]
     highest_point = [(bbox_left + bbox_right) / 2, (bbox_top + bbox_bottom) / 2]
     
-    # --- 수정된 코드 시작 ---
     # 가장 높은 어텐션 포인트(Grounding Point)를 노란 별표로 표시
     if highest_point is not None:
         ax.plot(highest_point[0], highest_point[1], 'y*', markersize=15, markeredgecolor='black')
@@ -981,8 +1005,6 @@ def visualize_aggregated_attention(
                               markerfacecolor='yellow', markeredgecolor='black', markersize=15)
         handles.append(yellow_star)
     ax.legend(handles=handles, loc='best')
-    # --- 수정된 코드 끝 ---
-
     ax.axis('off')
     ax.set_title("Final Result: Attention Map, Grounding, and Ground Truth")
     plt.tight_layout()
@@ -1244,6 +1266,27 @@ task instruction, a screen observation, guess where should you tap.
                     save_dir=s2_save_dir,
                     gt_bbox=original_bbox # gt_bbox 전달
                 )
+
+                # 각 inst_dir_name마다 성공 여부에 따라 디렉토리 이름 변경
+                new_inst_dir_name = f"{inst_dir_name} {'✅' if final_success else '❌'}"
+                new_dir = os.path.join(seg_save_base_dir, filename_wo_ext, new_inst_dir_name)
+                # 기존에 동일한 이름의 폴더가 있으면 삭제
+                if os.path.exists(new_dir):
+                    try:
+                        shutil.rmtree(new_dir)  # 폴더 삭제
+                        print(f"Existing directory '{new_dir}' removed.")
+                    except Exception as e:
+                        print(f"Failed to remove existing directory '{new_dir}': {e}")
+
+                # 디렉토리 이름 변경
+                if os.path.exists(dir):
+                    try:
+                        os.rename(dir, new_dir)
+                        print(f"Directory renamed to: {new_dir}")
+                    except Exception as e:
+                        print(f"Failed to rename directory: {e}")
+                else:
+                    print(f"Directory does not exist: {dir}")
 
                 # res_board_dict[2]["is_gt_in_top_q"] 변수명을 is_grounding_success 등으로 바꿔도 좋지만,
                 # 일단 기존 변수명을 재활용하여 점수 리스트에 추가합니다.
