@@ -2,7 +2,7 @@ import os
 import json
 from PIL import Image
 
-from dcgen.utils import *
+from dcgen.utils import ImgSegmentation
 
 def crop_and_save(image_path: str, json_path: str, output_dir: str, start_id: int):
     """
@@ -66,7 +66,7 @@ def run_segmentation(image_path: str, max_depth: int, window_size: int,
     - MAX_VAR_THRESH: 재시도 시 상한
     """
     #! Segmentation 재시도 하이퍼파라미터
-    MAX_VAR_THRESH = 5000  #! var_thresh 상한 (요청: 최대 3500)
+    MAX_VAR_THRESH = 3000  # var_thresh 상한 (120 -> 600 -> 3000)
 
     attempt = 0
     # 요청: 항상 var_thresh으로 시작, 크롭이 없을 때만 두 배로 증가
