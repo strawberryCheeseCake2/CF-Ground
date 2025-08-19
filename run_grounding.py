@@ -1,10 +1,10 @@
 import os
 
 os.environ["CUDA_DEVICE_ORDER"]="PCI_BUS_ID"
-os.environ["CUDA_VISIBLE_DEVICES"]= "3"  # 몇번 GPU 사용할지 ("0,1", "2" 등)
+os.environ["CUDA_VISIBLE_DEVICES"]= "2,3"  # 몇번 GPU 사용할지 ("0,1", "2" 등)
 max_memory = {
     0: "75GiB",
-    # 1: "75GiB",
+    1: "75GiB",
     # 2: "75GiB",
     "cpu": "120GiB",  # 남는 건 CPU 오프로딩xs
 }
@@ -45,7 +45,7 @@ SEED = 0
 MLLM_PATH = "zonghanHZH/ZonUI-3B"
 SCREENSPOT_IMGS = "./data/screenspotv2_imgs"  # input image 경로
 SCREENSPOT_TEST = "./data"  # json파일 경로
-SAVE_DIR = "./attn_output/" + "0819_noise"  #! 결과 저장 경로 (방법을 바꾼다면 바꿔서 기록하기)
+SAVE_DIR = "./attn_output/" + "0819_crop"  #! 결과 저장 경로 (방법을 바꾼다면 바꿔서 기록하기)
 
 # Data Processing
 SAMPLING = False  # data 섞을지
@@ -333,9 +333,11 @@ def run_refinement_pass(crop_list: List, question: str, original_image: Image, s
         use_thumbnail=True
     )
 
+    os.makedirs(f"{seg_save_base_dir}/{filename_wo_ext}/{inst_dir_name}/s2_processed", exist_ok=True)
     for _crop in s2_resized_crop_list:
-        os.makedirs(f"{seg_save_base_dir}/{filename_wo_ext}/{inst_dir_name}/s2_processed/crop{_crop['id']}", exist_ok=True)
-        _crop['resized_img'].save(f"{seg_save_base_dir}/{filename_wo_ext}/{inst_dir_name}/s2_processed/crop{_crop['id']}/{_crop['id']}.png")
+        # os.makedirs(f"{seg_save_base_dir}/{filename_wo_ext}/{inst_dir_name}/s2_processed/crop{_crop['id']}", exist_ok=True)
+        # _crop['resized_img'].save(f"{seg_save_base_dir}/{filename_wo_ext}/{inst_dir_name}/s2_processed/crop{_crop['id']}/{_crop['id']}.png")
+        _crop['resized_img'].save(f"{seg_save_base_dir}/{filename_wo_ext}/{inst_dir_name}/s2_processed/crop{_crop['id']}.png")
 
 
     msgs_s2 = create_msgs(crop_list=s2_resized_crop_list, question=question)
