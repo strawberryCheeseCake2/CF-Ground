@@ -1,21 +1,9 @@
 import os
-
-os.environ["CUDA_DEVICE_ORDER"]="PCI_BUS_ID"
-os.environ["CUDA_VISIBLE_DEVICES"]= "3"  # 몇번 GPU 사용할지 ("0,1", "2" 등)
-max_memory = {
-    0: "75GiB",
-    # 1: "75GiB",
-    # 2: "75GiB",
-    "cpu": "120GiB",  # 남는 건 CPU 오프로딩xs
-}
-
-
 import matplotlib.pyplot as plt
 import numpy as np
 from pathlib import Path
 from typing import List, Dict, Tuple
 from copy import deepcopy
-
 import re
 import argparse
 import sys
@@ -27,7 +15,7 @@ from PIL import Image, ImageDraw, ImageFont
 import pandas as pd
 from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor, AutoTokenizer, set_seed
 from qwen_vl_utils import process_vision_info
-from crop3 import run_segmentation_recursive
+from crop4 import run_segmentation_recursive  #! crop
 import torch.nn.functional as F
 from collections import deque
 import matplotlib.patches as patches
@@ -40,13 +28,20 @@ import shutil
 SEED = 0
 
 # Enviroment
-
+os.environ["CUDA_DEVICE_ORDER"]="PCI_BUS_ID"
+os.environ["CUDA_VISIBLE_DEVICES"]= "0"  # 몇번 GPU 사용할지 ("0,1", "2" 등)
+max_memory = {
+    0: "75GiB",
+    # 1: "75GiB",
+    # 2: "75GiB",
+    "cpu": "120GiB",  # 남는 건 CPU 오프로딩xs
+}
 
 # Dataset & Model
 MLLM_PATH = "zonghanHZH/ZonUI-3B"
 SCREENSPOT_IMGS = "./data/screenspotv2_imgs"  # input image 경로
 SCREENSPOT_TEST = "./data"  # json파일 경로
-SAVE_DIR = "./attn_output/" + "0820_crop3"  #! 결과 저장 경로 (방법을 바꾼다면 바꿔서 기록하기)
+SAVE_DIR = "./attn_output/" + "0820_crop4"  #! 결과 저장 경로 (방법을 바꾼다면 바꿔서 기록하기)
 
 # Data Processing
 SAMPLING = False  # data 섞을지
@@ -833,180 +828,275 @@ def collect_maps_and_sink_counts(
     return crop_list
 
 
-def visualize_aggregated_attention(
-        # attn_output, 
-        crop_list,
-        original_image, processor, save_path, gt_bbox, individual_maps_dir=None):
+from PIL import Image as PILImage
+# -----------------------
+# 유틸리티: 기본 연산들
+# -----------------------
+def upsample_att_map(att_map_low_res: np.ndarray, size):
     """
-    가장 높은 어텐션 포인트(Grounding Point)를 기준으로 성공 여부를 판단하고,
-    시각화 시 해당 포인트와 예측 BBox, Ground Truth BBox를 모두 표시합니다.
+    Pillow를 이용한 bilinear 업샘플 (size=(H, W))
+    입력/출력 모두 float32 유지
     """
-    if not os.path.exists(os.path.dirname(save_path)):
-        os.makedirs(os.path.dirname(save_path))
+    h, w = size
+    # 안전장치: 음수/NaN 제거
+    m = np.nan_to_num(att_map_low_res.astype(np.float32), nan=0.0, neginf=0.0, posinf=0.0)
+    if m.size == 0:
+        return np.zeros((h, w), dtype=np.float32)
+    # 값 범위를 일단 0 이상으로 클램프
+    m[m < 0] = 0.0
+    im = PILImage.fromarray(m)
+    im = im.resize((w, h), resample=PILImage.BILINEAR)
+    out = np.array(im).astype(np.float32)
+    # scale에 따라 값이 약간 변할 수 있어 0 이상으로 재클램프
+    out[out < 0] = 0.0
+    return out
 
+def point_in_bbox(point, bbox):
+    """
+    point: (x, y)
+    bbox: (left, top, right, bottom)
+    경계 포함
+    """
+    x, y = point
+    l, t, r, b = bbox
+    return (l <= x <= r) and (t <= y <= b)
+
+def boxfilter_sum(arr: np.ndarray, r: int):
+    """
+    정사각 윈도우 반경 r에 대한 합(box filter) 결과 반환.
+    r=0이면 입력 그대로. O(1) 쿼리를 위해 2D 적분영상 사용.
+    """
+    if r <= 0:
+        return arr.astype(np.float32, copy=True)
+    H, W = arr.shape
+    a = arr.astype(np.float32, copy=False)
+    integral = np.cumsum(np.cumsum(a, axis=0), axis=1)
+
+    def rect_sum(y1, x1, y2, x2):
+        y1 = max(0, y1); x1 = max(0, x1)
+        y2 = min(H - 1, y2); x2 = min(W - 1, x2)
+        A = integral[y2, x2]
+        B = integral[y1 - 1, x2] if y1 > 0 else 0.0
+        C = integral[y2, x1 - 1] if x1 > 0 else 0.0
+        D = integral[y1 - 1, x1 - 1] if (y1 > 0 and x1 > 0) else 0.0
+        return A - B - C + D
+
+    out = np.empty_like(a, dtype=np.float32)
+    for i in range(H):
+        for j in range(W):
+            out[i, j] = rect_sum(i - r, j - r, i + r, j + r)
+    return out
+
+# -----------------------
+# 히트맵에서 BBox 추출
+# -----------------------
+def find_bounding_boxes_from_heatmap(heatmap: np.ndarray, threshold: float):
+    """
+    heatmap >= threshold 인 영역을 바이너리로 보고
+    간단한 4-이웃 연결요소를 찾은 뒤, 각 컴포넌트의 bbox와 confidence를 반환.
+    confidence는 컴포넌트 내부 heat 평균값으로 정의.
+    리턴: [((l, t, r, b), confidence), ...] (confidence 내림차순 정렬)
+    """
+    H, W = heatmap.shape
+    mask = (heatmap >= threshold).astype(np.uint8)
+    visited = np.zeros_like(mask, dtype=np.uint8)
+
+    def neighbors(y, x):
+        # 4-이웃
+        if y > 0: yield (y - 1, x)
+        if y < H - 1: yield (y + 1, x)
+        if x > 0: yield (y, x - 1)
+        if x < W - 1: yield (y, x + 1)
+
+    boxes = []
+    for i in range(H):
+        for j in range(W):
+            if mask[i, j] == 1 and visited[i, j] == 0:
+                # BFS/DFS
+                stack = [(i, j)]
+                visited[i, j] = 1
+                ys, xs = [], []
+                vals = []
+                while stack:
+                    y, x = stack.pop()
+                    ys.append(y); xs.append(x)
+                    vals.append(float(heatmap[y, x]))
+                    for ny, nx in neighbors(y, x):
+                        if mask[ny, nx] == 1 and visited[ny, nx] == 0:
+                            visited[ny, nx] = 1
+                            stack.append((ny, nx))
+                if len(xs) > 0:
+                    t = min(ys); b = max(ys)
+                    l = min(xs); r = max(xs)
+                    # (left, top, right, bottom) with inclusive pixels => +1 보정 안함(시각화는 폭/높이에서 자동으로 +1不要)
+                    confidence = float(np.mean(vals)) if len(vals) > 0 else 0.0
+                    boxes.append(((l, t, r, b), confidence))
+    # confidence 내림차순 정렬
+    boxes.sort(key=lambda x: x[1], reverse=True)
+    return boxes
+
+# -----------------------
+# 메인 함수 (neighsum 방식)
+# -----------------------
+def visualize_aggregated_attention(
+        crop_list,
+        original_image, processor, save_path, gt_bbox, individual_maps_dir=None,
+        # 아래는 간단 튜닝 파라미터
+        neigh_radius=2,          #! 반경 N: 1->3x3, 2->5x5, 3->7x7
+        bbox_top_percent=98,     #! 상위 q% 임계(낮출수록 더 넓게 잡음, 예: 95~98 권장)
+        use_levels=(0, 1, 2),       # 어떤 crop level만 합칠지
+        star_marker_size=15      # 시각화용 별 크기
+    ):
+    """
+    crop_list: 각 crop dict에 다음 키가 있다고 가정
+      - 'bbox': (left, top, right, bottom) in original image coords
+      - 'att_avg_masked': (h', w')의 낮은 해상도 주의맵 (numpy)
+      - 'level': 정수 레벨(필터링용, 기본: 0/1만 사용)
+      - 'id': (선택) 시각화 저장시 파일명 표기용
+    original_image: PIL.Image
+    processor: (사용안함. 시그니처 호환용)
+    save_path: 최종 시각화 저장 경로
+    gt_bbox: (left, top, right, bottom)
+    individual_maps_dir: (선택) 각 crop attention upsample 시각화 저장 디렉토리
+    neigh_radius: 이웃 합 boxfilter 반경
+    bbox_top_percent: 히트맵 상위 q%를 threshold로 사용
+    """
+
+    # 출력 폴더
+    if not os.path.exists(os.path.dirname(save_path)):
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
     if individual_maps_dir:
         os.makedirs(individual_maps_dir, exist_ok=True)
 
+    # 캔버스 준비
     original_width, original_height = original_image.size
     aggregated_attention_map = np.zeros((original_height, original_width), dtype=np.float32)
 
-    image_inputs, _ = process_vision_info(create_msgs(crop_list, ""))
-    img_proc_out = processor.image_processor(images=image_inputs)
-    grid = img_proc_out["image_grid_thw"]
-    
-    
-    if grid.ndim == 3:
-        grid = grid[0]
-    img_patch_shapes = [(t, h//2, w//2) for t, h, w in grid]
+    # 각 crop을 원본 좌표계에 합성
+    for crop in crop_list:
+        if 'bbox' not in crop or 'att_avg_masked' not in crop:
+            continue
+        if ('level' in crop) and (crop['level'] not in use_levels):
+            continue
 
+        left, top, right, bottom = map(int, crop['bbox'])
+        cw = max(0, right - left)
+        ch = max(0, bottom - top)
+        if cw == 0 or ch == 0:
+            continue
 
-    for i, crop in enumerate(crop_list):
-        
+        att_low = crop['att_avg_masked']
+        att_up = upsample_att_map(att_low, size=(ch, cw))
 
-        crop_span = crop["token_span"]
-        # get average attention
-        # att_avg_low_res = get_mean_att_map(
-        #     model_output=attn_output,
-        #     span=crop_span,
-        #     img_idx=i,
-        #     layer_range=range(AGG_START, LAYER_NUM),
-        #     grid=grid
-        # )
-
-        att_avg_low_res = crop["att_avg_masked"]
-
-        
-        
-
-
-        # Calculate Entropy
-        # entropy = calculate_entropy(att_avg_low_res)
-        # weight = max(0.0, 1/entropy)
-
-
-        # Upsample Attention Map
-        crop_bbox = crop.get("bbox")
-        crop_width = int(crop_bbox[2] - crop_bbox[0])
-        crop_height = int(crop_bbox[3] - crop_bbox[1])
-        if crop_width <= 0 or crop_height <= 0: continue
-
-        att_avg_upscaled = upsample_att_map(att_avg_low_res, size=(crop_height, crop_width))
-
-
-
+        # 개별 맵 저장(옵션)
         if individual_maps_dir:
-            individual_map = np.zeros((original_height, original_width), dtype=np.float32)
-            left, top, right, bottom = map(int, crop_bbox)
-            individual_map[top:bottom, left:right] = att_avg_upscaled
-
+            indiv = np.zeros((original_height, original_width), dtype=np.float32)
+            indiv[top:bottom, left:right] = att_up
             plt.figure(figsize=(10, 10 * original_height / original_width))
             plt.imshow(original_image, extent=(0, original_width, original_height, 0))
-            plt.imshow(individual_map, cmap='viridis', alpha=0.6, extent=(0, original_width, original_height, 0))
+            plt.imshow(indiv, cmap='viridis', alpha=0.6, extent=(0, original_width, original_height, 0))
             plt.axis('off')
-            # plt.title(f"Crop ID: {crop.get('id')}, Level: {crop.get('level')}, Weight: {weight:.2f}")
-            plt.title(f"Crop ID: {crop.get('id')}, Level: {crop.get('level')}")
-            individual_save_path = os.path.join(individual_maps_dir, f"individual_attn_crop_{crop.get('id')}.png")
-            plt.savefig(individual_save_path, dpi=150, bbox_inches='tight', pad_inches=0)
+            ttl = f"Crop ID: {crop.get('id','?')}, Level: {crop.get('level','?')}"
+            plt.title(ttl)
+            path = os.path.join(individual_maps_dir, f"individual_attn_crop_{crop.get('id','unk')}.png")
+            plt.savefig(path, dpi=150, bbox_inches='tight', pad_inches=0)
             plt.close()
 
-        if crop.get("level") == 1 or crop.get("level") == 0:
-            left, top, right, bottom = map(int, crop_bbox)
-            # aggregated_attention_map[top:bottom, left:right] += weight * att_avg_upscaled
-            aggregated_attention_map[top:bottom, left:right] += att_avg_upscaled
+        aggregated_attention_map[top:bottom, left:right] += att_up
 
-    # --- Grounding Accuracy 측정 로직 ---
+    # -----------------------
+    # Grounding 계산 (neighsum)
+    # -----------------------
     is_grounding_success = False
     highest_point = None
-    
-    # 시각화와 동일한 방식으로 highest_point 계산
-    #! 이거 시각화는 영역으로 했는데, 기존코드는 제일 높은 점 찍어버렸었음.
-    # if aggregated_attention_map.max() > 0:
-    #     max_yx = np.unravel_index(np.argmax(aggregated_attention_map, axis=None), aggregated_attention_map.shape)
-    #     highest_point = (max_yx[1], max_yx[0])
-    #     is_grounding_success = point_in_bbox(highest_point, gt_bbox)
-    #     print(f"Highest attention point (Grounding Point): {highest_point}, GT bbox: {gt_bbox}, Success: {is_grounding_success}")
+    highest_bbox = None
 
     if aggregated_attention_map.max() > 0:
-        normalized_map = aggregated_attention_map / aggregated_attention_map.max()
-        if np.any(normalized_map > 0):
-            threshold = np.percentile(normalized_map[normalized_map > 0], 97)  #! 97로 바꿔봄
-        else:
-            threshold = 1.0
-        
-        # 어텐션이 높은 영역들 찾기
-        temp_bounding_boxes = find_bounding_boxes_from_heatmap(normalized_map, threshold=threshold)
-        
-        if temp_bounding_boxes:
-            # 가장 높은 confidence를 가진 bbox 선택
-            highest_bbox = max(temp_bounding_boxes, key=lambda x: x[1])
-            bbox_left, bbox_top, bbox_right, bbox_bottom = highest_bbox[0]
-            # bbox 중심점을 grounding point로 사용 (시각화와 동일)
-            highest_point = (int((bbox_left + bbox_right) / 2), int((bbox_top + bbox_bottom) / 2))
+        # 정규화
+        normalized = aggregated_attention_map / (aggregated_attention_map.max() + 1e-8)
+
+        # 이웃 합으로 스무딩
+        smoothed = boxfilter_sum(normalized, neigh_radius)
+
+        # bbox 추출용 임계값 (상위 q%)
+        thr = np.percentile(smoothed, bbox_top_percent)
+        temp_bboxes = find_bounding_boxes_from_heatmap(smoothed, threshold=thr)
+
+        if temp_bboxes:
+            highest_bbox = max(temp_bboxes, key=lambda x: x[1])
+            (l, t, r, b) = highest_bbox[0]
+            highest_point = (int((l + r) / 2), int((t + b) / 2))
             is_grounding_success = point_in_bbox(highest_point, gt_bbox)
-            print(f"Highest attention point (Grounding Point): {highest_point}, GT bbox: {gt_bbox}, Success: {is_grounding_success}")
+            print(f"[neighsum] Grounding Point: {highest_point}, GT: {gt_bbox}, Success: {is_grounding_success}")
         else:
-            print("No high-attention regions found. Grounding failed.")
+            # 컴포넌트가 없으면 최댓값 좌표로 대체
+            best_idx = int(np.argmax(smoothed))
+            H, W = smoothed.shape
+            pi, pj = divmod(best_idx, W)
+            highest_point = (int(pj), int(pi))
+            is_grounding_success = point_in_bbox(highest_point, gt_bbox)
+            print(f"[neighsum-fallback] Point: {highest_point}, GT: {gt_bbox}, Success: {is_grounding_success}")
     else:
         print("Aggregated attention map is all zeros. Grounding failed.")
 
-    # --- 시각화 ---
+    # -----------------------
+    # 시각화
+    # -----------------------
     fig, ax = plt.subplots(figsize=(10, 10 * original_height / original_width))
     ax.imshow(original_image, extent=(0, original_width, original_height, 0))
-    ax.imshow(aggregated_attention_map, cmap='viridis', alpha=0.6, extent=(0, original_width, original_height, 0))
+    ax.imshow(aggregated_attention_map, cmap='viridis', alpha=0.6,
+              extent=(0, original_width, original_height, 0))
 
+    # 시각화용 bbox는 동일한 neighsum 기준으로 표시
     if aggregated_attention_map.max() > 0:
-        normalized_map = aggregated_attention_map / aggregated_attention_map.max()
+        normalized = aggregated_attention_map / (aggregated_attention_map.max() + 1e-8)
+        smoothed = boxfilter_sum(normalized, neigh_radius)
+        thr_vis = np.percentile(smoothed, bbox_top_percent)
+        bounding_boxes = find_bounding_boxes_from_heatmap(smoothed, threshold=thr_vis)
     else:
-        normalized_map = aggregated_attention_map
+        bounding_boxes = []
 
-    if np.any(normalized_map > 0):
-        threshold = np.percentile(normalized_map[normalized_map > 0], 99)
-    else:
-        threshold = 1.0
-    
-    # 어텐션이 높은 여러 영역(Predicted BBox)을 빨간 박스로 표시
-    bounding_boxes = find_bounding_boxes_from_heatmap(normalized_map, threshold=threshold)
     print(f"Found {len(bounding_boxes)} high-attention regions.")
+    if len(bounding_boxes) > 0 and highest_bbox is None:
+        highest_bbox = deepcopy(bounding_boxes[0])
 
-    highest_bbox = deepcopy(bounding_boxes[0])
-
-    for bbox_info in bounding_boxes:
-        coords, confidence = bbox_info
+    # 예측 BBox(빨강) + confidence 표시
+    for coords, conf in bounding_boxes:
         left, top, right, bottom = coords
-        rect = patches.Rectangle((left, top), right - left, bottom - top, linewidth=2, edgecolor='r', facecolor='none')
+        rect = patches.Rectangle((left, top), right - left, bottom - top,
+                                 linewidth=2, edgecolor='r', facecolor='none')
         ax.add_patch(rect)
-        score_text = f'{confidence:.2f}'
-        ax.text(left, top - 5, score_text, color='white', fontsize=8, fontweight='bold',
+        ax.text(left, max(0, top - 5), f'{conf:.2f}', color='white', fontsize=8, fontweight='bold',
                 bbox=dict(facecolor='red', alpha=0.6, edgecolor='none', pad=1))
-        
-        if confidence > highest_bbox[1]:
-            highest_bbox = bbox_info
 
-    # Ground Truth BBox를 초록색 박스로 표시
-    gt_left, gt_top, gt_right, gt_bottom = gt_bbox
-    gt_width = gt_right - gt_left
-    gt_height = gt_bottom - gt_top
-    gt_rect = patches.Rectangle((gt_left, gt_top), gt_width, gt_height, linewidth=3, edgecolor='lime', facecolor='none')
+        if highest_bbox is not None and conf > highest_bbox[1]:
+            highest_bbox = (coords, conf)
+
+    # GT BBox(초록)
+    gl, gt, gr, gb = gt_bbox
+    gt_rect = patches.Rectangle((gl, gt), gr - gl, gb - gt,
+                                linewidth=3, edgecolor='lime', facecolor='none')
     ax.add_patch(gt_rect)
 
-    bbox_left, bbox_top, bbox_right, bbox_bottom = highest_bbox[0]
-    highest_point = [(bbox_left + bbox_right) / 2, (bbox_top + bbox_bottom) / 2]
-    
-    # 가장 높은 어텐션 포인트(Grounding Point)를 노란 별표로 표시
+    # 노란 별(grounding point)
     if highest_point is not None:
-        ax.plot(highest_point[0], highest_point[1], 'y*', markersize=15, markeredgecolor='black')
+        ax.plot(highest_point[0], highest_point[1], 'y*',
+                markersize=star_marker_size, markeredgecolor='black')
 
-    # 범례(Legend) 수정
+    # 범례
     red_patch = patches.Patch(color='red', label='Predicted BBox (High Attention Area)')
     green_patch = patches.Patch(color='lime', label='Ground Truth BBox')
     handles = [red_patch, green_patch]
     if highest_point is not None:
-        yellow_star = Line2D([0], [0], marker='*', color='w', label='Grounding Point (Max Attention)',
-                              markerfacecolor='yellow', markeredgecolor='black', markersize=15)
+        yellow_star = Line2D([0], [0], marker='*', color='w',
+                             label='Grounding Point (Neighborhood Sum)',
+                             markerfacecolor='yellow', markeredgecolor='black',
+                             markersize=star_marker_size)
         handles.append(yellow_star)
     ax.legend(handles=handles, loc='best')
     ax.axis('off')
-    ax.set_title("Final Result: Attention Map, Grounding, and Ground Truth")
+    ax.set_title("Attention (aggregated) + NeighSum BBoxes + Grounding")
+
     plt.tight_layout()
     plt.savefig(save_path, dpi=300, bbox_inches="tight", pad_inches=0)
     plt.close(fig)
