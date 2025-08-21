@@ -328,7 +328,6 @@ def run_segmentation_recursive( image_path: str,
             print(f"[seg] save error: {e}")
 
     # 디버그 출력
-    print(f"[crop] crop count: {running_idx-1}")
-    # print(f"[crop] oversize count (not returned): {len(dump_seen)}")
+    print(f"✂️  Total crop: {running_idx-1}")
 
     return results
