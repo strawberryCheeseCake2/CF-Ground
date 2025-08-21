@@ -26,9 +26,6 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(
 from qwen_vl_utils import process_vision_info
 from crop5 import run_segmentation_recursive  # ! crop
 
-
-#TODO : img_seg.display_tree("path") 로 s1 결과 뽑아보기
-
 #! Argument =======================
 
 SEED = 0
@@ -47,9 +44,7 @@ max_memory = {
 MLLM_PATH = "zonghanHZH/ZonUI-3B"
 SCREENSPOT_IMGS = "./data/screenspotv2_imgs"  # input image 경로
 SCREENSPOT_TEST = "./data"  # json파일 경로
-SAVE_DIR = "./attn_output/" + "0821_crop5"  #! 결과 저장 경로 (방법을 바꾼다면 바꿔서 기록하기)
-
-# Data Processing
+SAVE_DIR = "./attn_output/" + "0821_all"  #! 결과 저장 경로 (방법을 바꾼다면 바꿔서 기록하기)
 SAMPLING = False  # data 섞을지
 TASKS = ["mobile"]
 SAMPLE_RANGE = slice(3,4)  #! 샘플 범위 지정 (3번 샘플이면 3,4 / 5~9번 샘플이면 5,10 / 전체 사용이면 None)
@@ -364,7 +359,6 @@ def run_refinement_pass(crop_list: List, question: str, original_image: Image, s
         layer_range=range(AGG_START, LAYER_NUM), 
         processor=processor, 
         per_map_topn_frac=PER_MAP_TOPN_FRAC,
-
     )
 
     # (2) 이미지별 공통 sink 좌표 Top-K 추출
@@ -418,7 +412,7 @@ def run_refinement_pass(crop_list: List, question: str, original_image: Image, s
     )
     return is_success
 
-def visualize_top_q(save_dir, gt_bbox, top_q_bboxes, instruction, click_point=None):
+def visualize_crop(save_dir, gt_bbox, top_q_bboxes, instruction, filename, click_point=None):
     #! Visualize ground truth and selected crop on the image
     result_img = Image.open(img_path)
 
@@ -449,7 +443,7 @@ def visualize_top_q(save_dir, gt_bbox, top_q_bboxes, instruction, click_point=No
     # Ensure the save directory exists
     os.makedirs(save_dir, exist_ok=True)
     # Save the result image
-    result_path = os.path.join(save_dir ,f"s1_result.png")
+    result_path = os.path.join(save_dir, filename)
     # print(f"Top Q box is saved at : {result_path}")
     result_img.save(result_path)
 
@@ -852,7 +846,7 @@ def visualize_aggregated_attention(
     ax.imshow(aggregated_attention_map, cmap='viridis', alpha=0.6, extent=(0, W, H, 0))
 
     # 그냥 Attention 상태만 저장 -> 가리는거 없이 보이도록.
-    plt.savefig(inst_dir + "/s2_result_only", dpi=300, bbox_inches="tight", pad_inches=0)
+    plt.savefig(inst_dir + "/s2_result_only.png", dpi=300, bbox_inches="tight", pad_inches=0)
 
     # GT 박스(초록)
     gl, gt, gr, gb = gt_bbox
@@ -889,7 +883,7 @@ def visualize_aggregated_attention(
                     path_effects=[pe.withStroke(linewidth=2, foreground='black')])
 
 
-    plt.savefig(inst_dir + "/s2_result_star", dpi=300, bbox_inches="tight", pad_inches=0)
+    plt.savefig(inst_dir + "/s2_result_star.png", dpi=300, bbox_inches="tight", pad_inches=0)
     plt.close(fig)
 
     return bool(is_grounding_success)
@@ -1028,12 +1022,15 @@ task instruction, a screen observation, guess where should you tap.
             print(f"Selected Top Q Crops from Stage 1: {s1_top_q_crop_ids}")
 
             # ==================================================================
+
+            #  Stage 1 | 모든 Crop Visualize
+            all_crops_bboxes = [crop["bbox"] for crop in stage_crop_list]
+            visualize_crop(save_dir=inst_dir, gt_bbox=original_bbox, top_q_bboxes=all_crops_bboxes,
+                            instruction=instruction, filename="s1_all_crop.png", click_point=None)
+            
             # Stage 1 | top Q Visualize + GT가 안에 들어가는지 체크
-            # TODO: inference때는 안씀
-            visualize_top_q(
-                save_dir=inst_dir, gt_bbox=original_bbox, top_q_bboxes=s1_top_q_bboxes,
-                instruction=instruction, click_point=None
-            )
+            visualize_crop(save_dir=inst_dir, gt_bbox=original_bbox, top_q_bboxes=s1_top_q_bboxes,
+                            instruction=instruction, filename="s1_top_q.png", click_point=None)
             s1_is_gt_in_top_q = check_gt_in_top_q_crops(top_q_bboxes=s1_top_q_bboxes, gt_bbox=original_bbox)
 
             res_board_dict[1]["gt_score_list"].append(1 if s1_is_gt_in_top_q else 0)
