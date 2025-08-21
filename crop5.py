@@ -301,8 +301,7 @@ def run_segmentation_recursive( image_path: str,
     results.append({
         "img": original_img,
         "id": 0,
-        "bbox": [0, 0, W, H],
-        "level": 0
+        "bbox": [0, 0, W, H]
     })
 
     # 파일 저장 + id 부여
@@ -318,7 +317,6 @@ def run_segmentation_recursive( image_path: str,
                 "img": crop_img,
                 "id": running_idx,
                 "bbox": b,
-                "level": 1,
                 "recursion_depth": rec,
                 "fail": bool(fail),
                 "filename": fname

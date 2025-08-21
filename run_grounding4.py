@@ -149,19 +149,18 @@ def create_stage_crop_list(crop_list: List, resize_dict: Dict, use_thumbnail: bo
     stage_crop_list = []
 
     for crop in crop_list:
-        crop_level = crop.get("level")
-        if not use_thumbnail and crop_level == 0: continue
+        crop_id = crop.get("id")
+        if not use_thumbnail and crop_id == 0: continue
 
-        # 현재 crop의 level에 맞는 resize 비율을 가져옵니다.
-        ratio = resize_dict.get(crop_level)
-
-        # 만약 level이 resize_dict에 없다면(e.g., None, 2), crop을 누락시키지 않습니다.
-        # 대신, level 1의 비율을 기본값으로 사용합니다.
+        # 썸네일(id=0)은 thumbnail 비율, 나머지는 crop 비율 사용
+        if crop_id == 0:
+            ratio = resize_dict.get("thumbnail")
+        else:
+            ratio = resize_dict.get("crop")
+        
+        # 기본값 설정
         if ratio is None:
-            ratio = resize_dict.get(1) # level 1 비율로 대체
-            if ratio is None: # level 1 비율조차 없다면 경고 후 스킵
-                print(f"Warning: Skipping crop ID {crop.get('id')} due to missing resize ratio for level {crop_level} and no fallback.")
-                continue
+            ratio = resize_dict.get("crop", 0.5)  # 기본값
 
         new_crop = deepcopy(crop)
         crop_img = deepcopy(crop["img"])
@@ -286,11 +285,11 @@ def run_refinement_pass(crop_list: List, question: str, original_image: Image, s
 
     # 1. Stage 2에 맞는 크기로 이미지들을 리사이즈하고 모델 입력을 준비합니다.
     # for crop in crop_list:
-    #     print(f"id: {crop['id']}, level{crop['level']}")
+    #     print(f"id: {crop['id']}")
 
     s2_resized_crop_list = create_stage_crop_list(
         crop_list=crop_list,
-        resize_dict={0: THUMBNAIL_RESIZE_RATIO, 1: S2_RESIZE_RATIO},
+        resize_dict={"thumbnail": THUMBNAIL_RESIZE_RATIO, "crop": S2_RESIZE_RATIO},
         use_thumbnail=True
     )
 
@@ -750,7 +749,6 @@ def visualize_aggregated_attention(
         topk_points = 5,           # 상위 점 개수 (보여주기용)
         min_dist_pix = 200,        # 상위 점 사이 최소 간격 (픽셀)
 
-        use_levels=(0, 1, 2),     # 합칠 crop level
         star_marker_size= 8,      # 별 크기 (1등)
         dot_marker_size = 5,      # 점 크기 (2~5등)
         text_fontsize= 7          # 점수 텍스트 폰트 크기
@@ -777,8 +775,6 @@ def visualize_aggregated_attention(
     for crop in crop_list:
         if 'bbox' not in crop or 'att_avg_masked' not in crop:
             continue
-        if ('level' in crop) and (crop['level'] not in use_levels):
-            continue
 
         left, top, right, bottom = map(int, crop['bbox'])
         cw = max(0, right - left)
@@ -797,7 +793,7 @@ def visualize_aggregated_attention(
             plt.imshow(original_image, extent=(0, W, H, 0))
             plt.imshow(indiv, cmap='viridis', alpha=0.6, extent=(0, W, H, 0))
             plt.axis('off')
-            ttl = f"Crop ID: {crop.get('id','?')}, Level: {crop.get('level','?')}"
+            ttl = f"Crop ID: {crop.get('id','?')}"
             plt.title(ttl)
             path = os.path.join(individual_maps_dir, f"individual_attn_crop_{crop.get('id','unk')}.png")
             plt.savefig(path, dpi=150, bbox_inches='tight', pad_inches=0)
@@ -1022,9 +1018,9 @@ task instruction, a screen observation, guess where should you tap.
 
                 continue
 
-            only_lv_1 = [crop for crop in crop_list if crop.get("level") == 1]
-            if len(only_lv_1) == 0:
-                print(f"No level 1 crops found for {img_path}. Skipping this image.")
+            only_crops = [crop for crop in crop_list if crop.get("id") > 0]  # 썸네일 제외
+            if len(only_crops) == 0:
+                print(f"No crops found for {img_path}. Skipping this image.")
                 num_segmentation_failed += 1
 
                 # >>> ADDED: 실패 라인 남기고 계속 진행
@@ -1050,7 +1046,7 @@ task instruction, a screen observation, guess where should you tap.
 
             stage_crop_list = create_stage_crop_list(
                 crop_list=crop_list,
-                resize_dict={0: THUMBNAIL_RESIZE_RATIO, 1: S1_RESIZE_RATIO},
+                resize_dict={"thumbnail": THUMBNAIL_RESIZE_RATIO, "crop": S1_RESIZE_RATIO},
                 use_thumbnail=True
             )
             stage1_end = time.time()
