@@ -25,6 +25,7 @@ from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor, Auto
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 from qwen_vl_utils import process_vision_info
 from crop5 import run_segmentation_recursive  #! 어떤 crop 파일 사용?
+from iter_logger import init_iter_logger, append_iter_log  # log csv 기록 파일
 
 #! Argument =======================
 
@@ -47,7 +48,7 @@ SCREENSPOT_TEST = "./data"  # json파일 경로
 SAVE_DIR = "./attn_output/" + "0821_all"  #! 결과 저장 경로 (방법을 바꾼다면 바꿔서 기록하기)
 SAMPLING = False  # data 섞을지
 TASKS = ["mobile"]
-SAMPLE_RANGE = slice(all)  #! 샘플 범위 지정 (3번 샘플이면 3,4 / 5~9번 샘플이면 5,10 / 전체 사용이면 None)
+SAMPLE_RANGE = slice(None)  #! 샘플 범위 지정 (3번 샘플이면 3,4 / 5~9번 샘플이면 5,10 / 전체 사용이면 None)
 
 #! Hyperparameter =================
 
@@ -280,7 +281,7 @@ def run_refinement_pass(crop_list: List, question: str, original_image: Image, s
     [Stage 2용] 선택된 crop 리스트 전체를 사용하여 최종 Attention Map을 생성하고,
     Grounding Accuracy를 계산하여 성공 여부를 반환합니다.
     """
-    print("Running second forward pass for refinement...")
+    # print("Running second forward pass for refinement...")
     os.makedirs(save_dir, exist_ok=True)
 
     # 1. Stage 2에 맞는 크기로 이미지들을 리사이즈하고 모델 입력을 준비합니다.
@@ -307,7 +308,7 @@ def run_refinement_pass(crop_list: List, question: str, original_image: Image, s
         crop_list=s2_crop_list_w_shape)
 
     # 3. 모든 crop의 attention을 종합하여 최종 맵을 생성하고 Grounding 성공 여부를 확인합니다.
-    print("Generating final aggregated attention map and checking grounding accuracy...")
+    # print("Generating final aggregated attention map and checking grounding accuracy...")
     
     # 저장 파일명을 "result.png"로 변경
     s2_individual_maps_dir = os.path.join(save_dir, "individual_maps_refined")
@@ -836,7 +837,7 @@ def visualize_aggregated_attention(
         cx, cy = top_points[0]
         gl, gt, gr, gb = gt_bbox
         is_grounding_success = (gl <= cx <= gr) and (gt <= cy <= gb)
-        print(f"top-1: {(cx, cy)} , GT={gt_bbox}, neigh_sum={scores[0]:.6f}")
+        print(f"🎯 Our Grounding: {(cx, cy)} , GT: {gt_bbox}, Neigh_sum: {scores[0]:.2f}")
     else:
         print("Aggregated attention map empty 또는 peak 없음")
 
@@ -903,7 +904,6 @@ if __name__ == '__main__':
     while os.path.exists(save_dir):
         suffix += 1
         save_dir = f"{SAVE_DIR}_{suffix}"
-    os.makedirs(save_dir)
 
     # Model Import
     model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
@@ -921,6 +921,18 @@ You are an assistant trained to navigate the android phone. Given a
 task instruction, a screen observation, guess where should you tap.
 # Intruction
 {task_prompt}"""
+
+    os.makedirs(save_dir)
+    init_iter_logger(  # log csv 저장
+        save_dir=save_dir,
+        headers=[  # 순서 그대로 들어감
+            "idx","s1_hit", "s2_hit","filename_wo_ext","instruction","num_crops",
+            "stage1_crop","stage1_select", "acc_uptonow"
+        ],
+        write_md=True,
+        use_fsync=True,
+        use_lock=False
+    )
 
     # Process
     for task in TASKS:
@@ -989,12 +1001,51 @@ task instruction, a screen observation, guess where should you tap.
             if crop_list is None:
                 print(f"Segmentation failed for {img_path}. Skipping this image.")
                 num_segmentation_failed += 1
+                # >>> ADDED: 실패 라인 남기고 계속 진행
+                stage1_sec   = time.time() - stage1_start
+                select_sec   = 0.0
+                total_s1_sec = stage1_sec
+                _gt_list = res_board_dict[2]["gt_score_list"]
+                up2now   = (calc_acc(_gt_list) * 100) if _gt_list else 0.0
+
+                append_iter_log(
+                    idx=j+1,
+                    s1_hit="❌",                # GT 포함 실패
+                    s2_hit="❌",                # Stage2도 실패
+                    filename_wo_ext=filename_wo_ext,
+                    instruction=instruction,   # task 대신 instruction
+                    num_crops=0,
+                    stage1_crop=f"{stage1_sec:.3f}",
+                    stage1_select=f"{select_sec:.3f}",
+                    acc_uptonow=f"{up2now:.2f}"
+                )
+
                 continue
 
             only_lv_1 = [crop for crop in crop_list if crop.get("level") == 1]
             if len(only_lv_1) == 0:
                 print(f"No level 1 crops found for {img_path}. Skipping this image.")
                 num_segmentation_failed += 1
+
+                # >>> ADDED: 실패 라인 남기고 계속 진행
+                stage1_sec   = time.time() - stage1_start
+                select_sec   = 0.0
+                total_s1_sec = stage1_sec
+                _gt_list = res_board_dict[2]["gt_score_list"]
+                up2now   = (calc_acc(_gt_list) * 100) if _gt_list else 0.0
+
+                append_iter_log(
+                    idx=j+1,
+                    s1_hit="❌",                # GT 포함 실패
+                    s2_hit="❌",                # Stage2도 실패
+                    filename_wo_ext=filename_wo_ext,
+                    instruction=instruction,   # task 대신 instruction
+                    num_crops=0,
+                    stage1_crop=f"{stage1_sec:.3f}",
+                    stage1_select=f"{select_sec:.3f}",
+                    acc_uptonow=f"{up2now:.2f}"
+                )
+
                 continue
 
             stage_crop_list = create_stage_crop_list(
@@ -1014,12 +1065,12 @@ task instruction, a screen observation, guess where should you tap.
                 msgs=msgs, crop_list=stage_crop_list, top_q=TOP_Q, drop_indices=[0], attn_vis_dir=s1_dir
             )
             stage1_2_end = time.time()
+            print(f"👇 Selected Top Q Crops: {s1_top_q_crop_ids}")
 
             # Stage 1 Total Time
             total_time = stage1_2_end - stage1_start
-            print(f"Stage 1 Time: {total_time:.2f} sec / Segmentation: {stage1_end - stage1_start:.2f} sec / Find Top Q: {stage1_2_end - stage1_2_start:.2f} sec")
+            print(f"🕖 S1 Time: {total_time:.2f} sec ( Segmentation: {stage1_end - stage1_start:.2f} sec / Find Top Q: {stage1_2_end - stage1_2_start:.2f} sec )")
 
-            print(f"Selected Top Q Crops from Stage 1: {s1_top_q_crop_ids}")
 
             # ==================================================================
 
@@ -1035,9 +1086,9 @@ task instruction, a screen observation, guess where should you tap.
 
             res_board_dict[1]["gt_score_list"].append(1 if s1_is_gt_in_top_q else 0)
             if s1_is_gt_in_top_q:
-                print("☑️ Top Q contain Ground Truth")
+                print("☑️  Top Q contain Ground Truth!")
             else:
-                print("🙅🏻 Top Q NOT contain Ground Truth")
+                print("🙅🏻 Top Q NOT contain Ground Truth 🙅🏻")
 
             res_board_dict[1]["top_q_crop_ids"] = s1_top_q_crop_ids
             res_board_dict[1]["raw_attn_dict"] = s1_raw_res_dict
@@ -1096,8 +1147,26 @@ task instruction, a screen observation, guess where should you tap.
 
             _gt_score_list = res_board_dict[2]["gt_score_list"]
             up2now_gt_score = calc_acc(_gt_score_list)
-            print(f"Up2Now S2 Grounding Accuracy:{up2now_gt_score}") # 출력 메시지 수정
+            print(f"Up2Now Grounding Accuracy: {up2now_gt_score}") # 출력 메시지 수정
             print("\n----------------------\n")
+
+            # >>> ADDED: 한 줄 로그 append
+            stage1_sec   = stage1_end - stage1_start
+            select_sec   = stage1_2_end - stage1_2_start
+            total_s1_sec = stage1_2_end - stage1_start
+            up2now = calc_acc(res_board_dict[2]["gt_score_list"]) * 100
+
+            append_iter_log(
+                idx=j+1,
+                s1_hit="✅" if s1_is_gt_in_top_q else "❌",
+                s2_hit="✅" if final_success else "❌",
+                filename_wo_ext=filename_wo_ext,
+                instruction=instruction,
+                num_crops=len(stage_crop_list),
+                stage1_crop=f"{stage1_sec:.3f}",
+                stage1_select=f"{select_sec:.3f}",
+                acc_uptonow=f"{up2now:.2f}"
+            )
 
             item_res['filename'] = filename
             item_res['data_type'] = item["data_type"]
