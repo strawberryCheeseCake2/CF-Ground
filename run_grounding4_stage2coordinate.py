@@ -1,30 +1,33 @@
 # Standard Library
+import argparse
 import json
 import os
 import re
 import shutil
 import sys
 import time
+from collections import deque
 from copy import deepcopy
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Tuple
 
 # Third-Party Libraries
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
-import matplotlib.patheffects as pe
 from matplotlib.lines import Line2D
 import numpy as np
 import pandas as pd
 from PIL import Image, ImageDraw, ImageFont
 from tqdm import tqdm
 import torch
+import torch.nn.functional as F
 from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor, AutoTokenizer, set_seed
 
 # Project-Local Modules
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 from qwen_vl_utils import process_vision_info
-from crop5 import run_segmentation_recursive  #! 어떤 crop 파일 사용?
+from crop_clean import run_segmentation_recursive  # ! crop
+
 
 #! Argument =======================
 
@@ -44,10 +47,13 @@ max_memory = {
 MLLM_PATH = "zonghanHZH/ZonUI-3B"
 SCREENSPOT_IMGS = "./data/screenspotv2_imgs"  # input image 경로
 SCREENSPOT_TEST = "./data"  # json파일 경로
-SAVE_DIR = "./attn_output/" + "0821_all"  #! 결과 저장 경로 (방법을 바꾼다면 바꿔서 기록하기)
+SAVE_DIR = "./attn_output/" + "0821_crop_clean_stage2coord"  #! 결과 저장 경로 (방법을 바꾼다면 바꿔서 기록하기)
+
+# Data Processing
 SAMPLING = False  # data 섞을지
 TASKS = ["mobile"]
-SAMPLE_RANGE = slice(all)  #! 샘플 범위 지정 (3번 샘플이면 3,4 / 5~9번 샘플이면 5,10 / 전체 사용이면 None)
+SAMPLE_RANGE = slice(0,1)  #! 샘플 범위 지정 (5~9번 샘플이면 5,10 / 전체 사용이면 None)
+# SAMPLE_RANGE = slice()
 
 #! Hyperparameter =================
 
@@ -67,11 +73,24 @@ S1_RESIZE_RATIO = 0.30  # Stage 1 crop resize ratio
 S2_RESIZE_RATIO = 0.50  # Stage 2 crop resize ratio  
 THUMBNAIL_RESIZE_RATIO = 0.05  # Thumbnail resize ratio
 
+
 TOPK_SINKS  = 20             # 공통 sink 좌표로 잡을 개수
 PER_MAP_TOPN_FRAC = 0.05     # 각 맵에서 상위 몇 %를 "상위값"으로 간주할지 (빈도수 집계용)
 RENORMALIZE = False           # 0으로 만든 후 vision span 내에서 재정규화할지 여부
+SKIP_INDICES = {}
 
 #! ================================
+
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--mllm_path', type=str, default=MLLM_PATH)
+    parser.add_argument("--sampling", action='store_true', default=SAMPLING, help="do sampling for mllm")
+    parser.add_argument('--screenspot_imgs', type=str, default=SCREENSPOT_IMGS)
+    parser.add_argument('--screenspot_test', type=str, default=SCREENSPOT_TEST)
+    parser.add_argument('--save-dir', type=str, default=SAVE_DIR)
+    parser.add_argument("--vis_flag", action='store_true', help="visualize mid-results")
+    args = parser.parse_args()
+    return args
 
 class NpEncoder(json.JSONEncoder):
     def default(self, obj):
@@ -96,6 +115,11 @@ def find_vision_spans(input_ids, vs_id, ve_id):
         except ValueError:
             break
     return spans
+
+def point_in_bbox(pt, bbox):
+    x, y = pt
+    left, top, right, bottom = bbox
+    return left <= x <= right and top <= y <= bottom
 
 def calc_acc(score_list):
     return sum(score_list) / len(score_list) if len(score_list) != 0 else 0
@@ -124,6 +148,12 @@ def process_inputs(msgs, crop_list):
     # # (batch, num_imgs, 3) 혹은 (num_imgs, 3) 형태일 수 있으니 안전하게 뽑기
     if grid.ndim == 3:
         grid = grid[0]   # (num_imgs, 3)
+
+    # # 최종 token-map 차원: t × (h//2) × (w//2)
+    # final_shapes = [
+    #     (t, h//2, w//2)
+    #     for t, h, w in grid
+    # ]
 
     for i, (t,h,w) in enumerate(grid):
         crop_list[i]['patch_shape'] = (t, h//2, w//2)
@@ -176,6 +206,9 @@ def create_stage_crop_list(crop_list: List, resize_dict: Dict, use_thumbnail: bo
     return stage_crop_list
 
 def run_single_forward(inputs, crop_list: List):
+    # Process Input
+    # inputs = process_inputs(msgs=msgs)
+
     # Add vision span to crop list from inputs
     vision_start_id = processor.tokenizer.convert_tokens_to_ids("<|vision_start|>")
     vision_end_id = processor.tokenizer.convert_tokens_to_ids("<|vision_end|>")
@@ -186,7 +219,7 @@ def run_single_forward(inputs, crop_list: List):
     for i, span in enumerate(spans):
       crop_list[i]["token_span"] = span
 
-    # inference
+    ##### inference
     with torch.no_grad():
       output = model(**inputs, output_attentions=True)
 
@@ -226,7 +259,7 @@ def attn2df(attn_output, crop_list: List):
 def get_top_q_crop_ids(top_q, attn_df):
     df = deepcopy(attn_df)
      # LAYER_NUM까지의 어텐션 합 구하기
-    cols_to_sum = [f"layer{i}" for i in range(20, LAYER_NUM + 1)]  #! 
+    cols_to_sum = [f"layer{i}" for i in range(20, LAYER_NUM + 1)] #HERE!!!! #20?1?attn_map 20으로 한결과
     df[f"sum_until_{LAYER_NUM}"] = df[cols_to_sum].sum(axis=1)
 
     # 1.1. get top-q crop index
@@ -248,6 +281,16 @@ def check_gt_in_top_q_crops(top_q_bboxes: List, gt_bbox: List):
     gt_point_in_top_q_crops = any(point_in_bbox(gt_center_point, bbox) for bbox in top_q_bboxes)
     return gt_point_in_top_q_crops
 
+def calculate_entropy(attention_map: np.ndarray) -> float:
+    """
+    어텐션 맵(2D numpy array)의 엔트로피를 계산합니다.
+    """
+    epsilon = 1e-9
+    prob_map = attention_map / (attention_map.sum() + epsilon)
+    non_zero_probs = prob_map[prob_map > 0]
+    entropy = -np.sum(non_zero_probs * np.log2(non_zero_probs))
+    return entropy
+
 def run_selection_pass(msgs, crop_list, top_q, drop_indices: List, attn_vis_dir: str):
     """
     [Stage 1용] Attention 스코어를 계산하고, threshold(top_q)를 넘는 상위 crop들을 선택(selection)합니다.
@@ -257,7 +300,6 @@ def run_selection_pass(msgs, crop_list, top_q, drop_indices: List, attn_vis_dir:
     df = attn2df(attn_output=attn_output, crop_list=crop_list)
 
     # Stage 1 진단용 시각화 (개별 crop의 low-res attention)
-    # TODO: 추론만 할때는 빼기
     visualize_attn_map(attn_output=attn_output, msgs=msgs, crop_list=crop_list, attn_vis_dir=attn_vis_dir)
 
     raw_attn_res = df.to_dict(orient="index")
@@ -266,7 +308,7 @@ def run_selection_pass(msgs, crop_list, top_q, drop_indices: List, attn_vis_dir:
         df = df.drop(index=i, errors='ignore')
 
     top_q_crop_ids = get_top_q_crop_ids(top_q=top_q, attn_df=df)
-    # print(f"instruction: {instruction}, selected crops: {top_q_crop_ids}")
+    print(f"instruction: {instruction}, selected crops: {top_q_crop_ids}")
 
     top_q_bboxes = []
     for crop in crop_list:
@@ -293,9 +335,11 @@ def run_refinement_pass(crop_list: List, question: str, original_image: Image, s
         use_thumbnail=True
     )
 
-    os.makedirs(f"{save_dir}/s2_photo", exist_ok=True)
+    os.makedirs(f"{seg_save_base_dir}/{filename_wo_ext}/{inst_dir_name}/s2_processed", exist_ok=True)
     for _crop in s2_resized_crop_list:
-        _crop['resized_img'].save(f"{save_dir}/s2_photo/crop{_crop['id']}.png")
+        # os.makedirs(f"{seg_save_base_dir}/{filename_wo_ext}/{inst_dir_name}/s2_processed/crop{_crop['id']}", exist_ok=True)
+        # _crop['resized_img'].save(f"{seg_save_base_dir}/{filename_wo_ext}/{inst_dir_name}/s2_processed/crop{_crop['id']}/{_crop['id']}.png")
+        _crop['resized_img'].save(f"{seg_save_base_dir}/{filename_wo_ext}/{inst_dir_name}/s2_processed/crop{_crop['id']}.png")
 
 
     msgs_s2 = create_msgs(crop_list=s2_resized_crop_list, question=question)
@@ -310,7 +354,9 @@ def run_refinement_pass(crop_list: List, question: str, original_image: Image, s
     print("Generating final aggregated attention map and checking grounding accuracy...")
     
     # 저장 파일명을 "result.png"로 변경
+    s2_agg_save_path = os.path.join(save_dir, "result.png")
     s2_individual_maps_dir = os.path.join(save_dir, "individual_maps_refined")
+
 
     # (0) 사용할 query text token 정하기
     input_ids_1d = s2_inputs["input_ids"][0]
@@ -320,6 +366,7 @@ def run_refinement_pass(crop_list: List, question: str, original_image: Image, s
         query_indices = [seq_len - 1]
     else:
         query_indices = list(range(last_vision_end + 1, seq_len))
+
 
     exclude = set()
 
@@ -349,7 +396,10 @@ def run_refinement_pass(crop_list: List, question: str, original_image: Image, s
     # 최종 필터링
     query_indices = [i for i in query_indices if i not in exclude]
 
+
     # (1) 모든 레이어×모든 텍스트 질의 토큰에 대한 맵 수집 & 빈도 누적
+    
+
     s2_final_crop_list = collect_maps_and_sink_counts(
         s2_attn_output, 
         s2_inputs, 
@@ -359,6 +409,7 @@ def run_refinement_pass(crop_list: List, question: str, original_image: Image, s
         layer_range=range(AGG_START, LAYER_NUM), 
         processor=processor, 
         per_map_topn_frac=PER_MAP_TOPN_FRAC,
+
     )
 
     # (2) 이미지별 공통 sink 좌표 Top-K 추출
@@ -371,7 +422,10 @@ def run_refinement_pass(crop_list: List, question: str, original_image: Image, s
         crop['sink_coords'] = sinks
         # sink_coords_per_img.append(sinks)
 
+
     # (3) 마스킹 후 맵 재계산
+    
+
     s2_final_crop_list = zero_out_sinks_and_remap(
         model_output=s2_attn_output,
         crop_list=s2_final_crop_list,
@@ -402,17 +456,67 @@ def run_refinement_pass(crop_list: List, question: str, original_image: Image, s
             att_avg_masked = np.zeros((h2, w2), dtype=np.float32)
             crop["att_avg_masked"] = att_avg_masked
 
+
+
+
     is_success = visualize_aggregated_attention(
         # attn_output=s2_attn_output, 
         crop_list=s2_final_crop_list,
-        original_image=original_image,
-        inst_dir=inst_dir,
+        original_image=original_image, processor=processor,
+        save_path=s2_agg_save_path,
         gt_bbox=gt_bbox,
         individual_maps_dir=s2_individual_maps_dir
     )
+    print("Stage 2 refinement complete.")
+    if is_success:
+        print("✅ Grounding Success")
+    else:
+        print("❌ Grounding Fail")
+
     return is_success
 
-def visualize_crop(save_dir, gt_bbox, top_q_bboxes, instruction, filename, click_point=None):
+#! ================================================================================================
+# Accumulate time logs
+TIME_LOGS = []
+STAGE_TIMES = {}
+
+def measure_and_log_time(stage_name, start_time, end_time):
+    """
+    Logs the elapsed time for a stage to a global list and groups by stage.
+
+    Parameters:
+    - stage_name: Name of the stage being measured.
+    - start_time: Start time of the stage.
+    - end_time: End time of the stage.
+
+    Returns:
+    - elapsed_time: The time taken for the stage in seconds.
+    """
+    elapsed_time = end_time - start_time
+    TIME_LOGS.append(f"{stage_name}: {elapsed_time:.2f} seconds")
+    if stage_name not in STAGE_TIMES:
+        STAGE_TIMES[stage_name] = 0
+    STAGE_TIMES[stage_name] += elapsed_time
+    return elapsed_time
+
+def save_time_logs(log_file_path):
+    """
+    Save all accumulated time logs to a file, including grouped stage times and total time.
+
+    Parameters:
+    - log_file_path: Path to the log file where the times will be recorded.
+    """
+    with open(log_file_path, "w") as log_file:
+        log_file.write("\n".join(TIME_LOGS) + "\n\n")
+        log_file.write("Stage-wise Summary:\n")
+        for stage, total_time in STAGE_TIMES.items():
+            log_file.write(f"{stage}: {total_time:.2f} seconds\n")
+        log_file.write("\nTotal Time: {:.2f} seconds\n".format(sum(STAGE_TIMES.values())))
+
+#! ================================================================================================
+# Visualize
+
+def visualize_result(save_dir, gt_bbox, top_q_bboxes, instruction, click_point=None):
     # Visualize ground truth and selected crop on the image
     result_img = Image.open(img_path)
 
@@ -443,14 +547,17 @@ def visualize_crop(save_dir, gt_bbox, top_q_bboxes, instruction, filename, click
     # Ensure the save directory exists
     os.makedirs(save_dir, exist_ok=True)
     # Save the result image
-    result_path = os.path.join(save_dir, filename)
-    # print(f"Top Q box is saved at : {result_path}")
+    result_path = os.path.join(save_dir ,f"result.png")
+    print(result_path)
     result_img.save(result_path)
+
+
+
 
 def visualize_attn_map(attn_output, msgs, crop_list, attn_vis_dir):
     image_inputs, _ = process_vision_info(msgs)
 
-    # grid 크기 뽑아두기
+    # 3) grid 크기 뽑아두기
     img_proc_out = processor.image_processor(images=image_inputs)
     grid = img_proc_out["image_grid_thw"]
     # (batch, num_imgs, 3) 혹은 (num_imgs, 3) 형태일 수 있으니 안전하게 뽑기
@@ -501,6 +608,46 @@ def visualize_attn_map(attn_output, msgs, crop_list, attn_vis_dir):
     fig.savefig(_save_path, dpi=300, bbox_inches="tight", facecolor="white")
     # print(f"attn_map saved at: {_save_path}")
 
+
+def get_mean_att_map(model_output, span, img_idx, layer_range, img_patch_shapes):
+
+    # if grid.ndim == 3:
+    #     grid = grid[0]
+    # final_shapes = [(t, h//2, w//2) for t, h, w in grid]
+    
+    # 어텐션 뽑기
+    (st, end) = span
+    t, h2, w2 = img_patch_shapes[img_idx]
+
+    per_layer_att_maps = []
+    for li in layer_range:
+        if li >= len(model_output.attentions): continue
+        att = (
+            model_output.attentions[li][0, :, -1, st:end]
+            .mean(dim=0).to(torch.float32).cpu().numpy()
+        )
+        att_map = att.reshape(t, h2, w2).mean(axis=0)
+        per_layer_att_maps.append(att_map)
+
+
+    att_avg = np.mean(per_layer_att_maps, axis=0)
+    return att_avg
+
+
+def upsample_att_map(att_map, size: Tuple):
+    """
+    param: att_map, size (height, width)
+    """
+
+    att_map_to_upsample = torch.from_numpy(att_map).to(torch.float32).unsqueeze(0).unsqueeze(0)
+    upsampled_map = F.interpolate(att_map_to_upsample, size=size, mode='bilinear', align_corners=False)
+    upsampled_map = upsampled_map.squeeze(0).squeeze(0).cpu().numpy()
+
+    return upsampled_map
+
+
+
+
 def get_last_vision_end_index(input_ids_1d, processor):
     """시퀀스에서 마지막 <|vision_end|> 토큰 인덱스 반환 (없으면 -1)."""
     vision_end_id = processor.tokenizer.convert_tokens_to_ids("<|vision_end|>")
@@ -516,6 +663,7 @@ def top_indices(flat_values, topn):
     part = np.argpartition(flat_values, -topn)[-topn:]
     return part[np.argsort(flat_values[part])[::-1]]
 
+
 def pick_common_sinks(counts, h2, w2, k=10):
     """
     빈도 누적(counts: shape=(h2*w2,))에서 공통적으로 높은 좌표 상위 k개 선택.
@@ -528,6 +676,7 @@ def pick_common_sinks(counts, h2, w2, k=10):
     top_flat = top_indices(counts.astype(np.float32), k)
     coords = [(int(idx // w2), int(idx % w2)) for idx in top_flat]
     return coords
+
 
 def zero_sink_in_att_vec(att_vec, t, h2, w2, sink_coords, renormalize=False, eps=1e-12):
     """
@@ -542,11 +691,12 @@ def zero_sink_in_att_vec(att_vec, t, h2, w2, sink_coords, renormalize=False, eps
     # 시간 축으로 stride=hw
     for base in base_idxs:
         vec[base: hw * t: hw] = 0.0
-    if renormalize:
-        s = vec.sum()
-        if s > eps:
-            vec = vec / s
+    # if renormalize:
+    #     s = vec.sum()
+    #     if s > eps:
+    #         vec = vec / s
     return vec
+
 
 def zero_out_sinks_and_remap(
         model_output, 
@@ -683,6 +833,11 @@ def collect_maps_and_sink_counts(
     # return per_img_maps, per_img_sink_freqs
     return crop_list
 
+
+from PIL import Image as PILImage
+# -----------------------
+# 유틸리티: 기본 연산들
+# -----------------------
 def upsample_att_map(att_map_low_res: np.ndarray, size):
     """
     Pillow를 이용한 bilinear 업샘플 (size=(H, W))
@@ -695,8 +850,8 @@ def upsample_att_map(att_map_low_res: np.ndarray, size):
         return np.zeros((h, w), dtype=np.float32)
     # 값 범위를 일단 0 이상으로 클램프
     m[m < 0] = 0.0
-    im = Image.fromarray(m)
-    im = im.resize((w, h), resample=Image.BILINEAR)
+    im = PILImage.fromarray(m)
+    im = im.resize((w, h), resample=PILImage.BILINEAR)
     out = np.array(im).astype(np.float32)
     # scale에 따라 값이 약간 변할 수 있어 0 이상으로 재클램프
     out[out < 0] = 0.0
@@ -714,65 +869,116 @@ def point_in_bbox(point, bbox):
 
 def boxfilter_sum(arr: np.ndarray, r: int):
     """
-    끝부분 보정 없음(neighbor-sum).
-    (2r+1)x(2r+1) 창과 실제 겹치는 부분의 '합'만 계산.
-    평균 아님. 가장자리는 창이 덜 겹치므로 손해보게 됨.
+    정사각 윈도우 반경 r에 대한 합(box filter) 결과 반환.
+    r=0이면 입력 그대로. O(1) 쿼리를 위해 2D 적분영상 사용.
     """
     if r <= 0:
         return arr.astype(np.float32, copy=True)
-
+    H, W = arr.shape
     a = arr.astype(np.float32, copy=False)
-    H, W = a.shape
+    integral = np.cumsum(np.cumsum(a, axis=0), axis=1)
 
-    # 적분영상: 상단/좌측 0 패딩을 한 칸 추가해서 벡터화 계산 용이하게 구성
-    ii = np.pad(a, ((1, 0), (1, 0)), mode='constant').cumsum(axis=0).cumsum(axis=1)
+    def rect_sum(y1, x1, y2, x2):
+        y1 = max(0, y1); x1 = max(0, x1)
+        y2 = min(H - 1, y2); x2 = min(W - 1, x2)
+        A = integral[y2, x2]
+        B = integral[y1 - 1, x2] if y1 > 0 else 0.0
+        C = integral[y2, x1 - 1] if x1 > 0 else 0.0
+        D = integral[y1 - 1, x1 - 1] if (y1 > 0 and x1 > 0) else 0.0
+        return A - B - C + D
 
-    ys = np.arange(H)[:, None]   # Hx1
-    xs = np.arange(W)[None, :]   # 1xW
+    out = np.empty_like(a, dtype=np.float32)
+    for i in range(H):
+        for j in range(W):
+            out[i, j] = rect_sum(i - r, j - r, i + r, j + r)
+    return out
 
-    y0 = np.clip(ys - r, 0, H)
-    y1 = np.clip(ys + r + 1, 0, H)
-    x0 = np.clip(xs - r, 0, W)
-    x1 = np.clip(xs + r + 1, 0, W)
+# -----------------------
+# 히트맵에서 BBox 추출
+# -----------------------
+def find_bounding_boxes_from_heatmap(heatmap: np.ndarray, threshold: float):
+    """
+    heatmap >= threshold 인 영역을 바이너리로 보고
+    간단한 4-이웃 연결요소를 찾은 뒤, 각 컴포넌트의 bbox와 confidence를 반환.
+    confidence는 컴포넌트 내부 heat 평균값으로 정의.
+    리턴: [((l, t, r, b), confidence), ...] (confidence 내림차순 정렬)
+    """
+    H, W = heatmap.shape
+    mask = (heatmap >= threshold).astype(np.uint8)
+    visited = np.zeros_like(mask, dtype=np.uint8)
 
-    # 적분영상 인덱스는 +1 패딩 고려해서 그대로 사용 가능
-    S = ii[y1, x1] - ii[y0, x1] - ii[y1, x0] + ii[y0, x0]
-    return S
+    def neighbors(y, x):
+        # 4-이웃
+        if y > 0: yield (y - 1, x)
+        if y < H - 1: yield (y + 1, x)
+        if x > 0: yield (y, x - 1)
+        if x < W - 1: yield (y, x + 1)
 
-#! Stage 2 맞추기 메인 함수 (neighsum 방식)
+    boxes = []
+    for i in range(H):
+        for j in range(W):
+            if mask[i, j] == 1 and visited[i, j] == 0:
+                # BFS/DFS
+                stack = [(i, j)]
+                visited[i, j] = 1
+                ys, xs = [], []
+                vals = []
+                while stack:
+                    y, x = stack.pop()
+                    ys.append(y); xs.append(x)
+                    vals.append(float(heatmap[y, x]))
+                    for ny, nx in neighbors(y, x):
+                        if mask[ny, nx] == 1 and visited[ny, nx] == 0:
+                            visited[ny, nx] = 1
+                            stack.append((ny, nx))
+                if len(xs) > 0:
+                    t = min(ys); b = max(ys)
+                    l = min(xs); r = max(xs)
+                    # (left, top, right, bottom) with inclusive pixels => +1 보정 안함(시각화는 폭/높이에서 자동으로 +1不要)
+                    confidence = float(np.mean(vals)) if len(vals) > 0 else 0.0
+                    boxes.append(((l, t, r, b), confidence))
+    # confidence 내림차순 정렬
+    boxes.sort(key=lambda x: x[1], reverse=True)
+    return boxes
+
+# -----------------------
+# 메인 함수 (neighsum 방식)
+# -----------------------
 def visualize_aggregated_attention(
         crop_list,
-        original_image, inst_dir, gt_bbox, individual_maps_dir=None,
-
-        neigh_radius = 20,         #! 이웃합(box filter) 반경 r → (2r+1)^2 창
-
-        topk_points = 5,           # 상위 점 개수 (보여주기용)
-        min_dist_pix = 200,        # 상위 점 사이 최소 간격 (픽셀)
-
-        use_levels=(0, 1, 2),     # 합칠 crop level
-        star_marker_size= 8,      # 별 크기 (1등)
-        dot_marker_size = 5,      # 점 크기 (2~5등)
-        text_fontsize= 7          # 점수 텍스트 폰트 크기
+        original_image, processor, save_path, gt_bbox, individual_maps_dir=None,
+        # 아래는 간단 튜닝 파라미터
+        neigh_radius=2,          #! 반경 N: 1->3x3, 2->5x5, 3->7x7
+        bbox_top_percent=98,     #! 상위 q% 임계(낮출수록 더 넓게 잡음, 예: 95~98 권장)
+        use_levels=(0, 1, 2),       # 어떤 crop level만 합칠지
+        star_marker_size=15      # 시각화용 별 크기
     ):
     """
-    이웃합 기반 최대점 탐색:
-    - 합성 맵 정규화 후 boxfilter_sum(neigh_radius)로 이웃합 계산
-    - greedy 비최대 억제(NMS)로 상위 topk_points 좌표 선택(간격 min_dist_pix)
-    - 시각화:
-        • s2_result_only: 원본+합성맵+GT 박스만
-        • s2_result_star: top-1은 별(*), top-k 모두는 이웃합 점수 텍스트로 표시
-    - 성공 판정은 top-1 점이 GT 박스 안이면 True
+    crop_list: 각 crop dict에 다음 키가 있다고 가정
+      - 'bbox': (left, top, right, bottom) in original image coords
+      - 'att_avg_masked': (h', w')의 낮은 해상도 주의맵 (numpy)
+      - 'level': 정수 레벨(필터링용, 기본: 0/1만 사용)
+      - 'id': (선택) 시각화 저장시 파일명 표기용
+    original_image: PIL.Image
+    processor: (사용안함. 시그니처 호환용)
+    save_path: 최종 시각화 저장 경로
+    gt_bbox: (left, top, right, bottom)
+    individual_maps_dir: (선택) 각 crop attention upsample 시각화 저장 디렉토리
+    neigh_radius: 이웃 합 boxfilter 반경
+    bbox_top_percent: 히트맵 상위 q%를 threshold로 사용
     """
 
-    os.makedirs(os.path.dirname(inst_dir + "/stage2"), exist_ok=True)
+    # 출력 폴더
+    if not os.path.exists(os.path.dirname(save_path)):
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
     if individual_maps_dir:
         os.makedirs(individual_maps_dir, exist_ok=True)
 
-    # 캔버스 및 합성 맵 준비
-    W, H = original_image.size
-    aggregated_attention_map = np.zeros((H, W), dtype=np.float32)
+    # 캔버스 준비
+    original_width, original_height = original_image.size
+    aggregated_attention_map = np.zeros((original_height, original_width), dtype=np.float32)
 
-    # 각 crop의 맵을 원본 좌표계로 업샘플하여 합성
+    # 각 crop을 원본 좌표계에 합성
     for crop in crop_list:
         if 'bbox' not in crop or 'att_avg_masked' not in crop:
             continue
@@ -786,15 +992,15 @@ def visualize_aggregated_attention(
             continue
 
         att_low = crop['att_avg_masked']
-        att_up = upsample_att_map(att_low, size=(ch, cw))  # 파일 상단 정의 가정
+        att_up = upsample_att_map(att_low, size=(ch, cw))
 
         # 개별 맵 저장(옵션)
         if individual_maps_dir:
-            indiv = np.zeros((H, W), dtype=np.float32)
+            indiv = np.zeros((original_height, original_width), dtype=np.float32)
             indiv[top:bottom, left:right] = att_up
-            plt.figure(figsize=(10, 10 * H / W))
-            plt.imshow(original_image, extent=(0, W, H, 0))
-            plt.imshow(indiv, cmap='viridis', alpha=0.6, extent=(0, W, H, 0))
+            plt.figure(figsize=(10, 10 * original_height / original_width))
+            plt.imshow(original_image, extent=(0, original_width, original_height, 0))
+            plt.imshow(indiv, cmap='viridis', alpha=0.6, extent=(0, original_width, original_height, 0))
             plt.axis('off')
             ttl = f"Crop ID: {crop.get('id','?')}, Level: {crop.get('level','?')}"
             plt.title(ttl)
@@ -804,114 +1010,177 @@ def visualize_aggregated_attention(
 
         aggregated_attention_map[top:bottom, left:right] += att_up
 
-    # 이웃합 기반 상위 점 선정
-    top_points = []
-    scores = []  # boxfilter_sum으로 얻은 이웃합 값
+    # -----------------------
+    # Grounding 계산 (neighsum)
+    # -----------------------
+    is_grounding_success = False
+    highest_point = None
+    highest_bbox = None
 
     if aggregated_attention_map.max() > 0:
+        # 정규화
         normalized = aggregated_attention_map / (aggregated_attention_map.max() + 1e-8)
-        smoothed = boxfilter_sum(normalized, neigh_radius)  # 파일 상단 정의 가정
 
-        # greedy NMS로 상위 K개 점 선택
-        sm = smoothed.copy()
-        Hh, Ww = sm.shape
+        # 이웃 합으로 스무딩
+        smoothed = boxfilter_sum(normalized, neigh_radius)
 
-        for _ in range(int(topk_points)):
-            idx = int(np.argmax(sm))
-            vy, vx = divmod(idx, Ww)
-            best_val = sm[vy, vx]
-            if not np.isfinite(best_val) or best_val <= 0:
-                break
-            # 점 기록
-            top_points.append((int(vx), int(vy)))
-            scores.append(float(best_val))
-            # 정사각형 억제
-            y1 = max(0, vy - min_dist_pix); y2 = min(Hh - 1, vy + min_dist_pix)
-            x1 = max(0, vx - min_dist_pix); x2 = min(Ww - 1, vx + min_dist_pix)
-            sm[y1:y2+1, x1:x2+1] = -np.inf
+        # bbox 추출용 임계값 (상위 q%)
+        thr = np.percentile(smoothed, bbox_top_percent)
+        temp_bboxes = find_bounding_boxes_from_heatmap(smoothed, threshold=thr)
 
-    # 성공 판정: top-1 기준
-    is_grounding_success = False
-    if len(top_points) > 0:
-        cx, cy = top_points[0]
-        gl, gt, gr, gb = gt_bbox
-        is_grounding_success = (gl <= cx <= gr) and (gt <= cy <= gb)
-        print(f"top-1: {(cx, cy)} , GT={gt_bbox}, neigh_sum={scores[0]:.6f}")
+        if temp_bboxes:
+            highest_bbox = max(temp_bboxes, key=lambda x: x[1])
+            (l, t, r, b) = highest_bbox[0]
+            highest_point = (int((l + r) / 2), int((t + b) / 2))
+            is_grounding_success = point_in_bbox(highest_point, gt_bbox)
+            print(f"[neighsum] Grounding Point: {highest_point}, GT: {gt_bbox}, Success: {is_grounding_success}")
+        else:
+            # 컴포넌트가 없으면 최댓값 좌표로 대체
+            best_idx = int(np.argmax(smoothed))
+            H, W = smoothed.shape
+            pi, pj = divmod(best_idx, W)
+            highest_point = (int(pj), int(pi))
+            is_grounding_success = point_in_bbox(highest_point, gt_bbox)
+            print(f"[neighsum-fallback] Point: {highest_point}, GT: {gt_bbox}, Success: {is_grounding_success}")
     else:
-        print("Aggregated attention map empty 또는 peak 없음")
+        print("Aggregated attention map is all zeros. Grounding failed.")
 
-    # 시각화: 공통 바탕
-    fig, ax = plt.subplots(figsize=(10, 10 * H / W))
-    ax.imshow(original_image, extent=(0, W, H, 0))
-    ax.imshow(aggregated_attention_map, cmap='viridis', alpha=0.6, extent=(0, W, H, 0))
+    # -----------------------
+    # 시각화
+    # -----------------------
+    fig, ax = plt.subplots(figsize=(10, 10 * original_height / original_width))
+    ax.imshow(original_image, extent=(0, original_width, original_height, 0))
+    ax.imshow(aggregated_attention_map, cmap='viridis', alpha=0.6,
+              extent=(0, original_width, original_height, 0))
 
-    # 그냥 Attention 상태만 저장 -> 가리는거 없이 보이도록.
-    plt.savefig(inst_dir + "/s2_result_only.png", dpi=300, bbox_inches="tight", pad_inches=0)
+    # 시각화용 bbox는 동일한 neighsum 기준으로 표시
+    if aggregated_attention_map.max() > 0:
+        normalized = aggregated_attention_map / (aggregated_attention_map.max() + 1e-8)
+        smoothed = boxfilter_sum(normalized, neigh_radius)
+        thr_vis = np.percentile(smoothed, bbox_top_percent)
+        bounding_boxes = find_bounding_boxes_from_heatmap(smoothed, threshold=thr_vis)
+    else:
+        bounding_boxes = []
 
-    # GT 박스(초록)
+    print(f"Found {len(bounding_boxes)} high-attention regions.")
+    if len(bounding_boxes) > 0 and highest_bbox is None:
+        highest_bbox = deepcopy(bounding_boxes[0])
+
+    # 예측 BBox(빨강) + confidence 표시
+    for coords, conf in bounding_boxes:
+        left, top, right, bottom = coords
+        rect = patches.Rectangle((left, top), right - left, bottom - top,
+                                 linewidth=2, edgecolor='r', facecolor='none')
+        ax.add_patch(rect)
+        ax.text(left, max(0, top - 5), f'{conf:.2f}', color='white', fontsize=8, fontweight='bold',
+                bbox=dict(facecolor='red', alpha=0.6, edgecolor='none', pad=1))
+
+        if highest_bbox is not None and conf > highest_bbox[1]:
+            highest_bbox = (coords, conf)
+
+    # GT BBox(초록)
     gl, gt, gr, gb = gt_bbox
-    gt_rect = patches.Rectangle((gl, gt), gr - gl, gb - gt, linewidth=3, edgecolor='lime', facecolor='none')
+    gt_rect = patches.Rectangle((gl, gt), gr - gl, gb - gt,
+                                linewidth=3, edgecolor='lime', facecolor='none')
     ax.add_patch(gt_rect)
 
-    # 범례
-    green_patch = patches.Patch(color='lime', label='Ground Truth BBox')
-    star_legend = Line2D([0], [0], marker='*', color='w', label='NeighSum Top-1', 
-                         markerfacecolor='yellow', markeredgecolor='black', markersize=star_marker_size)
-    ax.legend([green_patch, star_legend], ['Ground Truth BBox', 'NeighSum Top-1'], loc='best')
-
-    ax.axis('off')
-    ax.set_title("Attention (aggregated) + NeighSum Peaks")
-    plt.tight_layout()
-
-    # 시각화: top-1 별표, top-2~5 검정 점, top-k 텍스트 라벨
-    if len(top_points) > 0:
-        # top-1 별표
-        ax.plot(top_points[0][0], top_points[0][1], 'y*',
+    # 노란 별(grounding point)
+    if highest_point is not None:
+        ax.plot(highest_point[0], highest_point[1], 'y*',
                 markersize=star_marker_size, markeredgecolor='black')
 
-        # top-2~5 검정 점
-        for i in range(1, min(len(top_points), topk_points)):
-            px, py = top_points[i]
-            ax.plot(px, py, 'o', 
-                    markersize=dot_marker_size, markerfacecolor='black', markeredgecolor='white', markeredgewidth=0.9)
+    # 범례
+    red_patch = patches.Patch(color='red', label='Predicted BBox (High Attention Area)')
+    green_patch = patches.Patch(color='lime', label='Ground Truth BBox')
+    handles = [red_patch, green_patch]
+    if highest_point is not None:
+        yellow_star = Line2D([0], [0], marker='*', color='w',
+                             label='Grounding Point (Neighborhood Sum)',
+                             markerfacecolor='yellow', markeredgecolor='black',
+                             markersize=star_marker_size)
+        handles.append(yellow_star)
+    ax.legend(handles=handles, loc='best')
+    ax.axis('off')
+    ax.set_title("Attention (aggregated) + NeighSum BBoxes + Grounding")
 
-        # top-k 텍스트(모두 표기: 점수만)
-        for (px, py), sc in zip(top_points, scores):
-            label = f"{sc:.3f}"
-            ax.text(px + 10, py - 10, label,
-                    fontsize=text_fontsize, color='white', ha='left', va='top',
-                    path_effects=[pe.withStroke(linewidth=2, foreground='black')])
-
-
-    plt.savefig(inst_dir + "/s2_result_star.png", dpi=300, bbox_inches="tight", pad_inches=0)
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=300, bbox_inches="tight", pad_inches=0)
     plt.close(fig)
+    print(f"Final result visualization saved at: {save_path}")
+    if individual_maps_dir:
+        print(f"Individual attention maps saved in: {individual_maps_dir}")
 
-    return bool(is_grounding_success)
+    return is_grounding_success
 
+
+def find_bounding_boxes_from_heatmap(attention_map, threshold):
+    """
+    주어진 어텐션 맵(히트맵)에서 임계값(threshold)을 초과하는
+    연결된 영역들을 찾고, 각 영역의 바운딩 박스를 반환합니다.
+    """
+    if not isinstance(attention_map, np.ndarray):
+        attention_map = np.array(attention_map)
+
+    height, width = attention_map.shape
+    visited = np.zeros_like(attention_map, dtype=bool)
+    bounding_boxes = []
+
+    def bfs(start_i, start_j):
+        queue = deque([(start_i, start_j)])
+        region_pixels = []
+
+        if visited[start_i][start_j] or attention_map[start_i][start_j] <= threshold:
+            return None
+
+        visited[start_i][start_j] = True
+        queue = deque([(start_i, start_j)])
+        region_pixels.append((start_i, start_j))
+
+        while queue:
+            i, j = queue.popleft()
+            for di in [-1, 0, 1]:
+                for dj in [-1, 0, 1]:
+                    if di == 0 and dj == 0: continue
+                    ni, nj = i + di, j + dj
+                    if (0 <= ni < height and 0 <= nj < width and
+                        not visited[ni][nj] and attention_map[ni][nj] > threshold):
+                        visited[ni][nj] = True
+                        queue.append((ni, nj))
+                        region_pixels.append((ni, nj))
+        return region_pixels
+
+    for i in range(height):
+        for j in range(width):
+            if attention_map[i][j] > threshold and not visited[i][j]:
+                region = bfs(i, j)
+                if region:
+                    min_i = min(p[0] for p in region)
+                    max_i = max(p[0] for p in region)
+                    min_j = min(p[1] for p in region)
+                    max_j = max(p[1] for p in region)
+                    bbox_confidence = np.mean(attention_map[min_i:max_i+1, min_j:max_j+1])
+                    bounding_boxes.append([[min_j, min_i, max_j, max_i], bbox_confidence])
+    return bounding_boxes
 
 
 #! ================================================================================================
 
 if __name__ == '__main__':
-
+    
+    # SEED
     set_seed(SEED)
 
-
-    # save_dir 폴더명이 이미 존재하면 고유한 이름 생성 (save_dir -> save_dir_1 -> save_dir_2)
-    save_dir = SAVE_DIR
-    suffix = 0
-    while os.path.exists(save_dir):
-        suffix += 1
-        save_dir = f"{SAVE_DIR}_{suffix}"
-    os.makedirs(save_dir)
+    # Argument Parsing
+    args = parse_args()
+    seg_save_base_dir = f"{args.save_dir}/seg"
 
     # Model Import
     model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-        MLLM_PATH, torch_dtype="auto", attn_implementation="eager",
+        args.mllm_path, torch_dtype="auto", attn_implementation="eager",
         device_map="balanced", max_memory=max_memory, low_cpu_mem_usage=True
     )
-    tokenizer = AutoTokenizer.from_pretrained(MLLM_PATH)
-    processor = AutoProcessor.from_pretrained(MLLM_PATH)
+    tokenizer = AutoTokenizer.from_pretrained(args.mllm_path)
+    processor = AutoProcessor.from_pretrained(args.mllm_path)
     model.eval()
 
     # Question
@@ -926,7 +1195,7 @@ task instruction, a screen observation, guess where should you tap.
     for task in TASKS:
         task_res = dict()
         dataset = "screenspot_" + task + "_v2.json"
-        screenspot_data = json.load(open(os.path.join(SCREENSPOT_TEST, dataset), 'r'))
+        screenspot_data = json.load(open(os.path.join(args.screenspot_test, dataset), 'r'))
         screenspot_data = screenspot_data[SAMPLE_RANGE]
 
         print("Num of sample: " + str(len(screenspot_data)), flush=True)
@@ -955,7 +1224,7 @@ task instruction, a screen observation, guess where should you tap.
             num_action += 1
             filename = item["img_filename"]
             filename_wo_ext, ext = os.path.splitext(filename)
-            img_path = os.path.join(SCREENSPOT_IMGS, filename)
+            img_path = os.path.join(args.screenspot_imgs, filename)
             if not os.path.exists(img_path):
                 continue
 
@@ -966,17 +1235,15 @@ task instruction, a screen observation, guess where should you tap.
             question = question_template.format(task_prompt=instruction)
 
             inst_dir_name = re.sub(r'\W+', '_', instruction).strip('_')
-
-            #* 이 반복문 내에서는 보기 쉽게 inst dir, s1_dir, s2_dir만 사용
-            inst_dir = os.path.join(save_dir, "seg", filename_wo_ext, inst_dir_name)
-            s1_dir = os.path.join(inst_dir, "stage1")
-            s2_dir = os.path.join(inst_dir, "stage2")
+            s1_dir = f"{seg_save_base_dir}/{filename_wo_ext}/{inst_dir_name}/s1"
+            s1_processed_dir = f"{seg_save_base_dir}/{filename_wo_ext}/{inst_dir_name}/s1_processed"
             os.makedirs(s1_dir, exist_ok=True)
-            os.makedirs(s2_dir, exist_ok=True)
+            os.makedirs(s1_processed_dir, exist_ok=True)
 
-            # ==================================================================
-            # Stage 1 | Segmentation
-            print("\n[Stage 1] Starting Segmentation...")
+            dir = f"{seg_save_base_dir}/{filename_wo_ext}/{inst_dir_name}"
+            log_file_path = os.path.join(dir, "time_log.txt")
+
+            # Stage 1: Segmentation
             stage1_start = time.time()
             crop_list = run_segmentation_recursive(
                 image_path=img_path, max_depth=1, window_size=120,
@@ -985,12 +1252,16 @@ task instruction, a screen observation, guess where should you tap.
                 start_id=0,
                 var_thresh=VAR_THRESH
             )
+            stage1_end = time.time()
+            measure_and_log_time("Stage 1 Segmentation", stage1_start, stage1_end)
 
             if crop_list is None:
                 print(f"Segmentation failed for {img_path}. Skipping this image.")
                 num_segmentation_failed += 1
                 continue
 
+            # Stage 1 Processed
+            stage1_processed_start = time.time()
             only_lv_1 = [crop for crop in crop_list if crop.get("level") == 1]
             if len(only_lv_1) == 0:
                 print(f"No level 1 crops found for {img_path}. Skipping this image.")
@@ -1002,42 +1273,53 @@ task instruction, a screen observation, guess where should you tap.
                 resize_dict={0: THUMBNAIL_RESIZE_RATIO, 1: S1_RESIZE_RATIO},
                 use_thumbnail=True
             )
-            stage1_end = time.time()
+            stage1_processed_end = time.time()
+            measure_and_log_time("Stage 1 Processed", stage1_processed_start, stage1_processed_end)
 
-            # ==================================================================
-            # Stage 1-2 | Find Top Q
-            stage1_2_start = time.time()
+            # Stage 2: Attention Refinement
+            stage2_start = time.time()
             msgs = create_msgs(crop_list=stage_crop_list, question=question)
+            attn_vis_dir = os.path.join(s1_dir, "attn_map")
 
-            # Top Q 고르기
+            print()
+
+            for _stage_crop in stage_crop_list:
+                _stage_crop['resized_img'].save(f"{seg_save_base_dir}/{filename_wo_ext}/{inst_dir_name}/s1_processed/{_stage_crop['id']}.png")
             s1_top_q_crop_ids, s1_top_q_bboxes, s1_raw_res_dict, s1_crop_list_out = run_selection_pass(
-                msgs=msgs, crop_list=stage_crop_list, top_q=TOP_Q, drop_indices=[0], attn_vis_dir=s1_dir
+                msgs=msgs, crop_list=stage_crop_list, top_q=TOP_Q, drop_indices=[0], attn_vis_dir=attn_vis_dir
             )
-            stage1_2_end = time.time()
-
-            # Stage 1 Total Time
-            total_time = stage1_2_end - stage1_start
-            print(f"Stage 1 Time: {total_time:.2f} sec / Segmentation: {stage1_end - stage1_start:.2f} sec / Find Top Q: {stage1_2_end - stage1_2_start:.2f} sec")
-
-            print(f"Selected Top Q Crops from Stage 1: {s1_top_q_crop_ids}")
-
-            # ==================================================================
-
-            #  Stage 1 | 모든 Crop Visualize
-            all_crops_bboxes = [crop["bbox"] for crop in stage_crop_list]
-            visualize_crop(save_dir=inst_dir, gt_bbox=original_bbox, top_q_bboxes=all_crops_bboxes,
-                            instruction=instruction, filename="s1_all_crop.png", click_point=None)
-            
-            # Stage 1 | top Q Visualize + GT가 안에 들어가는지 체크
-            visualize_crop(save_dir=inst_dir, gt_bbox=original_bbox, top_q_bboxes=s1_top_q_bboxes,
-                            instruction=instruction, filename="s1_top_q.png", click_point=None)
             s1_is_gt_in_top_q = check_gt_in_top_q_crops(top_q_bboxes=s1_top_q_bboxes, gt_bbox=original_bbox)
 
+            gt_vis_dir = os.path.join(s1_dir, "gt_vis")
+            visualize_result(
+                save_dir=gt_vis_dir, gt_bbox=original_bbox, top_q_bboxes=s1_top_q_bboxes,
+                instruction=instruction, click_point=None
+            )
+
+            stage2_end = time.time()
+            measure_and_log_time("Stage 2 Attention Refinement", stage2_start, stage2_end)
+
+            # Total Time
+            total_time = (stage1_end - stage1_start) + (stage1_processed_end - stage1_processed_start) + (stage2_end - stage2_start)
+            with open(log_file_path, "a") as log_file:
+                log_file.write(f"Total Time: {total_time:.2f} seconds\n")
+            print(f"🕖 Total Time: {total_time:.2f} seconds")
+
+            # [Stage 1]
+            attn_vis_dir = os.path.join(seg_save_base_dir, filename_wo_ext, inst_dir_name , "s1/attn_map")
+            s1_top_q_crop_ids, s1_top_q_bboxes, s1_raw_res_dict, s1_crop_list_out = run_selection_pass(
+                msgs=msgs, crop_list=stage_crop_list, top_q=TOP_Q, drop_indices=[0], attn_vis_dir=attn_vis_dir
+            )
+            s1_is_gt_in_top_q = check_gt_in_top_q_crops(top_q_bboxes=s1_top_q_bboxes, gt_bbox=original_bbox)
+
+            gt_vis_dir = os.path.join(seg_save_base_dir, filename_wo_ext, inst_dir_name , f"s1")
+            visualize_result(
+                save_dir=gt_vis_dir, gt_bbox=original_bbox, top_q_bboxes=s1_top_q_bboxes,
+                instruction=instruction, click_point=None
+            )
+
             res_board_dict[1]["gt_score_list"].append(1 if s1_is_gt_in_top_q else 0)
-            if s1_is_gt_in_top_q:
-                print("☑️ Top Q contain Ground Truth")
-            else:
-                print("🙅🏻 Top Q NOT contain Ground Truth")
+            print(f"s1 gt_contained: {s1_is_gt_in_top_q}")
 
             res_board_dict[1]["top_q_crop_ids"] = s1_top_q_crop_ids
             res_board_dict[1]["raw_attn_dict"] = s1_raw_res_dict
@@ -1049,9 +1331,21 @@ task instruction, a screen observation, guess where should you tap.
                 if "token_span" in c: del c["token_span"]
             res_board_dict[1]["crop_list"] = s1_crop_list_out
 
+            print(f"Selected Crops from Stage 1: {s1_top_q_crop_ids}")
 
-            #! [Stage 2] Attention Refinement Pass -------------------------------------
+
+            # [Stage 2] Attention Refinement Pass-------------------------------------
             print("\n[Stage 2] Starting Attention Refinement Pass...")
+
+            question_template = """
+You are a helpful assistant. Based on the screen image and instruction, provide the exact (x, y) coordinates to tap.
+The screen resolution is {width}x{height}. Your answer must be only the coordinates in the format [x, y].
+
+# Instruction
+{task_prompt}
+
+# Answer
+"""#근데 이렇게 해도 [x y] [x y] , 혹은 [a,b,c,d] 처럼 나오는 경우 있음.
 
             original_crop_map = {c['id']: c for c in crop_list}
             s2_input_crop_ids = set()
@@ -1061,43 +1355,55 @@ task instruction, a screen observation, guess where should you tap.
                 s2_input_crop_ids.add(crop_id)
             s2_input_crops = [original_crop_map[cid] for cid in s2_input_crop_ids if cid in original_crop_map]
 
-            # run_refinement_pass 호출 시 gt_bbox를 넘겨주고, 성공 여부를 final_success에 저장
-            final_success = run_refinement_pass(
-                crop_list=s2_input_crops,
-                question=question,
-                original_image=original_image,
-                save_dir=s2_dir,
-                gt_bbox=original_bbox # gt_bbox 전달
-            )
-            if final_success:
-                print("✅ Grounding Success")
+            if len(s2_input_crops) <= 1:
+                print("No crops from Stage 1 to refine. Skipping Stage 2.")
+                final_success = False # Stage 2를 건너뛰면 실패로 간주
+                res_board_dict[2]["is_gt_in_top_q"] = bool(final_success)
+                res_board_dict[2]["gt_score_list"].append(1 if final_success else 0)
             else:
-                print("❌ Grounding Fail")
-            
-            # -------------------------------------------------------------------------
-            # 각 inst_dir_name마다 성공 여부에 따라 디렉토리 이름 변경
-            new_inst_dir_name = f"{inst_dir_name} {'✅' if final_success else '❌'}"
-            new_dir = os.path.join(save_dir, "seg", filename_wo_ext, new_inst_dir_name)
-            if os.path.exists(new_dir):  # 기존에 동일한 이름의 폴더가 있으면 삭제
-                try:
-                    shutil.rmtree(new_dir)
-                    print(f"Existing directory '{new_dir}' removed.")
-                except Exception as e:
-                    print(f"Failed to remove existing directory '{new_dir}': {e}")
-            if os.path.exists(inst_dir):
-                try:
-                    os.rename(inst_dir, new_dir)
-                except Exception as e:
-                    print(f"Failed to rename directory: {e}")
-            # -------------------------------------------------------------------------
+                print(f"Stage 2 will use crops: {[c['id'] for c in s2_input_crops]}")
+                s2_save_dir = os.path.join(seg_save_base_dir, filename_wo_ext, inst_dir_name, "s2_refined")
+                
+                # run_refinement_pass 호출 시 gt_bbox를 넘겨주고, 성공 여부를 final_success에 저장
+                final_success = run_refinement_pass(
+                    crop_list=s2_input_crops,
+                    question=question,
+                    original_image=original_image,
+                    save_dir=s2_save_dir,
+                    gt_bbox=original_bbox # gt_bbox 전달
+                )
 
-            res_board_dict[2]["is_gt_in_top_q"] = bool(final_success)
-            res_board_dict[2]["gt_score_list"].append(1 if final_success else 0)
+                # 각 inst_dir_name마다 성공 여부에 따라 디렉토리 이름 변경
+                new_inst_dir_name = f"{inst_dir_name} {'✅' if final_success else '❌'}"
+                new_dir = os.path.join(seg_save_base_dir, filename_wo_ext, new_inst_dir_name)
+                # 기존에 동일한 이름의 폴더가 있으면 삭제
+                if os.path.exists(new_dir):
+                    try:
+                        shutil.rmtree(new_dir)  # 폴더 삭제
+                        print(f"Existing directory '{new_dir}' removed.")
+                    except Exception as e:
+                        print(f"Failed to remove existing directory '{new_dir}': {e}")
+
+                # 디렉토리 이름 변경
+                if os.path.exists(dir):
+                    try:
+                        os.rename(dir, new_dir)
+                        # print(f"Directory renamed to: {new_dir}")
+                    except Exception as e:
+                        print(f"Failed to rename directory: {e}")
+                # else:
+                    # print(f"Directory does not exist: {dir}")
+
+                # res_board_dict[2]["is_gt_in_top_q"] 변수명을 is_grounding_success 등으로 바꿔도 좋지만,
+                # 일단 기존 변수명을 재활용하여 점수 리스트에 추가합니다.
+                res_board_dict[2]["is_gt_in_top_q"] = bool(final_success)
+                res_board_dict[2]["gt_score_list"].append(1 if final_success else 0)
 
             _gt_score_list = res_board_dict[2]["gt_score_list"]
             up2now_gt_score = calc_acc(_gt_score_list)
             print(f"Up2Now S2 Grounding Accuracy:{up2now_gt_score}") # 출력 메시지 수정
-            print("\n----------------------\n")
+            print("------")
+            print()
 
             item_res['filename'] = filename
             item_res['data_type'] = item["data_type"]
@@ -1109,9 +1415,10 @@ task instruction, a screen observation, guess where should you tap.
             item_res['num_crop'] = len(stage_crop_list)
             task_res.append(item_res)
 
-        #! ==================================================
+
         # 마지막 결과 모음 정리
-        with open(os.path.join(save_dir, dataset), "w") as f:
+        # print(task_res[0])
+        with open(os.path.join(args.save_dir, dataset), "w") as f:
             json.dump(task_res, f, indent=4, ensure_ascii=False, cls=NpEncoder)
 
         print("==================================================")
@@ -1127,5 +1434,8 @@ task instruction, a screen observation, guess where should you tap.
             "acc": calc_acc(_gt_score_list)
         }
 
-        with open(os.path.join(save_dir, f"{task}_metrics.json"), "w") as mf:
+        with open(os.path.join(args.save_dir, f"{task}_metrics.json"), "w") as mf:
             json.dump(metrics, mf, ensure_ascii=False, indent=4)
+
+    # Save all time logs at the end
+    save_time_logs(log_file_path)
