@@ -24,7 +24,7 @@ from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor, Auto
 # Project-Local Modules
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 from qwen_vl_utils import process_vision_info
-from crop5 import run_segmentation_recursive  # ! crop
+from crop5 import run_segmentation_recursive  #! 어떤 crop 파일 사용?
 
 #! Argument =======================
 
@@ -413,7 +413,7 @@ def run_refinement_pass(crop_list: List, question: str, original_image: Image, s
     return is_success
 
 def visualize_crop(save_dir, gt_bbox, top_q_bboxes, instruction, filename, click_point=None):
-    #! Visualize ground truth and selected crop on the image
+    # Visualize ground truth and selected crop on the image
     result_img = Image.open(img_path)
 
     draw = ImageDraw.Draw(result_img)
@@ -739,7 +739,7 @@ def boxfilter_sum(arr: np.ndarray, r: int):
     S = ii[y1, x1] - ii[y0, x1] - ii[y1, x0] + ii[y0, x0]
     return S
 
-#! Stage 2 메인 함수 (neighsum 방식)
+#! Stage 2 맞추기 메인 함수 (neighsum 방식)
 def visualize_aggregated_attention(
         crop_list,
         original_image, inst_dir, gt_bbox, individual_maps_dir=None,
@@ -967,7 +967,7 @@ task instruction, a screen observation, guess where should you tap.
 
             inst_dir_name = re.sub(r'\W+', '_', instruction).strip('_')
 
-            #! 이 반복문 내에서는 보기 쉽게 inst dir, s1_dir, s2_dir만 사용
+            #* 이 반복문 내에서는 보기 쉽게 inst dir, s1_dir, s2_dir만 사용
             inst_dir = os.path.join(save_dir, "seg", filename_wo_ext, inst_dir_name)
             s1_dir = os.path.join(inst_dir, "stage1")
             s2_dir = os.path.join(inst_dir, "stage2")
@@ -1110,8 +1110,7 @@ task instruction, a screen observation, guess where should you tap.
             task_res.append(item_res)
 
         #! ==================================================
-        #! 마지막 결과 모음 정리
-        # print(task_res[0])
+        # 마지막 결과 모음 정리
         with open(os.path.join(save_dir, dataset), "w") as f:
             json.dump(task_res, f, indent=4, ensure_ascii=False, cls=NpEncoder)
 
