@@ -12,4 +12,4 @@ output/
 dcgen/
 
 # conda env
-conda_env/
+env_zonui/

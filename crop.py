@@ -1,268 +1,331 @@
+# crop5.py
+"""
+요구사항 요약:
+    - s1 폴더에 all.png 저장
+    - 20% 넘는 큰 그림은 최종적으로 반환하지 않으면 oversize/에 저장
+    - 20% 이하(또는 실패로 강제 포함)는 s1 폴더 바로 아래에
+        crop{번호}_rec{깊이}[ _fail].png 로 저장
+    * 번호는 '최종적으로 사용되는 crop'에 대해 1부터 부여
+    * level==0(썸네일)은 id=0 고정, 파일 저장은 all.png 만
+    - 좌표는 절대 좌표 유지, 중복 저장 금지
+    - MAX_RECURSION_DEPTH 번 반복해도 실패하면 fail로 강제 포함
+반환:
+    List[dict]: 0번 썸네일 + level1 crop들(dict는 run_grounding.py가 쓰는 스펙 유지)
+"""
+
 import os
 import json
+import shutil
+from pathlib import Path
+from typing import List, Dict, Tuple, Optional
+from dataclasses import dataclass, asdict
 from PIL import Image
 
-from dcgen.utils import ImgSegmentation
+from dcgen.utils2 import ImgSegmentation  #* dcgen util 사용
 
-def crop_and_save(image_path: str, json_path: str, output_dir: str, start_id: int):
+# ------------------------------
+# 설정 상수
+# ------------------------------
+DIFF_THRESH    = 45            # dcgen ImgSegmentation 인자 유지
+DIFF_PORTION   = 0.9           # dcgen ImgSegmentation 인자 유지
+
+MAX_AREA_RATIO = 0.40          #! 40% 보다 크면 재귀
+MAX_RECURSION_DEPTH = 3        # 최대 재귀 횟수
+RETRY_GROWTH   = 5             # var_thresh 증가 배율
+
+@dataclass
+class CropItem:
+    id: int
+    level: int
+    bbox: List[int]                  # [left, top, right, bottom] (절대 좌표)
+    recursion_depth: int = 0
+    fail: bool = False               # 세그 실패로 강제 채택 표시
+    parent_id: Optional[int] = None
+    filename: Optional[str] = None   # 디스크 저장 파일명
+
+# ------------------------------
+# 유틸
+# ------------------------------
+
+def _area(b):
+    return max(0, b[2]-b[0]) * max(0, b[3]-b[1])
+
+def _ratio(b, W, H):
+    A = _area(b)
+    return A / float(max(1, W*H))
+
+def _bbox_to_tuple(b):
+    return (int(b[0]), int(b[1]), int(b[2]), int(b[3]))
+
+def _dedup_key(b):
+    # 박스 중복 제거 키 (좌표 스냅)
+    return (int(b[0]), int(b[1]), int(b[2]), int(b[3]))
+
+def _safe_remove_tree(p: Path):
+    try:
+        if p.exists():
+            shutil.rmtree(p)
+    except Exception:
+        pass
+
+# ------------------------------
+# 세그멘테이션 1회 실행 + JSON 읽기
+# ------------------------------
+
+def _run_imgseg_once(image_path: str, max_depth: int, window_size: int, var_thresh: int, json_out: Path) -> Optional[List[Dict]]:
     """
-    image_path: 원본 이미지 파일 경로
-    json_path: bbox 정보가 담긴 JSON 파일 경로
-    output_dir: 잘라낸 이미지를 저장할 디렉터리
+    ImgSegmentation 1회 실행하고 JSON을 json_out에 저장한 뒤 파싱해서 반환
+    각 항목은 {"bbox":[l,t,r,b], "level":int} 형태라고 가정
     """
-    # 출력 디렉터리 생성
-    os.makedirs(output_dir, exist_ok=True)
-    # 자른 이미지와 메타데이터를 담을 리스트
-    results = []
-
-    # JSON 로드
-    with open(json_path, 'r', encoding='utf-8') as f:
-        data = json.load(f)
-
-    # 원본 이미지 열기
-    img = Image.open(image_path)
-
-    # 각 bbox별로 크롭 및 저장
-    for idx, item in enumerate(data):
-        left, top, right, bottom = item["bbox"]
-        level = item.get("level", None)
-
-        # 영역 자르기
-        
-        cropped = img.crop((left, top, right, bottom))
-        # if level != 0:
-        #     # reduce the cropped image size by ~40% (scale to 60% of original)
-        #     width, height = cropped.size
-        #     new_size = (int(width * 0.6), int(height * 0.6))
-        #     cropped = cropped.resize(new_size, Image.ANTIALIAS)
-
-        # 파일명 지정 (예: crop_0_level0.png)
-        if level is not None:
-            filename = f"crop_{start_id + idx}_level{level}.png"
-        else:
-            filename = f"crop_{start_id + idx}.png"
-
-        # 저장
-        save_path = os.path.join(output_dir, filename)
-        cropped.save(save_path)
-        # print(f"Saved: {save_path}")
-        results.append({
-            "img": cropped,
-            "id": start_id + idx,
-            "bbox": item["bbox"],
-            "level": level
-        })
-
-    return results
-
-def run_segmentation(image_path: str, max_depth: int, window_size: int, 
-                     output_json_path: str, output_image_path: str, start_id: int = 0, var_thresh: int = 120):
-    """
-    ImgSegmentation을 실행하여 crop을 생성합니다. 만약 crop이 하나도 생성되지 않으면
-    var_thresh를 두 배씩 올려가며 재시도합니다.
-
-    하이퍼파라미터:
-    - var_thresh: 시작 threshold
-    - MAX_VAR_THRESH: 재시도 시 상한
-    """
-    #! Segmentation 재시도 하이퍼파라미터
-    MAX_VAR_THRESH = 3000  # var_thresh 상한 (120 -> 600 -> 3000)
-
-    attempt = 0
-    # 요청: 항상 var_thresh으로 시작, 크롭이 없을 때만 두 배로 증가
-    cur_thresh = var_thresh
-    last_error = None
-    crop_list = None
-
-    tried_values = []
-    while True:
-        tried_values.append(cur_thresh)
-        try:
-            img_seg = ImgSegmentation(
-                img=image_path,
-                max_depth=max_depth,
-                var_thresh=cur_thresh,
-                diff_thresh=45,
-                diff_portion=0.9,
-                window_size=window_size
-            )
-
-            # 동일 경로에 덮어쓰기 (최근 시도 기준)
-            img_seg.to_json(path=output_json_path)
-            crop_list = crop_and_save(image_path, output_json_path, output_image_path, start_id)
-            
-            # level 0 원본 제외 하나라도 나왔는지 확인
-            if crop_list and len(crop_list) > 1:
-                # print(f"Segmentation succeeded with var_thresh={cur_thresh} (attempt {attempt+1}, tried={tried_values})")
-                return crop_list
-            else:
-                print(f"🚨 Segmentation produced no crops with var_thresh={cur_thresh}")
-                # return crop_list  #! segmentation 그냥 일단 취소 (threshold 올리면서 반복할거면 주석해제 / 근데 오래걸림.)
-        except Exception as e:
-            last_error = e
-            print(f"Segmentation error with var_thresh={cur_thresh}: {e}")
-
-        # 다음 시도 준비 (두 배 증가)
-        attempt += 1
-        next_thresh = cur_thresh * 5
-        if next_thresh <= MAX_VAR_THRESH:
-            cur_thresh = next_thresh
-        else:
-            # 상한을 마지막으로 한 번 더 시도 (ex: 120→...→2048→3500)
-            if cur_thresh != MAX_VAR_THRESH:
-                cur_thresh = MAX_VAR_THRESH
-            else:
-                break
-
-    print(f"❌ segmentation failed: No crops generated for {image_path} after tries {tried_values}")
-    if last_error:
-        print(f"Last error: {last_error}")
-    return None
-
-def run_segmentation_recursive(image_path: str, max_depth: int, window_size: int, 
-                               output_json_path: str, output_image_path: str, start_id: int = 0, var_thresh: int = 120,
-                               max_area_ratio: float = 0.20, max_recursion: int = 3):
-    """
-    재귀적으로 segmentation을 수행하여 crop 크기를 제한합니다.
-    기존 run_segmentation 방식을 반복 사용하여 큰 crop들을 더 작은 단위로 분할합니다.
-
-    Parameters:
-    - image_path: 원본 이미지 파일 경로
-    - max_depth: ImgSegmentation의 최대 깊이
-    - window_size: ImgSegmentation의 윈도우 크기
-    - output_json_path: bbox 정보를 저장할 JSON 파일 경로
-    - output_image_path: 잘라낸 이미지를 저장할 디렉터리
-    - start_id: crop ID 시작 번호
-    - max_area_ratio: 원본 면적 대비 최대 허용 비율 (기본값: 0.20 = 20%)
-    - max_recursion: 최대 재귀 깊이 (기본값: 3)
-    """
-    #! 재귀적 crop 분할을 위한 하이퍼파라미터
-    MAX_AREA_RATIO = max_area_ratio        # 원본 면적 대비 최대 허용 비율
-    MAX_RECURSION_DEPTH = max_recursion    # 최대 재귀 깊이 (무한 반복 방지)
-    
-    # 원본 이미지 정보
-    original_img = Image.open(image_path)
-    original_area = original_img.width * original_img.height
-    
-    # 초기 segmentation 실행 (내부에서 var_thresh 재시도)
-    # print(f"Starting initial segmentation for {image_path}")
-    
-    crop_list = run_segmentation(image_path, max_depth, window_size, output_json_path, output_image_path, start_id, var_thresh)
-
-
-    #! Segmentation 결과가 없을 경우 바로 리턴
-    if not crop_list:
-        print(f"Segmentation failed: No crops generated for {image_path}")
+    try:
+        seg = ImgSegmentation(
+            img=image_path,
+            max_depth=max_depth,
+            var_thresh=var_thresh,
+            diff_thresh=DIFF_THRESH,
+            diff_portion=DIFF_PORTION,
+            window_size=window_size
+        )
+        seg.to_json(path=str(json_out))
+        with open(json_out, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, list):
+            return None
+        return data
+    except Exception as e:
+        print(f"[seg] error var_thresh={var_thresh}: {e}")
         return None
 
-    # 재귀적으로 큰 crop들을 처리
-    recursion_count = 0
-    next_crop_id = start_id + len(crop_list)
+def _run_imgseg_with_retries(image_path: str, max_depth: int, window_size: int, var_thresh: int, json_out: Path) -> Optional[List[Dict]]:
+    """
+    var_thresh를 점증시키며 시도
+    MAX_RECURSION_DEPTH 만큼 
+    """
+    tried = []
+    cur = var_thresh
+    last = None
 
-    while recursion_count < MAX_RECURSION_DEPTH:
-        # 면적이 기준을 초과하는 큰 crop들 찾기 (level==0 제외)
-        large_crops = []
-        for crop in crop_list:
-            if crop.get("level") != 0:
-                left, top, right, bottom = crop["bbox"]
-                crop_area = (right - left) * (bottom - top)
-                if crop_area > original_area * MAX_AREA_RATIO:
-                    large_crops.append(crop)
-        
-        if not large_crops:
-            print(f"All crops meet the size criteria. Stopping recursion at depth {recursion_count}")
-            break
-            
-        print(f"Recursion depth {recursion_count + 1}: Found {len(large_crops)} crops exceeding {MAX_AREA_RATIO*100:.1f}% of original area")
-        
-        # 큰 crop들에 대해 추가 segmentation 수행
-        new_crops = []
-        for large_crop in large_crops:
-            # 큰 crop을 임시 이미지로 저장
-            left, top, right, bottom = large_crop["bbox"]
-            temp_crop_img = original_img.crop((left, top, right, bottom))
-            
-            # 임시 파일 경로 생성
-            temp_dir = os.path.join(output_image_path, f"temp_recursion_{recursion_count}")
-            os.makedirs(temp_dir, exist_ok=True)
-            temp_image_path = os.path.join(temp_dir, f"temp_crop_{large_crop['id']}.png")
-            temp_crop_img.save(temp_image_path)
-            
-            # 임시 crop에 대해 segmentation 수행
-            temp_json_path = os.path.join(temp_dir, f"temp_crop_{large_crop['id']}.json")
-            temp_output_dir = os.path.join(temp_dir, f"sub_crops_{large_crop['id']}")
-            
-            # try:
-            sub_crops = run_segmentation(
-                temp_image_path, max_depth, window_size, 
-                temp_json_path, temp_output_dir, next_crop_id
+    for _ in range(MAX_RECURSION_DEPTH):
+        tried.append(cur)
+        data = _run_imgseg_once(image_path, max_depth, window_size, cur, json_out)
+        if data is not None and len(data) > 0:
+            # 최소 level=1이 존재하는지 확인
+            if any((d.get("level", 1) != 0) for d in data):
+                return data
+        last = data
+        cur *= RETRY_GROWTH
+
+    # 최종 실패
+    print(f"[seg] no result after tries {tried}")
+    return last
+
+# ------------------------------
+# 하위(부분) 이미지에 대해 재귀 분할
+# ------------------------------
+
+def _recursive_split(
+    original_img: Image.Image,
+    abs_bbox: List[int],
+    depth: int,
+    max_depth_limit: int,
+    max_area_ratio: float,
+    max_depth: int, window_size: int, var_thresh: int,
+    work_root: Path
+) -> Tuple[List[Tuple[List[int], int, bool]], List[List[int]]]:
+    """
+    반환:
+      kept: List of (abs_bbox, recursion_depth, fail_flag)
+      oversize_dump: 최종적으로 반환하지 않는(oversize) 절대 박스들
+    """
+    W, H = original_img.size
+
+    # 1) 큰 영역을 잘라 임시 파일로 세그 시도
+    l, t, r, b = _bbox_to_tuple(abs_bbox)
+    sub = original_img.crop((l, t, r, b))
+
+    tmp_dir = work_root / f"tmp_rec_{depth}"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    tmp_img = tmp_dir / "img.png"
+    tmp_json = tmp_dir / "seg.json"
+    sub.save(tmp_img)
+
+    data = _run_imgseg_with_retries(str(tmp_img), max_depth=max_depth, window_size=window_size, var_thresh=var_thresh, json_out=tmp_json)
+
+    kept: List[Tuple[List[int], int, bool]] = []
+    oversize_dump: List[List[int]] = []
+
+    if data is None:
+        # 세그 자체가 실패 → 원래 abs_bbox를 fail로 포함
+        kept.append((abs_bbox, depth, True))
+        return kept, oversize_dump
+
+    # data 안에는 level 0(썸네일) + level 1들이 함께 있을 수 있음
+    # level 1만 처리
+    subs = [d for d in data if d.get("level", 1) != 0 and "bbox" in d]
+    if len(subs) == 0:
+        # 분할 결과 없음 → abs_bbox fail 포함
+        kept.append((abs_bbox, depth, True))
+        return kept, oversize_dump
+
+    for d in subs:
+        rel = d["bbox"]  # 부분 이미지 기준 좌표
+        sL, sT, sR, sB = int(rel[0]), int(rel[1]), int(rel[2]), int(rel[3])
+        # 절대 좌표 변환
+        abs_child = [l + sL, t + sT, l + sR, t + sB]
+        ratio = _ratio(abs_child, W, H)
+
+        if ratio <= max_area_ratio:
+            kept.append((abs_child, depth, False))
+        else:
+            # 더 쪼갤 수 있는지 확인
+            if depth + 1 < max_depth_limit:
+                child_kept, child_oversize = _recursive_split(
+                    original_img, abs_child, depth + 1, max_depth_limit, max_area_ratio,
+                    max_depth, window_size, var_thresh, work_root
+                )
+                kept.extend(child_kept)
+                oversize_dump.extend(child_oversize)
+            else:
+                # 더 못 쪼갬 → oversize로 보관 (반환 안 함)
+                oversize_dump.append(abs_child)
+
+    return kept, oversize_dump
+
+# ------------------------------
+# 메인 엔트리
+# ------------------------------
+
+def run_segmentation_recursive( image_path: str,
+                                max_depth: int,
+                                window_size: int,
+                                output_json_path: str,
+                                output_image_path: str,
+                                start_id: int = 0,
+                                var_thresh: int = 120,
+                                max_area_ratio: float = MAX_AREA_RATIO,
+                                max_recursion: int = 3):
+    
+    s1_dir = Path(output_image_path)
+    s1_dir.mkdir(parents=True, exist_ok=True)
+    oversize_dir = s1_dir / "oversize"
+    oversize_dir.mkdir(exist_ok=True)
+
+    # 0) 원본 저장
+    try:
+        original_img = Image.open(image_path).convert("RGB")
+    except Exception as e:
+        print(f"[seg] cannot open image: {e}")
+        return None
+    W, H = original_img.size
+    (s1_dir / "all.png").write_bytes(Path(image_path).read_bytes())
+
+    # 1) 초기 세그
+    output_json_path = Path(output_json_path)
+    data = _run_imgseg_with_retries(image_path, max_depth=max_depth, window_size=window_size, var_thresh=var_thresh, json_out=output_json_path)
+
+    if data is None or len(data) == 0:
+        print("[seg] initial segmentation failed → 썸네일만 반환")
+        return [{
+            "img": original_img,
+            "id": 0,
+            "bbox": [0, 0, W, H],
+            "level": 0
+        }]
+
+    # 2) 수집 단계
+    final_kept: List[Tuple[List[int], int, bool]] = []   # (abs_bbox, recursion_depth, fail_flag)
+    final_dump: List[List[int]] = []                    # oversize만 모아 저장용
+    seen = set()
+
+    # 초기 level==1 후보
+    init_candidates = [d for d in data if d.get("level", 1) != 0 and "bbox" in d]
+
+    # 초기 후보 각각 처리
+    for d in init_candidates:
+        b = [int(x) for x in d["bbox"]]
+        key = _dedup_key(b)
+        if key in seen:
+            continue
+        seen.add(key)
+
+        ratio = _ratio(b, W, H)
+        if ratio <= max_area_ratio:
+            final_kept.append((b, 0, False))
+        else:
+            # 재귀 분할
+            work_root = s1_dir / "_tmp_work"
+            work_root.mkdir(exist_ok=True)
+            kept, dump = _recursive_split(
+                original_img, b, 1, max_recursion, max_area_ratio,
+                max_depth, window_size, var_thresh,
+                work_root=work_root
             )
+            final_kept.extend(kept)
+            final_dump.extend(dump)
+            _safe_remove_tree(work_root)
 
-            if sub_crops is not None:
-            
-              # 상대 좌표를 절대 좌표로 변환 + 최종 crop 생성
-              for sub_crop in sub_crops:
-                  if sub_crop.get("level") != 0:
-                      s_left, s_top, s_right, s_bottom = sub_crop["bbox"]
-                      absolute_bbox = [left + s_left, top + s_top, left + s_right, top + s_bottom]
-                      sub_crop["bbox"] = absolute_bbox
-                      sub_crop["parent_id"] = large_crop["id"]
-                      sub_crop["recursion_depth"] = recursion_count + 1
-                      
-                      # 원본 이미지에서 다시 crop
-                      final_cropped = original_img.crop(tuple(absolute_bbox))
-                      sub_crop["img"] = final_cropped
-                      
-                      new_crops.append(sub_crop)
-                      next_crop_id += 2
-                   
-                
-                # 임시 파일 정리
-                # try:
-                #     os.remove(temp_image_path)
-                # except Exception:
-                #     pass
-                # try:
-                #     if os.path.exists(temp_json_path):
-                #         os.remove(temp_json_path)
-                # except Exception:
-                #     pass
-                    
-            # except Exception as e:
-            #     print(f"Warning: Failed to process large crop {large_crop['id']}: {e}")
-            #     continue
-        
-        # 큰 crop들을 새로운 작은 crop들로 교체
-        crop_list = [crop for crop in crop_list if crop not in large_crops]
-        crop_list.extend(new_crops)
-        
-        
-        recursion_count += 1
-        print(f"Recursion depth {recursion_count} completed. Total crops: {len(crop_list)}")
-    
-    if recursion_count >= MAX_RECURSION_DEPTH:
-        remaining_large = []
-        for crop in crop_list:
-            if crop.get("level") != 0:
-                l, t, r, b = crop["bbox"]
-                crop_area = (r - l) * (b - t)
-                if crop_area > original_area * MAX_AREA_RATIO:
-                    remaining_large.append(crop["id"])
-        if remaining_large:
-            print(f"Warning: Maximum recursion depth reached. {len(remaining_large)} crops still exceed size limit: {remaining_large}")
-    
-    print(f"Recursive segmentation completed. Final crop count: {len(crop_list)}")
+    # 3) oversize 저장 (반환하지 않는 것만)
+    dump_seen = set()
+    for b in final_dump:
+        k = _dedup_key(b)
+        if k in dump_seen:
+            continue
+        dump_seen.add(k)
+        try:
+            crop = original_img.crop(_bbox_to_tuple(b))
+            # 이름: over_{l}_{t}_{r}_{b}.png (고유)
+            fname = f"over_{b[0]}_{b[1]}_{b[2]}_{b[3]}.png"
+            crop.save(oversize_dir / fname)
+        except Exception as e:
+            print(f"[seg] oversize save fail: {e}")
 
-    # 최종 crop_list 개수 출력
-    print(f"[seg] final_count={len(crop_list)}")
+    # 4) 최종 반환 목록(레벨/ID 정리)
+    #    - id 0: 썸네일
+    #    - id 1..N: 채택된 crop (fail 포함)
+    #    - 번호 부여는 '최종적으로 사용되는 crop' 기준으로 1부터
+    # 좌표 중복 제거
+    kept_unique = []
+    kept_seen = set()
+    for b, rec, fail in final_kept:
+        k = _dedup_key(b)
+        if k in kept_seen:
+            continue
+        kept_seen.add(k)
+        kept_unique.append((b, rec, fail))
 
-    return crop_list
+    # 정렬 기준: 상단-좌측 우선
+    kept_unique.sort(key=lambda x: (x[0][1], x[0][0]))
 
+    results: List[Dict] = []
+    # 썸네일 먼저
+    results.append({
+        "img": original_img,
+        "id": 0,
+        "bbox": [0, 0, W, H]
+    })
 
-# if __name__ == "__main__":
-#     # 예시 사용법
-#     IMAGE_PATH = "input.jpg"        # 원본 이미지 파일
-#     JSON_PATH  = "bboxes.json"      # bbox 정보 JSON
-#     OUTPUT_DIR = "crops"           # 잘라낸 이미지를 저장할 폴더
+    # 파일 저장 + id 부여
+    running_idx = 1
+    for b, rec, fail in kept_unique:
+        try:
+            crop_img = original_img.crop(_bbox_to_tuple(b))
+            # 파일명 규칙
+            fname = f"crop{running_idx}_rec{rec}{'_fail' if fail else ''}.png"
+            crop_img.save(s1_dir / fname)
 
-#     crop_and_save(IMAGE_PATH, JSON_PATH, OUTPUT_DIR)
+            results.append({
+                "img": crop_img,
+                "id": running_idx,
+                "bbox": b,
+                "recursion_depth": rec,
+                "fail": bool(fail),
+                "filename": fname
+            })
+            running_idx += 1
+        except Exception as e:
+            print(f"[seg] save error: {e}")
+
+    # 디버그 출력
+    print(f"✂️  Total crop: {running_idx-1}")
+
+    return results

@@ -1,9 +1,9 @@
-# conda env create -p ./conda_env -f environment.yml
-# conda activate ./conda_env
+# conda env create -p ./env_zonui -f environment.yml
+# conda activate ./env_zonui
 
 #! 민규님이 쓰던 stage_env2 파일 그대로 yml화 - 필요없는거 너무 많아서 오래걸릴까봐 수정이 필요하긴 함.
 
-name: stage_env2
+name: env_zonui
 channels:
   - defaults
 dependencies:
