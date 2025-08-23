@@ -1,12 +1,15 @@
-# Conda environment
-
-- total package
-```
-conda env create -p ./conda_env -f environment.yml
-conda activate ./conda_env
-```
-
 # Run Grounding
+
+## zonui
+
 ```
-python run_grounding.py
+conda env create -p ./env_zonui -f environment.yml
+conda activate ./env_zonui
 ```
+
+```
+python run_zonui.py
+```
+
+## GUI Actor
+
