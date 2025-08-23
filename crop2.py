@@ -89,103 +89,88 @@ def collect_leaves_from_tree(tree_dict, base_level=0):
     _rec(tree_dict, base_level)
     return out
 
-def merge_until_stable(leaves, parent_size, min_w_ratio, min_h_ratio,
-                       v_overlap_thr=0.0, h_overlap_thr=0.0):
+def merge_small_segments(leaves, parent_size, min_w_ratio, min_h_ratio,
+                         v_overlap_thr=0.3, h_overlap_thr=0.3, max_iter=10):
     """
-    인접(pairwise) 병합만 반복 수행.
-    - 바로 좌/우(또는 상/하) '이웃' 중에서만 합침
-    - 우선순위: merge_count 적은 쪽 → 동률이면 더 짧은 쪽(폭/높이)
-    - 임계(min_w_ratio, min_h_ratio) 이상만 남을 때까지 반복
+    너무 얇은 조각(폭/높이 기준)을 이웃과 병합.
+    - leaves: [(bbox, level), ...]
+    - parent_size: (W, H)  -> 이 좌표계 픽셀 스케일 기준으로 판정
+    - min_w_ratio/min_h_ratio: 비율 임계
+    - v_overlap_thr/h_overlap_thr: 이웃으로 간주할 최소 겹침 비율
     """
     W, H = parent_size
-    cur = [(tuple(b), lvl, 0) for (b, lvl) in leaves]  # (bbox, level, merge_count)
+    cur = [(tuple(b), lvl) for (b, lvl) in leaves]
 
-    def _center(b):
-        return ((b[0]+b[2])*0.5, (b[1]+b[3])*0.5)
+    def by_x(e): return (e[0][0] + e[0][2]) / 2.0
+    def by_y(e): return (e[0][1] + e[0][3]) / 2.0
 
-    def _adjacent_pass(cur, span, min_ratio, axis):  # axis: 'x' or 'y'
-        if span <= 0 or min_ratio <= 0 or len(cur) <= 1:
-            return cur, False
-
-        # 정렬: x축이면 x중심, y축이면 y중심
-        order = sorted(range(len(cur)), key=lambda i: _center(cur[i][0])[0 if axis=='x' else 1])
-        used  = [False]*len(order)
-        out   = []
+    for _ in range(max_iter):
         changed = False
 
-        for p, i in enumerate(order):
-            if used[p]:
-                continue
-            b, lvl, cnt = cur[i]
-            w, h = bbox_w(b), bbox_h(b)
-            size = w if axis=='x' else h
-            need_merge = (size / span) < min_ratio
-
-            if need_merge:
-                # 바로 왼쪽/오른쪽(또는 위/아래) '사용 안 된' 이웃만 후보
-                left_p = p-1
-                while left_p >= 0 and used[left_p]:
-                    left_p -= 1
-                right_p = p+1
-                while right_p < len(order) and used[right_p]:
-                    right_p += 1
-
-                candidates = []
-                if left_p >= 0:
-                    j = order[left_p]
-                    b2, lvl2, cnt2 = cur[j]
-                    # 동률이면 '더 짧은 쪽' 우선: x축 병합이면 폭, y축 병합이면 높이
-                    short_metric = bbox_w(b2) if axis=='x' else bbox_h(b2)
-                    candidates.append((cnt2, short_metric, left_p, j, b2, lvl2))
-                if right_p < len(order):
-                    j = order[right_p]
-                    b2, lvl2, cnt2 = cur[j]
-                    short_metric = bbox_w(b2) if axis=='x' else bbox_h(b2)
-                    candidates.append((cnt2, short_metric, right_p, j, b2, lvl2))
-
-                if candidates:
-                    # merge_count 적은 쪽 → 동률이면 더 짧은 쪽
-                    candidates.sort(key=lambda x: (x[0], x[1]))
-                    _, _, picked_p, j, b2, lvl2 = candidates[0]
-                    new_bbox = merge_two(b, b2)
-                    new_cnt  = max(cnt, cur[j][2]) + 1
-                    out.append((new_bbox, max(lvl, lvl2), new_cnt))
-                    used[p] = True
-                    used[picked_p] = True
+        # 1) 폭이 너무 좁은 것 -> 좌/우 이웃과 병합
+        cur.sort(key=by_x)
+        i = 0
+        while i < len(cur):
+            b, lvl = cur[i]
+            w = bbox_w(b)
+            if W > 0 and (w / W) < min_w_ratio:
+                # 좌/우 후보 중 세로 겹침 가장 큰 이웃
+                best_j = -1
+                best_ov = -1.0
+                for j in [i - 1, i + 1]:
+                    if 0 <= j < len(cur):
+                        b2, _ = cur[j]
+                        ov = vertical_overlap(b, b2)
+                        if ov > best_ov:
+                            best_ov = ov
+                            best_j = j
+                if best_j >= 0 and best_ov >= v_overlap_thr:
+                    b2, lvl2 = cur[best_j]
+                    merged = merge_two(b, b2)
+                    new_lvl = max(lvl, lvl2)
+                    for idx in sorted([i, best_j], reverse=True):
+                        cur.pop(idx)
+                    cur.insert(min(i, best_j), (merged, new_lvl))
                     changed = True
-                    continue  # 이 i는 처리 끝
+                    continue
+            i += 1
 
-            # 병합 불필요 또는 이웃 없음 → 그대로 유지
-            used[p] = True
-            out.append((b, lvl, cnt))
+        # 2) 높이가 너무 낮은 것 -> 상/하 이웃과 병합
+        cur.sort(key=by_y)
+        i = 0
+        while i < len(cur):
+            b, lvl = cur[i]
+            h = bbox_h(b)
+            if H > 0 and (h / H) < min_h_ratio:
+                best_j = -1
+                best_ov = -1.0
+                for j in [i - 1, i + 1]:
+                    if 0 <= j < len(cur):
+                        b2, _ = cur[j]
+                        ov = horizontal_overlap(b, b2)
+                        if ov > best_ov:
+                            best_ov = ov
+                            best_j = j
+                if best_j >= 0 and best_ov >= h_overlap_thr:
+                    b2, lvl2 = cur[best_j]
+                    merged = merge_two(b, b2)
+                    new_lvl = max(lvl, lvl2)
+                    for idx in sorted([i, best_j], reverse=True):
+                        cur.pop(idx)
+                    cur.insert(min(i, best_j), (merged, new_lvl))
+                    changed = True
+                    continue
+            i += 1
 
-        return out, changed
-
-        # 끝 _adjacent_pass
-
-    # 임계 만족할 때까지 x→y 순으로 반복
-    while True:
-        changed_any = False
-        cur, ch1 = _adjacent_pass(cur, W, min_w_ratio, axis='x')
-        changed_any |= ch1
-        cur, ch2 = _adjacent_pass(cur, H, min_h_ratio, axis='y')
-        changed_any |= ch2
-
-        # 더 이상 합칠 게 없으면 종료
-        if not changed_any:
+        if not changed:
             break
 
-        # 혹시 아직도 임계 미달이 남았는지 확인해서 남아있으면 다음 루프로
-        small_exists = False
-        for b, _, _ in cur:
-            if (W > 0 and (bbox_w(b) / W) < min_w_ratio) or (H > 0 and (bbox_h(b) / H) < min_h_ratio):
-                small_exists = True
-                break
-        if not small_exists:
-            break
-
-    # (bbox, level)로 반환
-    return [(b, lvl) for (b, lvl, _) in cur]
+    # 경계 스냅(정수화)
+    snapped = []
+    for (b, lvl) in cur:
+        l, t, r, btm = b
+        snapped.append(((int(round(l)), int(round(t)), int(round(r)), int(round(btm))), lvl))
+    return snapped
 
 
 #! ================================================================================================
@@ -234,7 +219,7 @@ def crop(image_path,
     leaves_lvl1 = collect_leaves_from_tree(tree, base_level=0)
 
     # 1-2) 제로-드롭 병합 보정(너무 얇은/낮은 조각은 이웃과 병합)
-    leaves_lvl1_merged = merge_until_stable(
+    leaves_lvl1_merged = merge_small_segments(
         leaves=leaves_lvl1,
         parent_size=(abs_W1, abs_H1),  # ← 부모 bbox 말고, 원본×리사이즈 상수
         min_w_ratio=Y_MIN_RATIO,
@@ -282,7 +267,7 @@ def crop(image_path,
             # base_level=1 → 2차 리프는 level 2 이상
             leaves_lvl2 = collect_leaves_from_tree(tree2, base_level=1)
             # 2차 결과 병합도 sub_img_resized 좌표계로 수행
-            leaves_lvl2_merged = merge_until_stable(
+            leaves_lvl2_merged = merge_small_segments(
                 leaves=leaves_lvl2,
                 parent_size=(abs_W2, abs_H2),  # ← 지역 크기(잘린 영역) 말고, 원본×리사이즈 상수
                 min_w_ratio=Y_MIN_RATIO,
