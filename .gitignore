@@ -7,9 +7,7 @@ data/
 # output
 attn_output/
 output/
-
-# dcgen
-dcgen/
+crop_test/
 
 # conda env
 env_zonui/

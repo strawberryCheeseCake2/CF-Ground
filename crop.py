@@ -1,4 +1,4 @@
-# crop5.py
+# crop.py
 """
 요구사항 요약:
     - s1 폴더에 all.png 저장
@@ -21,7 +21,7 @@ from typing import List, Dict, Tuple, Optional
 from dataclasses import dataclass, asdict
 from PIL import Image
 
-from dcgen.utils2 import ImgSegmentation  #* dcgen util 사용
+from utils_dcgen import ImgSegmentation
 
 # ------------------------------
 # 설정 상수
