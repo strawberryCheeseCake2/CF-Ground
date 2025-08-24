@@ -1,8 +1,6 @@
 '''
-crop2.py는 crop 1개짜리가 많음
--> 오히려 그냥 1개짜리 crop이 top-q로 잃는게 없고, GUI Actor의 정확도가 워낙 높아서 좋아진거일 수 있음
-그리고 crop이 실패하면 나중에 Peak Memory가 증가함.
-그래서 오래걸리더라도 crop 실패가 적도록 반복문을 바꿈
+보통 crop 개수가 5개 이상일때 s1 miss 가 나옴
+crop을 2~4개로 맞추는게 가장 좋을듯
 '''
 
 from utils_dcgen import ImgSegmentation

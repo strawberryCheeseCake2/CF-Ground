@@ -11,3 +11,4 @@ crop_test/
 
 # conda env
 env_zonui/
+env_gui_actor/

@@ -21,29 +21,17 @@ Y_MIN_RATIO = 0.20   # 전체 너비의 20% 미만이면 병합
 # 수평 최소 분할 비율: 높이가 너무 낮은 조각(=상하로 얇음)은 이웃과 병합
 X_MIN_RATIO = 0.1   # 전체 높이의 10% 미만이면 병합  # TODO: crop이 잘게 10개 넘게씩이 좋을까 아니면 그냥 뭉치게가 좋을까 0.05 / 0.1
 
-# 리사이즈 비율 (coarse/fine 분리)
+# 리사이즈 비율
 RESIZE_RATIO_1 = 0.1   # 1차 coarse segmentation
-RESIZE_RATIO_2 = 0.1   # 2차 fine segmentation (조금 더 크게)
 
-# 2차 세분화 트리거 면적 비율(1차 결과 중 너무 큰 조각은 그 영역만 다시 분할)
-SECOND_PASS_AREA_RATIO = 0.40
 
-#! 1차/2차 분할 파라미터
+#! 1차 분할 파라미터만 사용
 FIRST_PASS = dict(
     max_depth=1,      # 트리 분할 최대 깊이 (값 ↑ → 더 많이 잘라서 세부적으로 분할)
     var_thresh=150,   # 픽셀 분산 기준 (값 ↑ → 단색/균일 구간도 "내용 있음"으로 인식 → 분할 줄어듦)
     diff_thresh=20,   # 행간 픽셀 차이 허용치 (값 ↑ → 작은 경계 무시, 오직 큰 차이만 분리 → 분할 줄어듦)
     diff_portion=0.7, # 차이가 일정 비율 이상일 때만 경계 인정 (값 ↑ → 더 강한 변화 필요 → 분할 줄어듦)
     window_size=50    # 슬라이딩 윈도우 높이 (값 ↑ → 큰 구간 단위로 평균내서 안정적 경계 탐지, 작은 변화 무시됨)
-)
-
-
-SECOND_PASS = dict(
-    max_depth=1,
-    var_thresh=500,
-    diff_thresh=20,     
-    diff_portion=0.4,  
-    window_size=50
 )
 
 
@@ -95,8 +83,7 @@ def collect_leaves_from_tree(tree_dict, base_level=0):
     _rec(tree_dict, base_level)
     return out
 
-def merge_until_stable(leaves, parent_size, min_w_ratio, min_h_ratio,
-                       v_overlap_thr=0.0, h_overlap_thr=0.0):
+def merge_until_stable(leaves, parent_size, min_w_ratio, min_h_ratio):
     """
     인접(pairwise) 병합만 반복 수행.
     - 바로 좌/우(또는 상/하) '이웃' 중에서만 합침
@@ -239,84 +226,17 @@ def crop(image_path,
     tree = img_seg.to_json_tree()
     leaves_lvl1 = collect_leaves_from_tree(tree, base_level=0)
 
-    # 1-2) 제로-드롭 병합 보정(너무 얇은/낮은 조각은 이웃과 병합)
+    time1 = time()
+    print(f"[1] {time1 - time0:.3f}s", end = " | ")
+
+
+    # 2) 제로-드롭 병합 보정(너무 얇은/낮은 조각은 이웃과 병합)
     leaves_lvl1_merged = merge_until_stable(
         leaves=leaves_lvl1,
         parent_size=(abs_W1, abs_H1),  # ← 부모 bbox 말고, 원본×리사이즈 상수
         min_w_ratio=Y_MIN_RATIO,
-        min_h_ratio=X_MIN_RATIO,
-        v_overlap_thr=0.3,
-        h_overlap_thr=0.3
+        min_h_ratio=X_MIN_RATIO
     )
-
-    time1 = time()
-    print(f"[1] {time1 - time0:.3f}s", end = " | ")
-
-    # 2) 2차(세분화) 대상 선별 및 재분할
-    final_items = []  # [(bbox_in_work_img_coords, level)]
-    resized_area_1 = resized_w1 * resized_h1
-    sx1 = orig_w / float(resized_w1)
-    sy1 = orig_h / float(resized_h1)
-
-    for (b_work, lvl) in leaves_lvl1_merged:
-        a = bbox_area(b_work)
-        if resized_area_1 > 0 and (a / resized_area_1) >= SECOND_PASS_AREA_RATIO:
-            # --- 2차: 원본에서 해당 영역 crop → 더 크게 리사이즈 → 세분할 ---
-            l1, t1, r1, b1 = b_work  # work_img 좌표계
-            # work_img → original 좌표계로 변환
-            L = int(round(l1 * sx1)); T = int(round(t1 * sy1))
-            R = int(round(r1 * sx1)); B = int(round(b1 * sy1))
-            # 원본에서 crop
-            sub_img = orig_img_full.crop((L, T, R, B))
-            # 2차 리사이즈
-            resized_w2 = max(1, int((R - L) * RESIZE_RATIO_2))
-            resized_h2 = max(1, int((B - T) * RESIZE_RATIO_2))
-            sub_img_resized = sub_img.resize((resized_w2, resized_h2))
-            # 2차도 원본 기준 절대 임계를 RESIZE_RATIO_2 스케일로 맞춘 상수
-            abs_W2 = orig_w * RESIZE_RATIO_2
-            abs_H2 = orig_h * RESIZE_RATIO_2
-
-            img_seg2 = ImgSegmentation(
-                img=sub_img_resized,
-                max_depth=SECOND_PASS["max_depth"],
-                var_thresh=SECOND_PASS["var_thresh"],
-                diff_thresh=SECOND_PASS["diff_thresh"],
-                diff_portion=SECOND_PASS["diff_portion"],
-                window_size=SECOND_PASS["window_size"]
-            )
-            tree2 = img_seg2.to_json_tree()
-            # base_level=1 → 2차 리프는 level 2 이상
-            leaves_lvl2 = collect_leaves_from_tree(tree2, base_level=1)
-            # 2차 결과 병합도 sub_img_resized 좌표계로 수행
-            leaves_lvl2_merged = merge_until_stable(
-                leaves=leaves_lvl2,
-                parent_size=(abs_W2, abs_H2),  # ← 지역 크기(잘린 영역) 말고, 원본×리사이즈 상수
-                min_w_ratio=Y_MIN_RATIO,
-                min_h_ratio=X_MIN_RATIO,
-                v_overlap_thr=0.3,
-                h_overlap_thr=0.3
-            )
-            # 2차 bbox를 work_img 좌표계로 역변환
-            # sub_img_resized (0..resized_w2, 0..resized_h2) -> work_img (l1..r1, t1..b1)
-            sx2w = (r1 - l1) / float(resized_w2) if resized_w2 > 0 else 1.0
-            sy2w = (b1 - t1) / float(resized_h2) if resized_h2 > 0 else 1.0
-
-            for (b2, lvl2) in leaves_lvl2_merged:
-                lx, ty, rx, by = b2
-                Lw = int(round(l1 + lx * sx2w))
-                Tw = int(round(t1 + ty * sy2w))
-                Rw = int(round(l1 + rx * sx2w))
-                Bw = int(round(t1 + by * sy2w))
-                # 안전 가드(경계 클램프)
-                Lw = max(0, min(resized_w1, Lw))
-                Rw = max(0, min(resized_w1, Rw))
-                Tw = max(0, min(resized_h1, Tw))
-                Bw = max(0, min(resized_h1, Bw))
-                if Rw > Lw and Bw > Tw:
-                    final_items.append(((Lw, Tw, Rw, Bw), max(lvl2, 2)))
-        else:
-            # 2차 없이 1차 결과 채택
-            final_items.append((b_work, max(lvl, 1)))
 
     time2 = time()
     print(f"[2] {time2 - time1:.3f}s", end = " | ")
