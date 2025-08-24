@@ -29,7 +29,7 @@ LAYER_NUM = 31
 
 # Stage 1: Segmentation & Selection
 SELECT_THRE = 0.70  # score >= tau * max_score 인 모든 crop select
-EARLY_EXIT = False
+EARLY_EXIT = True
 
 # Stage 2: Attention Refinement  
 AGG_START = 20  # Starting layer for attention aggregation

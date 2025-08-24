@@ -1,39 +1,59 @@
-'''
-재귀 크롭 X
-합치는 알고리즘이 단순해서 16개 -> 1개로 합쳐지는 경우 발생 -> 이를 crop3에서 해결
-
-하지만 crop을 안했을때 오히려 GUI Actor에서는 정확도가 높음
-현재까지 최대 정확도
-
-+ resize가 생각보다 속도가 오래걸림
-'''
+# crop.py
+# ------------------------------------------------------------------------------------
+# 2-Stage Segmentation:
+#   Stage 1) 좌우 분할만 수행 → 좌우 병합 기준으로 정리
+#   Stage 2) 각 좌우 세그먼트 내부에서 상하 분할 → 상하 병합 기준으로 정리
+# 정책:
+#   - 버림 금지(드랍 없음) 기본
+#   - 너무 얇은 조각은 인접 이웃과 병합
+#   - 병합 편향 방지(좌/우, 상/하 병합 횟수 균형)
+#   - 최종적으로 모델 최소 변 길이(28px) 원본 좌표계에서 보장
+# ------------------------------------------------------------------------------------
 
 from utils_dcgen import ImgSegmentation
 from PIL import Image, ImageDraw
-
+import math
 import os
-from time import time 
+from time import time
 import json
+import cv2
+import numpy as np
 
 #! Hyper Parameter
-# 수직 최소 분할 비율: 폭이 너무 좁은 조각(=좌우로 얇음)은 이웃과 병합
-Y_MIN_RATIO = 0.20   # 전체 너비의 20% 미만이면 병합
+# 1단계 좌우 분할(수직 컷) 후 병합 기준
+LR_MIN_W_RATIO = 0.20     # 부모 폭 대비 최소 너비 비율 기준
+LR_MIN_W_PX    = 28       # 절대 최소 너비 픽셀 기준
 
-# 수평 최소 분할 비율: 높이가 너무 낮은 조각(=상하로 얇음)은 이웃과 병합
-X_MIN_RATIO = 0.05   # 전체 높이의 5% 미만이면 병합  # TODO: crop이 잘게 10개 넘게씩이 좋을까 아니면 그냥 뭉치게가 좋을까 0.05 / 0.1
+# 2단계 상하 분할(수평 컷) 후 병합 기준
+TB_MIN_H_RATIO = 0.1      # 부모 높이 대비 최소 높이 비율 기준
+TB_MIN_H_PX    = 28       # 절대 최소 높이 픽셀 기준
 
-# 리사이즈 비율 (coarse/fine 분리)
-RESIZE_RATIO_1 = 0.1   # 1차 coarse segmentation
+# 겹침 임계
+V_OVERLAP_THR = 0.30      # 세로 겹침(좌우 병합 시) 임계
+H_OVERLAP_THR = 0.30      # 가로 겹침(상하 병합 시) 임계
 
-#! 1차/2차 분할 파라미터
-FIRST_PASS = dict(
+# 리사이즈 비율
+RESIZE_RATIO_1 = 0.10     # 작업 이미지 비율
+
+# 세그먼트 생성 파라미터(조금 더 보수적으로 경계만 잡도록 설정 권장)
+FIRST_PASS_LR = dict(     # 좌우 분할 전용 세그 파라미터
     max_depth=1,      # 트리 분할 최대 깊이 (값 ↑ → 더 많이 잘라서 세부적으로 분할)
     var_thresh=150,   # 픽셀 분산 기준 (값 ↑ → 단색/균일 구간도 "내용 있음"으로 인식 → 분할 줄어듦)
     diff_thresh=20,   # 행간 픽셀 차이 허용치 (값 ↑ → 작은 경계 무시, 오직 큰 차이만 분리 → 분할 줄어듦)
     diff_portion=0.7, # 차이가 일정 비율 이상일 때만 경계 인정 (값 ↑ → 더 강한 변화 필요 → 분할 줄어듦)
     window_size=50    # 슬라이딩 윈도우 높이 (값 ↑ → 큰 구간 단위로 평균내서 안정적 경계 탐지, 작은 변화 무시됨)
 )
+FIRST_PASS_TB = dict(     # 상하 분할 전용(기존과 유사)
+    max_depth=1,
+    var_thresh=150,
+    diff_thresh=20,
+    diff_portion=0.70,
+    window_size=50
+)
 
+# 모델 전처리 제약
+MODEL_MIN_SIDE = 28       # Qwen2-VL smart_resize 최소 변
+PAD_COLOR = (255, 255, 255)  # 패딩 색
 
 #! ---------------------------- Util ----------------------------
 
@@ -48,235 +68,298 @@ def bbox_h(b):
     return max(0, b[3] - b[1])
 
 def overlap_1d(a1, a2, b1, b2):
-    """ [a1,a2]와 [b1,b2] 구간의 겹침 길이 """
     return max(0, min(a2, b2) - max(a1, b1))
 
 def vertical_overlap(a, b):
-    """ 두 bbox의 세로 방향 겹침 비율 (작은 쪽 기준) """
     ov = overlap_1d(a[1], a[3], b[1], b[3])
     denom = max(1, min(bbox_h(a), bbox_h(b)))
     return ov / denom
 
 def horizontal_overlap(a, b):
-    """ 두 bbox의 가로 방향 겹침 비율 (작은 쪽 기준) """
     ov = overlap_1d(a[0], a[2], b[0], b[2])
     denom = max(1, min(bbox_w(a), bbox_w(b)))
     return ov / denom
 
 def merge_two(a, b):
-    """ 두 bbox의 외접 사각형으로 병합 """
     return (min(a[0], b[0]), min(a[1], b[1]), max(a[2], b[2]), max(a[3], b[3]))
 
-def collect_leaves_from_tree(tree_dict, base_level=0):
-    """
-    to_json_tree() 결과(dict)에서 리프 노드들만 (bbox, level)로 수집.
-    level은 base_level 기준으로 +1씩 내려감.
-    """
-    out = []
-    def _rec(node, level):
-        ch = node.get("children", [])
-        if not ch:
-            out.append((tuple(node["bbox"]), level))
-            return
-        for c in ch:
-            _rec(c, level + 1)
-    _rec(tree_dict, base_level)
-    return out
+def by_cx(b):
+    return (b[0] + b[2]) * 0.5
 
-def merge_small_segments(leaves, parent_size, min_w_ratio, min_h_ratio,
-                         v_overlap_thr=0.3, h_overlap_thr=0.3, max_iter=4):
-    """
-    너무 얇은 조각(폭/높이 기준)을 이웃과 병합.
-    - leaves: [(bbox, level), ...]
-    - parent_size: (W, H)  -> 이 좌표계 픽셀 스케일 기준으로 판정
-    - min_w_ratio/min_h_ratio: 비율 임계
-    - v_overlap_thr/h_overlap_thr: 이웃으로 간주할 최소 겹침 비율
-    """
-    W, H = parent_size
-    cur = [(tuple(b), lvl) for (b, lvl) in leaves]
+def by_cy(b):
+    return (b[1] + b[3]) * 0.5
 
-    def by_x(e): return (e[0][0] + e[0][2]) / 2.0
-    def by_y(e): return (e[0][1] + e[0][3]) / 2.0
+def grow_bbox_to_min(b, img_w, img_h, min_w=MODEL_MIN_SIDE, min_h=MODEL_MIN_SIDE):
+    L, T, R, B = b
+    w, h = R - L, B - T
+
+    if w < min_w:
+        lack = min_w - w
+        left = lack // 2
+        right = lack - left
+        L = max(0, L - left)
+        R = min(img_w, R + right)
+        if (R - L) < min_w:
+            miss = min_w - (R - L)
+            if L == 0 and R + miss <= img_w:
+                R += miss
+            elif R == img_w and L - miss >= 0:
+                L -= miss
+
+    if h < min_h:
+        lack = min_h - h
+        up = lack // 2
+        down = lack - up
+        T = max(0, T - up)
+        B = min(img_h, B + down)
+        if (B - T) < min_h:
+            miss = min_h - (B - T)
+            if T == 0 and B + miss <= img_h:
+                B += miss
+            elif B == img_h and T - miss >= 0:
+                T -= miss
+
+    L, T = max(0, L), max(0, T)
+    R, B = min(img_w, R), min(img_h, B)
+    return (L, T, R, B)
+
+# [ADDED] 균형 병합 보조 카운터
+def init_merge_counter(n):
+    # 좌우용(L/R) 또는 상하용(U/D)로 사용
+    return [{"L":0, "R":0, "U":0, "D":0} for _ in range(n)]
+
+# [ADDED] 좌우 병합(폭 기준)
+def merge_lr(bboxes, parent_w, v_overlap_thr=V_OVERLAP_THR,
+             min_w_ratio=LR_MIN_W_RATIO, min_w_px=LR_MIN_W_PX, max_iter=4):
+    cur = list(bboxes)
+    counters = init_merge_counter(len(cur))
+
+    def threshold_w():
+        return max(int(math.ceil(parent_w * min_w_ratio)), min_w_px)
 
     for _ in range(max_iter):
         changed = False
-
-        # 1) 폭이 너무 좁은 것 -> 좌/우 이웃과 병합
-        cur.sort(key=by_x)
+        cur = sorted(cur, key=by_cx)
         i = 0
         while i < len(cur):
-            b, lvl = cur[i]
+            b = cur[i]
             w = bbox_w(b)
-            if W > 0 and (w / W) < min_w_ratio:
-                # 좌/우 후보 중 세로 겹침 가장 큰 이웃
-                best_j = -1
-                best_ov = -1.0
-                for j in [i - 1, i + 1]:
-                    if 0 <= j < len(cur):
-                        b2, _ = cur[j]
-                        ov = vertical_overlap(b, b2)
-                        if ov > best_ov:
-                            best_ov = ov
-                            best_j = j
-                if best_j >= 0 and best_ov >= v_overlap_thr:
-                    b2, lvl2 = cur[best_j]
-                    merged = merge_two(b, b2)
-                    new_lvl = max(lvl, lvl2)
-                    for idx in sorted([i, best_j], reverse=True):
-                        cur.pop(idx)
-                    cur.insert(min(i, best_j), (merged, new_lvl))
+            if w < threshold_w() and len(cur) > 1:
+                left_j = i - 1 if i - 1 >= 0 else None
+                right_j = i + 1 if i + 1 < len(cur) else None
+                candidates = []
+                if left_j is not None:
+                    bL = cur[left_j]
+                    ovL = vertical_overlap(b, bL)
+                    if ovL >= v_overlap_thr:
+                        # 비용: 병합 후 중심 이동 + 좌측 병합 횟수
+                        merged = merge_two(b, bL)
+                        cost = abs(by_cx(merged) - by_cx(b)) + 0.5 * counters[i]["L"]
+                        candidates.append(("L", left_j, cost, merged))
+                if right_j is not None:
+                    bR = cur[right_j]
+                    ovR = vertical_overlap(b, bR)
+                    if ovR >= v_overlap_thr:
+                        merged = merge_two(b, bR)
+                        cost = abs(by_cx(merged) - by_cx(b)) + 0.5 * counters[i]["R"]
+                        candidates.append(("R", right_j, cost, merged))
+                if candidates:
+                    candidates.sort(key=lambda x: x[2])  # 비용 최소
+                    side, j, _cost, merged = candidates[0]
+                    # 카운터 업데이트
+                    if side == "L":
+                        counters[i]["L"] += 1
+                    else:
+                        counters[i]["R"] += 1
+                    # 병합 적용
+                    ii, jj = (i, j) if i < j else (j, i)
+                    del cur[jj]
+                    del cur[ii]
+                    cur.insert(ii, merged)
+                    # 카운터 배열 길이 동기화는 단순화해서 재초기화
+                    counters = init_merge_counter(len(cur))
                     changed = True
                     continue
             i += 1
-
-        # 2) 높이가 너무 낮은 것 -> 상/하 이웃과 병합
-        cur.sort(key=by_y)
-        i = 0
-        while i < len(cur):
-            b, lvl = cur[i]
-            h = bbox_h(b)
-            if H > 0 and (h / H) < min_h_ratio:
-                best_j = -1
-                best_ov = -1.0
-                for j in [i - 1, i + 1]:
-                    if 0 <= j < len(cur):
-                        b2, _ = cur[j]
-                        ov = horizontal_overlap(b, b2)
-                        if ov > best_ov:
-                            best_ov = ov
-                            best_j = j
-                if best_j >= 0 and best_ov >= h_overlap_thr:
-                    b2, lvl2 = cur[best_j]
-                    merged = merge_two(b, b2)
-                    new_lvl = max(lvl, lvl2)
-                    for idx in sorted([i, best_j], reverse=True):
-                        cur.pop(idx)
-                    cur.insert(min(i, best_j), (merged, new_lvl))
-                    changed = True
-                    continue
-            i += 1
-
         if not changed:
             break
+    return cur
 
-    # 경계 스냅(정수화)
-    snapped = []
-    for (b, lvl) in cur:
-        l, t, r, btm = b
-        snapped.append(((int(round(l)), int(round(t)), int(round(r)), int(round(btm))), lvl))
-    return snapped
+# [ADDED] 상하 병합(높이 기준)
+def merge_tb(bboxes, parent_h, h_overlap_thr=H_OVERLAP_THR,
+             min_h_ratio=TB_MIN_H_RATIO, min_h_px=TB_MIN_H_PX, max_iter=4):
+    cur = list(bboxes)
+    counters = init_merge_counter(len(cur))
 
+    def threshold_h():
+        return max(int(math.ceil(parent_h * min_h_ratio)), min_h_px)
+
+    for _ in range(max_iter):
+        changed = False
+        cur = sorted(cur, key=by_cy)
+        i = 0
+        while i < len(cur):
+            b = cur[i]
+            h = bbox_h(b)
+            if h < threshold_h() and len(cur) > 1:
+                up_j = i - 1 if i - 1 >= 0 else None
+                down_j = i + 1 if i + 1 < len(cur) else None
+                candidates = []
+                if up_j is not None:
+                    bU = cur[up_j]
+                    ovU = horizontal_overlap(b, bU)
+                    if ovU >= h_overlap_thr:
+                        merged = merge_two(b, bU)
+                        cost = abs(by_cy(merged) - by_cy(b)) + 0.5 * counters[i]["U"]
+                        candidates.append(("U", up_j, cost, merged))
+                if down_j is not None:
+                    bD = cur[down_j]
+                    ovD = horizontal_overlap(b, bD)
+                    if ovD >= h_overlap_thr:
+                        merged = merge_two(b, bD)
+                        cost = abs(by_cy(merged) - by_cy(b)) + 0.5 * counters[i]["D"]
+                        candidates.append(("D", down_j, cost, merged))
+                if candidates:
+                    candidates.sort(key=lambda x: x[2])
+                    side, j, _cost, merged = candidates[0]
+                    if side == "U":
+                        counters[i]["U"] += 1
+                    else:
+                        counters[i]["D"] += 1
+                    ii, jj = (i, j) if i < j else (j, i)
+                    del cur[jj]
+                    del cur[ii]
+                    cur.insert(ii, merged)
+                    counters = init_merge_counter(len(cur))
+                    changed = True
+                    continue
+            i += 1
+        if not changed:
+            break
+    return cur
+
+# [ADDED] 한 방향 강제 세그 생성 유틸
+def segment_once(segger, img, bbox, line_direct):
+    # ImgSegmentation 내부의 cut_img_bbox를 직접 호출해서 한 방향만 분할
+    cuts = segger.cut_img_bbox(img, bbox, line_direct=line_direct, verbose=False, save_cut=False)
+    return cuts if cuts else []
 
 #! ================================================================================================
 
-
-def crop(image_path, output_json_path=None, output_image_path=None, save_visualization=False, print_latency=False):
-    """
-    이미지를 crop하여 결과 리스트 반환
-    
-    Args:
-        image_path: 입력 이미지 경로
-        output_json_path: JSON 저장 경로 (None이면 저장 안함)
-        output_image_path: 이미지 저장 경로 (None이면 저장 안함)
-        save_visualization: 시각화 이미지 저장 여부
-        print_latency: 실행 시간 출력 여부
-    
-    Returns:
-        results_for_grounding: grounding용 crop 결과 리스트
-    """
-
+def crop_img(image_path, output_json_path=None, output_image_path=None, save_visualization=False, print_latency=False):
     start = time()
 
-    # 0) 원본/작업 이미지 로드 및 리사이즈
-    orig_img_full = Image.open(image_path).convert("RGB")
-    orig_w, orig_h = orig_img_full.size
-    resized_w1, resized_h1 = int(orig_w * RESIZE_RATIO_1), int(orig_h * RESIZE_RATIO_1)
-    resized_w1 = max(1, resized_w1)
-    resized_h1 = max(1, resized_h1)
-    work_img = orig_img_full.resize((resized_w1, resized_h1))
+    # 0) 원본/작업 이미지
+    orig_img = Image.open(image_path).convert("RGB")
+    W, H = orig_img.size
+    w1, h1 = max(1, int(W * RESIZE_RATIO_1)), max(1, int(H * RESIZE_RATIO_1))
 
-    abs_W1 = orig_w * RESIZE_RATIO_1
-    abs_H1 = orig_h * RESIZE_RATIO_1
+    #! resize
+    # work_img = orig_img.resize((w1, h1))
+    work_img = orig_img.resize((w1, h1), resample=Image.BOX)
+    # work_img = Image.fromarray(
+    #     cv2.resize(np.array(orig_img), (w1, h1), interpolation=cv2.INTER_AREA)
+    # )
 
-    time0 = time()
-    # print(f"[Crop] [0] {time0 - start:.3f}s", end = " | ")
+    sx, sy = W / float(w1), H / float(h1)
 
-    # 1-2) 1차 분할
-    img_seg = ImgSegmentation(
+    # 1) Stage 1 - 좌우 분할만
+    seg_lr = ImgSegmentation(
         img=work_img,
-        max_depth=FIRST_PASS["max_depth"],
-        var_thresh=FIRST_PASS["var_thresh"],
-        diff_thresh=FIRST_PASS["diff_thresh"],
-        diff_portion=FIRST_PASS["diff_portion"],
-        window_size=FIRST_PASS["window_size"]
+        max_depth=FIRST_PASS_LR["max_depth"],
+        var_thresh=FIRST_PASS_LR["var_thresh"],
+        diff_thresh=FIRST_PASS_LR["diff_thresh"],
+        diff_portion=FIRST_PASS_LR["diff_portion"],
+        window_size=FIRST_PASS_LR["window_size"]
     )
+    root_bbox_work = (0, 0, w1, h1)
+    lr_work = segment_once(seg_lr, work_img, root_bbox_work, line_direct="y")  # 수직 컷
 
-    # 트리에서 리프만 수집(level 기준: 루트 0, 리프는 1)
-    tree = img_seg.to_json_tree()
-    leaves_lvl1 = collect_leaves_from_tree(tree, base_level=0)
+    # 분할이 안 되면 전체 1개 처리
+    if not lr_work:
+        lr_work = [root_bbox_work]
 
+    # work→orig 스케일백
+    lr_orig = []
+    for l,t,r,b in lr_work:
+        L = int(math.floor(l * sx)); T = int(math.floor(t * sy))
+        R = int(math.ceil (r * sx)); B = int(math.ceil (b * sy))
+        L, T = max(0, min(W, L)), max(0, min(H, T))
+        R, B = max(0, min(W, R)), max(0, min(H, B))
+        if R > L and B > T:
+            lr_orig.append((L,T,R,B))
 
-    time1 = time()
-    if print_latency:
-        print(f"[1] {time1 - time0:.3f}s", end = " | ")
+    # 좌우 병합
+    lr_merged = merge_lr(lr_orig, parent_w=W)
 
-    # 1-2) 제로-드롭 병합 보정(너무 얇은/낮은 조각은 이웃과 병합)
-    leaves_lvl1_merged = merge_small_segments(
-        leaves=leaves_lvl1,
-        parent_size=(abs_W1, abs_H1),  # ← 부모 bbox 말고, 원본×리사이즈 상수
-        min_w_ratio=Y_MIN_RATIO,
-        min_h_ratio=X_MIN_RATIO,
-        v_overlap_thr=0.3,
-        h_overlap_thr=0.3,
-        max_iter=4
-    )
+    # 2) Stage 2 - 각 좌우 세그 내부에서 상하 분할
+    final_boxes = []
+    for seg in lr_merged:
+        L0,T0,R0,B0 = seg
+        # 해당 세그 영역을 작업 좌표계로 변환
+        l0 = int(math.floor(L0 / sx)); t0 = int(math.floor(T0 / sy))
+        r0 = int(math.ceil (R0 / sx)); b0 = int(math.ceil (B0 / sy))
+        l0, t0 = max(0, min(w1, l0)), max(0, min(h1, t0))
+        r0, b0 = max(0, min(w1, r0)), max(0, min(h1, b0))
+        sub_bbox_work = (l0, t0, r0, b0)
 
-    time2 = time()
-    if print_latency:
-        print(f"[2] {time2 - time1:.3f}s", end = " | ")
+        seg_tb = ImgSegmentation(
+            img=work_img,
+            max_depth=FIRST_PASS_TB["max_depth"],
+            var_thresh=FIRST_PASS_TB["var_thresh"],
+            diff_thresh=FIRST_PASS_TB["diff_thresh"],
+            diff_portion=FIRST_PASS_TB["diff_portion"],
+            window_size=FIRST_PASS_TB["window_size"]
+        )
+        tb_work = segment_once(seg_tb, work_img, sub_bbox_work, line_direct="x")  # 수평 컷
+        if not tb_work:
+            tb_work = [sub_bbox_work]
 
-    # 3) 결과 JSON 저장 (옵션)
-    final_items = [(b_work, max(lvl, 1)) for (b_work, lvl) in leaves_lvl1_merged]
-    json_out = [{"bbox": [int(b[0]), int(b[1]), int(b[2]), int(b[3])], "level": int(lvl)} for (b, lvl) in final_items]
+        # work→orig 스케일백
+        tb_orig = []
+        for l,t,r,b in tb_work:
+            L = int(math.floor(l * sx)); T = int(math.floor(t * sy))
+            R = int(math.ceil (r * sx)); B = int(math.ceil (b * sy))
+            L, T = max(L0, L), max(T0, T)
+            R, B = min(R0, R), min(B0, B)
+            if R > L and B > T:
+                tb_orig.append((L,T,R,B))
 
-    # JSON 저장 (경로가 제공된 경우에만)
+        # 상하 병합
+        tb_merged = merge_tb(tb_orig, parent_h=(B0 - T0))
+        final_boxes.extend(tb_merged)
+
+    # 3) 최종 최소 변 보장
+    safe_boxes = []
+    for b in final_boxes:
+        safe = grow_bbox_to_min(b, W, H, MODEL_MIN_SIDE, MODEL_MIN_SIDE)
+        safe_boxes.append(safe)
+
+    # 4) 결과 JSON 구성
+    json_out = [{"bbox": [int(b[0]), int(b[1]), int(b[2]), int(b[3])], "level": 1} for b in safe_boxes]
+
     if output_json_path:
         with open(output_json_path, "w") as f:
             json.dump(json_out, f, indent=2)
 
-    #! === 반환 리스트(grounding 호환 포맷) 구성 ===
+    # 5) 결과 리스트(grounding 포맷)
     results_for_grounding = []
-    # 0번 썸네일
-    results_for_grounding.append({
-        "img": orig_img_full.copy(),
-        "id": 0,
-        "bbox": [0, 0, orig_w, orig_h]
-    })
-
-    # work_img → original 스케일팩터
-    sx = orig_w / float(resized_w1)
-    sy = orig_h / float(resized_h1)
-
-    # k번 크롭들 (원본 좌표계 bbox + 이미지를 메모리에서 잘라서 포함)
+    results_for_grounding.append({"img": orig_img.copy(), "id": 0, "bbox": [0,0,W,H]})
     k = 1
-    for item in json_out:
-        bbox = item.get("bbox")
-        if not bbox or len(bbox) != 4:
-            continue
-        l, t, r, b = bbox
-        # work_img → 원본 좌표로 스케일백
-        L = int(round(l * sx)); T = int(round(t * sy))
-        R = int(round(r * sx)); B = int(round(b * sy))
-        # 유효성 체크
-        L = max(0, min(orig_w, L)); R = max(0, min(orig_w, R))
-        T = max(0, min(orig_h, T)); B = max(0, min(orig_h, B))
-        if R <= L or B <= T:
-            continue
-        crop_img = orig_img_full.crop((L, T, R, B))
+    for b in safe_boxes:
+        crop_img = orig_img.crop(b)
+        # 모델 전처리 안전을 위해 최종적으로도 최소 변 확보
+        if min(crop_img.size) < MODEL_MIN_SIDE:
+            # 여유 패딩으로 보장
+            from PIL import ImageOps
+            need_w = max(0, MODEL_MIN_SIDE - crop_img.size[0])
+            need_h = max(0, MODEL_MIN_SIDE - crop_img.size[1])
+            pad = (need_w//2, need_h//2, need_w - need_w//2, need_h - need_h//2)
+            crop_img = ImageOps.expand(crop_img, border=pad, fill=PAD_COLOR)
         results_for_grounding.append({
             "img": crop_img,
             "id": k,
-            "bbox": [L, T, R, B],
+            "bbox": [int(b[0]), int(b[1]), int(b[2]), int(b[3])],
             "recursion_depth": 0,
             "fail": False,
             "filename": None
@@ -284,70 +367,39 @@ def crop(image_path, output_json_path=None, output_image_path=None, save_visuali
         k += 1
 
     end = time()
-
     if print_latency:
-        print(f"[3] {end - time2:.3f}s", end = " | ")
-        print(f"🕖 Crop Time : {end - start:.3f}s", end = " | ")
-        print(f"✂️ Crops : {len(final_items)}")
+        print(f"🕖 Time: {end - start:.3f}s", end=" | ")
+        print(f"✂️ Crops: {len(safe_boxes)}", end=" | ")
 
-
-    if not save_visualization:
-        return results_for_grounding
-    
-    #! ---------------------------- 시각화(원본 크기) ----------------------------
-
-    # 시각화는 경로가 제공되고 save_visualization이 True인 경우에만
-    if json_out and save_visualization and output_image_path:
-        orig_img = orig_img_full.copy()
-        draw = ImageDraw.Draw(orig_img)
-
-        palette = {
-            0: (255, 0, 0),
-            1: (0, 255, 0),
-            2: (0, 0, 255),
-            3: (255, 165, 0),
-            4: (255, 0, 255),
-            5: (0, 255, 255),
-        }
-        line_w = max(2, int(min(orig_w, orig_h) * 0.003))
-
-        for item in json_out:
-            bbox = item.get("bbox")
-            level = item.get("level", 0)
-            if not bbox or len(bbox) != 4:
-                continue
-            l, t, r, b = bbox
-            L = int(round(l * sx)); T = int(round(t * sy))
-            R = int(round(r * sx)); B = int(round(b * sy))
-            color = palette.get(level % len(palette), (255, 0, 0))
-            draw.rectangle([L, T, R, B], outline=color, width=line_w)
-
-        save_path = output_image_path + f"result.png"
-        orig_img.save(save_path)
-        print(f" | [SAVE] {save_path}")
-    elif save_visualization and not output_image_path:
-        print(" | [WARNING] save_visualization=True but output_image_path is None")
-    elif json_out and not save_visualization and print_latency:
-        print(" | [INFO] Visualization skipped (save_visualization=False)")
+    # 6) 시각화
+    if save_visualization and output_image_path:
+        vis = orig_img.copy()
+        draw = ImageDraw.Draw(vis)
+        line_w = max(2, int(min(W,H) * 0.003))
+        palette = [(255,0,0),(0,255,0),(0,0,255),(255,165,0),(255,0,255),(0,255,255)]
+        for idx, b in enumerate(safe_boxes):
+            color = palette[idx % len(palette)]
+            draw.rectangle(b, outline=color, width=line_w)
+        save_path = os.path.join(output_image_path, "result.png")
+        os.makedirs(output_image_path, exist_ok=True)
+        vis.save(save_path)
+        if print_latency:
+            print(f"[SAVE] {save_path}")
 
     return results_for_grounding
-
 
 #! ================================================================================================
 
 if __name__ == '__main__':
-    # 테스트용 main: 데이터/출력 경로는 main 전역으로 유지
     data_path = "./data/screenspotv2_imgs/"
-
     jsonlist = json.load(open("./data/screenspot_mobile_v2.json"))
     target_imgs = sorted(set(item["img_filename"] for item in jsonlist))
-
     for fname in target_imgs:
         os.makedirs(f"./crop_test/{fname}", exist_ok=True)
-        # 테스트 실행: 저장 경로는 main에서 지정한 output_path 사용
-        crop(image_path = data_path + fname,
+        crop_img(
+            image_path = os.path.join(data_path, fname),
             output_json_path = f"./crop_test/{fname}/json.json",
             output_image_path = f"./crop_test/{fname}/",
             save_visualization = True,
             print_latency = True
-            )
+        )

@@ -6,7 +6,7 @@ import matplotlib.pyplot as plt
 # ------------------------------
 # 경로 설정
 # ------------------------------
-dir = './attn_output/' + "0824_hoon"
+dir = './attn_output/' + "0824_hoon_not_early_exit_2"
 csv_file = dir + '/iter_log.csv'
 output_dir = dir + '/vis'
 os.makedirs(output_dir, exist_ok=True)
