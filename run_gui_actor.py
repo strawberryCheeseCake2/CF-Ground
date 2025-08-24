@@ -20,7 +20,7 @@ SCREENSPOT_IMGS = "./data/screenspotv2_imgs"  # input image 경로
 SCREENSPOT_JSON = "./data"  # json파일 경로
 TASKS = ["mobile"]
 SAMPLE_RANGE = slice(None)  #! 샘플 범위 지정 (3번 샘플이면 3,4 / 5~9번 샘플이면 5,10 / 전체 사용이면 None)
-SAVE_DIR = "./attn_output/" + "0824_hoon"  #! 결과 저장 경로 (방법을 바꾼다면 바꿔서 기록하기)
+SAVE_DIR = "./attn_output/" + "0824_hoon_not_early_exit"  #! 결과 저장 경로 (방법을 바꾼다면 바꿔서 기록하기)
 
 # Visualize
 STAGE0_VIS = False
@@ -35,7 +35,7 @@ LAYER_NUM = 31
 
 # Stage 1: Segmentation & Selection
 SELECT_THRE = 0.70  # score >= tau * max_score 인 모든 crop select
-EARLY_EXIT = True
+EARLY_EXIT = False
 
 # Stage 2: Attention Refinement  
 AGG_START = 20  # Starting layer for attention aggregation
@@ -67,12 +67,8 @@ from typing import List
 from math import sqrt
 
 # Third-Party Libraries
-import matplotlib.pyplot as plt
-import matplotlib.patches as patches
-import matplotlib.patheffects as pe
-from matplotlib.lines import Line2D
 import numpy as np
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image
 from tqdm import tqdm
 import torch
 # from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor, AutoTokenizer, set_seed
@@ -84,7 +80,11 @@ from qwen_vl_utils import process_vision_info
 from iter_logger import init_iter_logger, append_iter_log  # log csv 기록 파일
 from gui_actor.modeling_qwen25vl import Qwen2_5_VLForConditionalGenerationWithPointer
 from gui_actor.multi_image_inference import inference
-from visualize_util import visualize_results
+from visualize_util import (
+    visualize_results, get_highest_attention_patch_bbox, 
+    _visualize_early_exit_results, _visualize_stage1_results, _visualize_stage2_results, 
+    visualize_crop, visualize_attn_map, visualize_aggregated_attention
+)
 from crop2_2 import crop  #! 어떤 crop 파일 사용?
 from thop import profile #! flops
 
@@ -275,7 +275,7 @@ def get_highest_attention_patch_bbox(image_result: dict) -> list:
     
     return [left, top, right, bottom]
 
-def check_early_exit_condition(top_point, top_crop_id, crop_list, per_image_outputs, gt_bbox):
+def check_early_exit_condition(top_point, top_crop_id, crop_list, per_image_outputs, gt_bbox, original_image):
     """Early Exit 조건 확인"""
     if top_point is None or top_crop_id == -1:
         return False, False
@@ -304,7 +304,7 @@ def check_early_exit_condition(top_point, top_crop_id, crop_list, per_image_outp
     
     return should_exit_early, early_exit_success
 
-def run_selection_pass_with_guiactor(msgs, crop_list, gt_bbox: List, attn_vis_dir: str):
+def run_selection_pass_with_guiactor(msgs, crop_list, gt_bbox: List, attn_vis_dir: str, original_image, img_path, instruction):
     """Stage 1 inference 및 Early Exit 판단"""
     
     # Inference 수행
@@ -320,7 +320,7 @@ def run_selection_pass_with_guiactor(msgs, crop_list, gt_bbox: List, attn_vis_di
     if EARLY_EXIT:
         top_point, top_crop_id = find_top_crop_for_early_exit(crop_list, per_image_outputs)
         should_exit_early, early_exit_success = check_early_exit_condition(
-            top_point, top_crop_id, crop_list, per_image_outputs, gt_bbox
+            top_point, top_crop_id, crop_list, per_image_outputs, gt_bbox, original_image
         )    # Early Exit하면 select_crop 스킵
     if should_exit_early:
         top_q_crop_ids = []
@@ -332,25 +332,11 @@ def run_selection_pass_with_guiactor(msgs, crop_list, gt_bbox: List, attn_vis_di
     
     # 시각화 (필요시)
     if STAGE1_VIS and EARLY_EXIT and should_exit_early:
-        _visualize_early_exit_results(crop_list, pred, gt_bbox, attn_vis_dir)
+        _visualize_early_exit_results(crop_list, pred, gt_bbox, attn_vis_dir, instruction, img_path)
     elif STAGE1_VIS and not should_exit_early:
-        _visualize_stage1_results(crop_list, pred, attn_vis_dir)
+        _visualize_stage1_results(crop_list, pred, attn_vis_dir, instruction)
     
     return top_q_crop_ids, top_q_bboxes, crop_list, should_exit_early, early_exit_success
-
-def _visualize_early_exit_results(crop_list, pred, gt_bbox, attn_vis_dir):
-    """Early Exit 시각화"""
-    s1_att_vis_path = attn_vis_dir + "/output.png"
-    visualize_results(crop_list, pred, instruction=instruction, save_path=s1_att_vis_path)
-    
-    # 임시로 빈 리스트로 처리 (Early Exit이므로 crop selection 없음)
-    visualize_crop(save_dir=attn_vis_dir, gt_bbox=gt_bbox, 
-                   top_q_bboxes=[], instruction=instruction, filename="ee_gt_vis.png")
-
-def _visualize_stage1_results(crop_list, pred, attn_vis_dir):
-    """일반 Stage1 시각화"""
-    s1_att_vis_path = attn_vis_dir + "/output.png"
-    visualize_results(crop_list, pred, instruction=instruction, save_path=s1_att_vis_path)
 
 def denormalize_crop_point(point_in_crop, crop_size, crop_bbox):
     crop_w, crop_h = crop_size
@@ -383,7 +369,7 @@ def find_best_crop_point(crop_list, per_image_outputs):
     
     return top_point, top_crop_id
 
-def run_refinement_pass_with_guiactor(crop_list: List, instruction: str, original_image: Image, save_dir: str, gt_bbox: List):
+def run_refinement_pass_with_guiactor(crop_list: List, instruction: str, original_image: Image, save_dir: str, gt_bbox: List, img_path: str):
     """Stage 2: 선택된 crop들로 최종 grounding 수행"""
     
     # Stage 2 용 리사이즈
@@ -417,123 +403,9 @@ def run_refinement_pass_with_guiactor(crop_list: List, instruction: str, origina
 
     # 시각화 (필요시)
     if STAGE2_VIS:
-        _visualize_stage2_results(save_dir, s2_resized_crop_list, pred, gt_bbox, corrected_point, instruction)
+        _visualize_stage2_results(save_dir, s2_resized_crop_list, pred, gt_bbox, corrected_point, instruction, img_path)
         
     return is_success
-
-def _visualize_stage2_results(save_dir, crop_list, pred, gt_bbox, click_point, instruction):
-    """Stage 2 결과 시각화"""
-    s2_att_vis_path = save_dir + "/output.png"
-    visualize_results(crop_list, pred, instruction=instruction, save_path=s2_att_vis_path)
-    visualize_crop(save_dir=save_dir, gt_bbox=gt_bbox, top_q_bboxes=[], 
-                   instruction=instruction, filename="gt_vis.png", click_point=click_point)
-
-def visualize_crop(save_dir, gt_bbox, top_q_bboxes, instruction, filename, click_point=None):
-    # Visualize ground truth and selected crop on the image
-    result_img = Image.open(img_path)
-
-    draw = ImageDraw.Draw(result_img)
-    # Draw ground truth bbox in green
-    draw.rectangle(gt_bbox, outline="green", width=2)
-
-    font = None
-    try:
-        font = ImageFont.truetype("DejaVuSans-Bold.ttf", 20)
-    except IOError:
-        font = ImageFont.load_default()
-
-    for bbox in top_q_bboxes:
-        draw.rectangle(bbox, outline="red", width=2)
-        text_to_draw = f"{instruction}"
-        crop_left, crop_top, crop_right, crop_bottom = bbox
-        inst_position = (crop_left, crop_top)
-        draw.text(inst_position, text_to_draw, fill="red", font=font)
-
-    # Draw click point as an orange circle
-    if click_point is not None:
-        click_x, click_y = click_point[0], click_point[1]
-        radius = 13
-        draw.ellipse((click_x - radius, click_y - radius, click_x + radius, click_y + radius), outline="purple", width=3)
-
-    # Ensure the save directory exists
-    os.makedirs(save_dir, exist_ok=True)
-    # Save the result image
-    result_path = os.path.join(save_dir, filename)
-    # print(f"Top Q box is saved at : {result_path}")
-    result_img.save(result_path)
-
-def visualize_attn_map(attn_output, msgs, crop_list, attn_vis_dir):
-    image_inputs, _ = process_vision_info(msgs)
-
-    # grid 크기 뽑아두기
-    img_proc_out = processor.image_processor(images=image_inputs)
-    grid = img_proc_out["image_grid_thw"]
-    # (batch, num_imgs, 3) 혹은 (num_imgs, 3) 형태일 수 있으니 안전하게 뽑기
-    if grid.ndim == 3:
-        grid = grid[0]   # (num_imgs, 3)
-
-    # 최종 token-map 차원: t × (h//2) × (w//2)
-    final_shapes = [
-        (t, h//2, w//2)
-        for t, h, w in grid
-    ]
-
-    num_imgs = len(crop_list)
-    fig, axes = plt.subplots(1, num_imgs, figsize=(5*num_imgs, 5))
-
-    for i, crop in enumerate(crop_list):
-        (st, end) = crop["token_span"] # crop의 토큰 시작, 끝 index 뽑기
-        t, h2, w2 = final_shapes[i]
-        att_maps = []
-
-        # for li in range(L):
-        for li in range(AGG_START, LAYER_NUM):
-            att = (
-                attn_output.attentions[li]         # (batch, heads, seq_q, seq_k)
-                [0, :, -1, st:end]              # batch=0, 마지막 query 토큰, vision span
-                .mean(dim=0)                 # head 평균
-                .to(torch.float32)           # bfloat16 → float32
-                .cpu()
-                .numpy()
-            )
-            att_map = att.reshape(t, h2, w2).mean(axis=0)  # 시간축 평균
-            att_maps.append(att_map)
-
-        att_avg = np.mean(att_maps, axis=0)  # 32개 레이어 평균
-
-        ax = axes[i] if num_imgs > 1 else axes
-        im = ax.imshow(att_avg, cmap="viridis", interpolation="nearest")
-        ax.set_title(f"crop{crop['id']}")
-        ax.axis("off")
-
-    plt.tight_layout()
-
-    out_dir = Path(attn_vis_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    _save_path = os.path.join(out_dir, "attn_map.png")
-
-    fig.savefig(_save_path, dpi=300, bbox_inches="tight", facecolor="white")
-    # print(f"attn_map saved at: {_save_path}")
-
-def upsample_att_map(att_map_low_res: np.ndarray, size):
-    """
-    Pillow를 이용한 bilinear 업샘플 (size=(H, W))
-    입력/출력 모두 float32 유지
-    """
-    h, w = size
-    # 안전장치: 음수/NaN 제거
-    m = np.nan_to_num(att_map_low_res.astype(np.float32), nan=0.0, neginf=0.0, posinf=0.0)
-    if m.size == 0:
-        return np.zeros((h, w), dtype=np.float32)
-    # 값 범위를 일단 0 이상으로 클램프
-    m[m < 0] = 0.0
-    im = Image.fromarray(m)
-    im = im.resize((w, h), resample=Image.BILINEAR)
-    out = np.array(im).astype(np.float32)
-    # scale에 따라 값이 약간 변할 수 있어 0 이상으로 재클램프
-    out[out < 0] = 0.0
-    return out
 
 def point_in_bbox(point, bbox):
     """
@@ -544,175 +416,6 @@ def point_in_bbox(point, bbox):
     x, y = point
     l, t, r, b = bbox
     return (l <= x <= r) and (t <= y <= b)
-
-def boxfilter_sum(arr: np.ndarray, r: int):
-    """
-    끝부분 보정 없음(neighbor-sum).
-    (2r+1)x(2r+1) 창과 실제 겹치는 부분의 '합'만 계산.
-    평균 아님. 가장자리는 창이 덜 겹치므로 손해보게 됨.
-    """
-    if r <= 0:
-        return arr.astype(np.float32, copy=True)
-
-    a = arr.astype(np.float32, copy=False)
-    H, W = a.shape
-
-    # 적분영상: 상단/좌측 0 패딩을 한 칸 추가해서 벡터화 계산 용이하게 구성
-    ii = np.pad(a, ((1, 0), (1, 0)), mode='constant').cumsum(axis=0).cumsum(axis=1)
-
-    ys = np.arange(H)[:, None]   # Hx1
-    xs = np.arange(W)[None, :]   # 1xW
-
-    y0 = np.clip(ys - r, 0, H)
-    y1 = np.clip(ys + r + 1, 0, H)
-    x0 = np.clip(xs - r, 0, W)
-    x1 = np.clip(xs + r + 1, 0, W)
-
-    # 적분영상 인덱스는 +1 패딩 고려해서 그대로 사용 가능
-    S = ii[y1, x1] - ii[y0, x1] - ii[y1, x0] + ii[y0, x0]
-    return S
-
-def visualize_aggregated_attention(
-        crop_list,
-        original_image, inst_dir, gt_bbox, individual_maps_dir=None,
-        neigh_radius = 20,         #! 이웃합(box filter) 반경 r → (2r+1)^2 창
-        topk_points = 5,           # 상위 점 개수 (보여주기용)
-        min_dist_pix = 200,        # 상위 점 사이 최소 간격 (픽셀)
-        star_marker_size= 8,      # 별 크기 (1등)
-        dot_marker_size = 5,      # 점 크기 (2~5등)
-        text_fontsize= 7          # 점수 텍스트 폰트 크기
-    ):
-    """
-    이웃합 기반 최대점 탐색:
-    - 합성 맵 정규화 후 boxfilter_sum(neigh_radius)로 이웃합 계산
-    - greedy 비최대 억제(NMS)로 상위 topk_points 좌표 선택(간격 min_dist_pix)
-    - 시각화:
-        • s2_result_only: 원본+합성맵+GT 박스만
-        • s2_result_star: top-1은 별(*), top-k 모두는 이웃합 점수 텍스트로 표시
-    - 성공 판정은 top-1 점이 GT 박스 안이면 True
-    """
-
-    os.makedirs(os.path.dirname(inst_dir + "/stage2"), exist_ok=True)
-    if individual_maps_dir:
-        os.makedirs(individual_maps_dir, exist_ok=True)
-
-    # 캔버스 및 합성 맵 준비
-    W, H = original_image.size
-    aggregated_attention_map = np.zeros((H, W), dtype=np.float32)
-
-    # 각 crop의 맵을 원본 좌표계로 업샘플하여 합성
-    for crop in crop_list:
-        if 'bbox' not in crop or 'att_avg_masked' not in crop:
-            continue
-
-        left, top, right, bottom = map(int, crop['bbox'])
-        cw = max(0, right - left)
-        ch = max(0, bottom - top)
-        if cw == 0 or ch == 0:
-            continue
-
-        att_low = crop['att_avg_masked']
-        att_up = upsample_att_map(att_low, size=(ch, cw))  # 파일 상단 정의 가정
-
-        # 개별 맵 저장(옵션)
-        if individual_maps_dir:
-            indiv = np.zeros((H, W), dtype=np.float32)
-            indiv[top:bottom, left:right] = att_up
-            plt.figure(figsize=(10, 10 * H / W))
-            plt.imshow(original_image, extent=(0, W, H, 0))
-            plt.imshow(indiv, cmap='viridis', alpha=0.6, extent=(0, W, H, 0))
-            plt.axis('off')
-            ttl = f"Crop ID: {crop.get('id','?')}"
-            plt.title(ttl)
-            path = os.path.join(individual_maps_dir, f"individual_attn_crop_{crop.get('id','unk')}.png")
-            plt.savefig(path, dpi=150, bbox_inches='tight', pad_inches=0)
-            plt.close()
-
-        aggregated_attention_map[top:bottom, left:right] += att_up
-
-    # 이웃합 기반 상위 점 선정
-    top_points = []
-    scores = []  # boxfilter_sum으로 얻은 이웃합 값
-
-    if aggregated_attention_map.max() > 0:
-        normalized = aggregated_attention_map / (aggregated_attention_map.max() + 1e-8)
-        smoothed = boxfilter_sum(normalized, neigh_radius)  # 파일 상단 정의 가정
-
-        # greedy NMS로 상위 K개 점 선택
-        sm = smoothed.copy()
-        Hh, Ww = sm.shape
-
-        for _ in range(int(topk_points)):
-            idx = int(np.argmax(sm))
-            vy, vx = divmod(idx, Ww)
-            best_val = sm[vy, vx]
-            if not np.isfinite(best_val) or best_val <= 0:
-                break
-            # 점 기록
-            top_points.append((int(vx), int(vy)))
-            scores.append(float(best_val))
-            # 정사각형 억제
-            y1 = max(0, vy - min_dist_pix); y2 = min(Hh - 1, vy + min_dist_pix)
-            x1 = max(0, vx - min_dist_pix); x2 = min(Ww - 1, vx + min_dist_pix)
-            sm[y1:y2+1, x1:x2+1] = -np.inf
-
-    # 성공 판정: top-1 기준
-    is_grounding_success = False
-    if len(top_points) > 0:
-        cx, cy = top_points[0]
-        gl, gt, gr, gb = gt_bbox
-        is_grounding_success = (gl <= cx <= gr) and (gt <= cy <= gb)
-        print(f"🎯 Our Grounding: {(cx, cy)} , GT: {gt_bbox}, Neigh_sum: {scores[0]:.2f}")
-    else:
-        print("Aggregated attention map empty 또는 peak 없음")
-
-    # 시각화: 공통 바탕
-    fig, ax = plt.subplots(figsize=(10, 10 * H / W))
-    ax.imshow(original_image, extent=(0, W, H, 0))
-    ax.imshow(aggregated_attention_map, cmap='viridis', alpha=0.6, extent=(0, W, H, 0))
-
-    # 그냥 Attention 상태만 저장 -> 가리는거 없이 보이도록.
-    plt.savefig(inst_dir + "/s2_result_only.png", dpi=300, bbox_inches="tight", pad_inches=0)
-
-    # GT 박스(초록)
-    gl, gt, gr, gb = gt_bbox
-    gt_rect = patches.Rectangle((gl, gt), gr - gl, gb - gt, linewidth=3, edgecolor='lime', facecolor='none')
-    ax.add_patch(gt_rect)
-
-    # 범례
-    green_patch = patches.Patch(color='lime', label='Ground Truth BBox')
-    star_legend = Line2D([0], [0], marker='*', color='w', label='NeighSum Top-1', 
-                         markerfacecolor='yellow', markeredgecolor='black', markersize=star_marker_size)
-    ax.legend([green_patch, star_legend], ['Ground Truth BBox', 'NeighSum Top-1'], loc='best')
-
-    ax.axis('off')
-    ax.set_title("Attention (aggregated) + NeighSum Peaks")
-    plt.tight_layout()
-
-    # 시각화: top-1 별표, top-2~5 검정 점, top-k 텍스트 라벨
-    if len(top_points) > 0:
-        # top-1 별표
-        ax.plot(top_points[0][0], top_points[0][1], 'y*',
-                markersize=star_marker_size, markeredgecolor='black')
-
-        # top-2~5 검정 점
-        for i in range(1, min(len(top_points), topk_points)):
-            px, py = top_points[i]
-            ax.plot(px, py, 'o', 
-                    markersize=dot_marker_size, markerfacecolor='black', markeredgecolor='white', markeredgewidth=0.9)
-
-        # top-k 텍스트(모두 표기: 점수만)
-        for (px, py), sc in zip(top_points, scores):
-            label = f"{sc:.3f}"
-            ax.text(px + 10, py - 10, label,
-                    fontsize=text_fontsize, color='white', ha='left', va='top',
-                    path_effects=[pe.withStroke(linewidth=2, foreground='black')])
-
-
-    plt.savefig(inst_dir + "/s2_result_star.png", dpi=300, bbox_inches="tight", pad_inches=0)
-    plt.close(fig)
-
-    return bool(is_grounding_success)
 
 #! ================================================================================================
 
@@ -811,7 +514,7 @@ if __name__ == '__main__':
             if STAGE0_VIS and inst_dir:
                 all_crops_bboxes = [crop["bbox"] for crop in s0_crop_list]
                 visualize_crop(save_dir=inst_dir, gt_bbox=original_bbox, top_q_bboxes=all_crops_bboxes,
-                                instruction=instruction, filename="s1_all_crop.png", click_point=None)
+                                instruction=instruction, filename="s1_all_crop.png", img_path=img_path, click_point=None)
 
             #! ==================================================================
             #! Stage 1 | Find Top Q + Inference
@@ -830,7 +533,10 @@ if __name__ == '__main__':
                 msgs=s1_msgs,
                 crop_list=s0_crop_list,
                 gt_bbox=original_bbox,
-                attn_vis_dir=s1_dir or ""
+                attn_vis_dir=s1_dir or "",
+                original_image=original_image,
+                img_path=img_path,
+                instruction=instruction
             )
             s1_infence_end = time.time()
 
@@ -882,7 +588,8 @@ if __name__ == '__main__':
                     instruction=instruction,
                     original_image=original_image,
                     save_dir=s2_dir or "",
-                    gt_bbox=original_bbox
+                    gt_bbox=original_bbox,
+                    img_path=img_path
                 )
                 s2_inference_end = time.time()
                 s2_time = s2_inference_end - s2_inference_start
@@ -891,7 +598,8 @@ if __name__ == '__main__':
             total_time = seg_time + s1_time + s2_time
             total_flops_this = s1_flops + (s2_flops if not should_exit_early else 0)
             total_flops += total_flops_this
-            
+
+            print(f"✂️  Crops : {len(s0_crop_list_out)-1} | Select Crops : {len(s1_top_q_crop_ids)}")
             print(f"🕖 Times - Seg: {seg_time:.2f}s | S1: {s1_time:.2f}s | S2: {s2_time:.2f}s | Total: {total_time:.2f}s")
             print(f"🔥 FLOPs - S1: {s1_flops/1e9:.2f} | S2: {s2_flops/1e9:.2f} | Total: {total_flops_this/1e9:.2f} GFLOPs")
             print(f"{'✅🚨 Early Exit Success' if should_exit_early and early_exit_success else '❌🚨 Early Exit Fail' if should_exit_early else '✅ Grounding Success' if final_success else '❌ Grounding Fail'}")

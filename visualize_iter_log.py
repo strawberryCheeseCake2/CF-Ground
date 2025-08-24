@@ -1,8 +1,10 @@
 import pandas as pd
 import matplotlib.pyplot as plt
+import numpy as np
 
-# CSV 파일 경로
-csv_file = './attn_output/0824_hoon_1/iter_log.csv'
+# 파일 경로
+dir = './attn_output/' + "0824_hoon"
+csv_file = dir + '/iter_log.csv'
 
 # 데이터 읽기
 data = pd.read_csv(csv_file)
@@ -13,28 +15,29 @@ columns_to_visualize = [
     's1_flops_gflops', 's2_time', 's2_flops_gflops', 'total_time', 'total_flops_gflops'
 ]
 
-# 꺾은선 그래프
+# x축이 정수인지 확인하는 함수
+def is_integer_series(series):
+    return np.all(series % 1 == 0)
+
+# 시각화 수정
 for column in columns_to_visualize:
     plt.figure(figsize=(10, 6))
-    plt.plot(data.index, data[column], marker='o', label=column)
-    plt.title(f'{column} Over Iterations')
-    plt.xlabel('Iteration')
-    plt.ylabel(column)
+    
+    if is_integer_series(data[column]):
+        # 정수일 경우 막대그래프
+        plt.bar(data[column], data.index, label=column, color='skyblue')
+        plt.xlabel(column)
+        plt.ylabel('Frequency')
+    else:
+        # 정수가 아닐 경우 꺾은선 그래프
+        plt.plot(data[column], data.index, label=column, color='skyblue', marker='o')
+        plt.xlabel(column)
+        plt.ylabel('Frequency')
+
+    plt.title(f'{column} Distribution')
     plt.legend()
-    plt.grid(True)
-    plt.savefig(f'./attn_output/0824_hoon_1/{column}_line_plot.png')
+    plt.grid(axis='both')
+    plt.savefig(f'{dir}/{column}_plot.png')
     plt.close()
 
-# 막대그래프
-for column in columns_to_visualize:
-    plt.figure(figsize=(10, 6))
-    plt.bar(data.index, data[column], label=column, color='skyblue')
-    plt.title(f'{column} Over Iterations')
-    plt.xlabel('Iteration')
-    plt.ylabel(column)
-    plt.legend()
-    plt.grid(axis='y')
-    plt.savefig(f'./attn_output/0824_hoon_1/{column}_bar_plot.png')
-    plt.close()
-
-print("Visualization complete. Check the output directory for graphs.")
+print("Visualization complete. Check the output directory for updated graphs.")

@@ -287,14 +287,11 @@ def crop(image_path, output_json_path=None, output_image_path=None, save_visuali
 
     if print_latency:
         print(f"[3] {end - time2:.3f}s", end = " | ")
-    
-    if print_latency:
         print(f"🕖 Crop Time : {end - start:.3f}s", end = " | ")
+        print(f"✂️ Crops : {len(final_items)}")
 
-    print(f"✂️ Crops : {len(final_items)}", end = "")
 
     if not save_visualization:
-        print()
         return results_for_grounding
     
     #! ---------------------------- 시각화(원본 크기) ----------------------------
