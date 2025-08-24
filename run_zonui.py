@@ -236,9 +236,6 @@ def get_top_q_crop_ids(top_q, attn_df):
 
     top_q_crop_ids = df.index[df[f"sum_until_{LAYER_NUM}"] >= thr].tolist()
 
-    # # guardrail: 최소/최대 개수 보정(선택)
-    if len(top_q_crop_ids) < 1:
-        raise Exception("no crop selected")
     return top_q_crop_ids
 
 def check_gt_in_top_q_crops(top_q_bboxes: List, gt_bbox: List):

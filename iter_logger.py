@@ -17,20 +17,6 @@ _WRITE_MD = True
 _USE_FSYNC = True
 _USE_LOCK = False
 
-_DEFAULT_HEADERS = [
-    "idx",                # 번호
-    "success",            # 최종 성공여부 (1/0)
-    "filename_wo_ext",    # 파일명(확장자 제외)
-    "task",               # task 이름
-    "num_crops",          # stage1 투입 crop 총 개수
-    "s1_hit",             # stage1 topQ 안에 GT 포함 (1/0)
-    "acc_s2_uptonow",     # 현재까지 누적 정확도 % (float)
-    "stage1_sec",         # stage1 처리 시간
-    "select_sec",         # topQ 선별 시간
-    "total_s1_sec",       # stage1 전체 시간 (위 둘 합)
-    "s1_topq_count",      # stage1 topQ 개수
-]
-
 def init_iter_logger(
     save_dir: str,
     csv_name: str = "iter_log.csv",
@@ -54,7 +40,7 @@ def init_iter_logger(
 
     _CSV_PATH = os.path.join(save_dir, csv_name)
     _MD_PATH = os.path.join(save_dir, md_name)
-    _HEADERS = list(headers) if headers is not None else list(_DEFAULT_HEADERS)
+    _HEADERS = list(headers)
     _WRITE_MD = bool(write_md)
     _USE_FSYNC = bool(use_fsync)
     _USE_LOCK = bool(use_lock and (fcntl is not None))
