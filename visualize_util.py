@@ -180,7 +180,7 @@ def visualize_results(crop_list: list, prediction_results: dict, instruction: st
         else:
             final_img = img_with_attns
 
-        # ⭐ 핵심 수정 부분: 어텐션 스코어 총합 계산 및 제목에 추가
+        # 어텐션 스코어 총합 계산
         total_attention_score = np.sum(attn_scores_np)
             
         # 4. 결과 이미지 표시

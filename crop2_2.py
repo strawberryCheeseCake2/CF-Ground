@@ -1,12 +1,19 @@
+'''
+재귀 크롭 X
+합치는 알고리즘이 단순해서 16개 -> 1개로 합쳐지는 경우 발생 -> 이를 crop3에서 해결
+
+하지만 crop을 안했을때 오히려 GUI Actor에서는 정확도가 높음
+현재까지 최대 정확도
+
++ resize가 생각보다 속도가 오래걸림
+'''
+
 from utils_dcgen import ImgSegmentation
 from PIL import Image, ImageDraw
 
 import os
-from pathlib import Path
 from time import time 
 import json
-
-# TODO: pip uninstall pillow → pip install pillow-simd로 교체 설치시 resize 빨라진다고 함.
 
 #! Hyper Parameter
 # 수직 최소 분할 비율: 폭이 너무 좁은 조각(=좌우로 얇음)은 이웃과 병합
@@ -163,7 +170,20 @@ def merge_small_segments(leaves, parent_size, min_w_ratio, min_h_ratio,
 #! ================================================================================================
 
 
-def crop(image_path, output_json_path, output_image_path, save_visualization, print_latency=False):
+def crop(image_path, output_json_path=None, output_image_path=None, save_visualization=False, print_latency=False):
+    """
+    이미지를 crop하여 결과 리스트 반환
+    
+    Args:
+        image_path: 입력 이미지 경로
+        output_json_path: JSON 저장 경로 (None이면 저장 안함)
+        output_image_path: 이미지 저장 경로 (None이면 저장 안함)
+        save_visualization: 시각화 이미지 저장 여부
+        print_latency: 실행 시간 출력 여부
+    
+    Returns:
+        results_for_grounding: grounding용 crop 결과 리스트
+    """
 
     start = time()
 
@@ -215,14 +235,16 @@ def crop(image_path, output_json_path, output_image_path, save_visualization, pr
     if print_latency:
         print(f"[2] {time2 - time1:.3f}s", end = " | ")
 
-    # 3) 결과 JSON 저장(리스트 평면 구조: {"bbox":[l,t,r,b], "level":k})
+    # 3) 결과 JSON 저장 (옵션)
     final_items = [(b_work, max(lvl, 1)) for (b_work, lvl) in leaves_lvl1_merged]
     json_out = [{"bbox": [int(b[0]), int(b[1]), int(b[2]), int(b[3])], "level": int(lvl)} for (b, lvl) in final_items]
 
-    with open(output_json_path, "w") as f:
-        json.dump(json_out, f, indent=2)
+    # JSON 저장 (경로가 제공된 경우에만)
+    if output_json_path:
+        with open(output_json_path, "w") as f:
+            json.dump(json_out, f, indent=2)
 
-    # === 반환 리스트(grounding 호환 포맷) 구성 ===
+    #! === 반환 리스트(grounding 호환 포맷) 구성 ===
     results_for_grounding = []
     # 0번 썸네일
     results_for_grounding.append({
@@ -269,46 +291,47 @@ def crop(image_path, output_json_path, output_image_path, save_visualization, pr
     if print_latency:
         print(f"🕖 Crop Time : {end - start:.3f}s", end = " | ")
 
-    print(f"✂️ crops : {len(final_items)}", end = " | ")
+    print(f"✂️ Crops : {len(final_items)}", end = "")
 
-    if save_visualization==False:
+    if not save_visualization:
         print()
         return results_for_grounding
     
     #! ---------------------------- 시각화(원본 크기) ----------------------------
 
-    # 시각화는 기존 방식 유지
-    if json_out:
-        if save_visualization:
-            orig_img = orig_img_full.copy()
-            draw = ImageDraw.Draw(orig_img)
+    # 시각화는 경로가 제공되고 save_visualization이 True인 경우에만
+    if json_out and save_visualization and output_image_path:
+        orig_img = orig_img_full.copy()
+        draw = ImageDraw.Draw(orig_img)
 
-            palette = {
-                0: (255, 0, 0),
-                1: (0, 255, 0),
-                2: (0, 0, 255),
-                3: (255, 165, 0),
-                4: (255, 0, 255),
-                5: (0, 255, 255),
-            }
-            line_w = max(2, int(min(orig_w, orig_h) * 0.003))
+        palette = {
+            0: (255, 0, 0),
+            1: (0, 255, 0),
+            2: (0, 0, 255),
+            3: (255, 165, 0),
+            4: (255, 0, 255),
+            5: (0, 255, 255),
+        }
+        line_w = max(2, int(min(orig_w, orig_h) * 0.003))
 
-            for item in json_out:
-                bbox = item.get("bbox")
-                level = item.get("level", 0)
-                if not bbox or len(bbox) != 4:
-                    continue
-                l, t, r, b = bbox
-                L = int(round(l * sx)); T = int(round(t * sy))
-                R = int(round(r * sx)); B = int(round(b * sy))
-                color = palette.get(level % len(palette), (255, 0, 0))
-                draw.rectangle([L, T, R, B], outline=color, width=line_w)
+        for item in json_out:
+            bbox = item.get("bbox")
+            level = item.get("level", 0)
+            if not bbox or len(bbox) != 4:
+                continue
+            l, t, r, b = bbox
+            L = int(round(l * sx)); T = int(round(t * sy))
+            R = int(round(r * sx)); B = int(round(b * sy))
+            color = palette.get(level % len(palette), (255, 0, 0))
+            draw.rectangle([L, T, R, B], outline=color, width=line_w)
 
-            save_path = output_image_path + f"result.png"
-            orig_img.save(save_path)
-            print(f"[SAVE] {save_path}")
-    else:
-        print("[INFO] No bbox results to visualize.")
+        save_path = output_image_path + f"result.png"
+        orig_img.save(save_path)
+        print(f" | [SAVE] {save_path}")
+    elif save_visualization and not output_image_path:
+        print(" | [WARNING] save_visualization=True but output_image_path is None")
+    elif json_out and not save_visualization and print_latency:
+        print(" | [INFO] Visualization skipped (save_visualization=False)")
 
     return results_for_grounding
 

@@ -31,7 +31,6 @@ ITER_LOG = True  # csv, md
 #! Hyperparameter =================
 
 # Model Architecture
-LAYER_NUM_LIST = [3, 7, 11, 15, 31]
 LAYER_NUM = 31
 
 # Stage 1: Segmentation & Selection
@@ -64,7 +63,7 @@ import sys
 import time
 from copy import deepcopy
 from pathlib import Path
-from typing import Dict, List
+from typing import List
 from math import sqrt
 
 # Third-Party Libraries
@@ -85,7 +84,7 @@ from qwen_vl_utils import process_vision_info
 from iter_logger import init_iter_logger, append_iter_log  # log csv 기록 파일
 from gui_actor.modeling_qwen25vl import Qwen2_5_VLForConditionalGenerationWithPointer
 from gui_actor.multi_image_inference import inference
-from utils2 import visualize_results, get_highest_attention_patch_bbox
+from visualize_util import visualize_results
 from crop2_2 import crop  #! 어떤 crop 파일 사용?
 from thop import profile #! flops
 
@@ -119,6 +118,8 @@ class NpEncoder(json.JSONEncoder):
             return float(obj)
         if isinstance(obj, np.ndarray):
             return obj.tolist()
+        if isinstance(obj, (np.bool_, bool)):
+            return bool(obj)
         return super(NpEncoder, self).default(obj)
 
 def create_guiactor_msgs(crop_list, instruction):
@@ -243,6 +244,37 @@ def find_top_crop_for_early_exit(crop_list, per_image_outputs):
     
     return top_point, top_crop_id
 
+def get_highest_attention_patch_bbox(image_result: dict) -> list:
+    """
+    per_image 결과에서 어텐션 스코어가 가장 높은 패치를 찾아 
+    해당 패치의 정규화된 바운딩 박스 좌표를 반환
+    """
+    # 1. 입력 데이터 추출
+    attn_scores = np.array(image_result['attn_scores'][0])
+    n_width = image_result['n_width']
+    n_height = image_result['n_height']
+
+    # 2. 어텐션 스코어가 가장 높은 패치의 1차원 인덱스 찾기
+    highest_score_idx = np.argmax(attn_scores)
+
+    # 3. 1차원 인덱스를 2차원 패치 그리드 좌표 (patch_x, patch_y)로 변환
+    # (patch_x는 가로 인덱스, patch_y는 세로 인덱스)
+    patch_y = highest_score_idx // n_width
+    patch_x = highest_score_idx % n_width
+
+    # 4. 패치 그리드 좌표를 정규화된 바운딩 박스 좌표로 계산
+    # 각 패치의 정규화된 너비와 높이
+    patch_norm_width = 1.0 / n_width
+    patch_norm_height = 1.0 / n_height
+    
+    # 바운딩 박스 계산
+    left = patch_x * patch_norm_width
+    top = patch_y * patch_norm_height
+    right = (patch_x + 1) * patch_norm_width
+    bottom = (patch_y + 1) * patch_norm_height
+    
+    return [left, top, right, bottom]
+
 def check_early_exit_condition(top_point, top_crop_id, crop_list, per_image_outputs, gt_bbox):
     """Early Exit 조건 확인"""
     if top_point is None or top_crop_id == -1:
@@ -283,14 +315,13 @@ def run_selection_pass_with_guiactor(msgs, crop_list, gt_bbox: List, attn_vis_di
     compute_attention_scores(crop_list, per_image_outputs)
     
     # Early Exit 체크
-    should_exit_early = False
-    early_exit_success = False
+    should_exit_early, early_exit_success = False, False
     
     if EARLY_EXIT:
         top_point, top_crop_id = find_top_crop_for_early_exit(crop_list, per_image_outputs)
-        should_exit_early, early_exit_success = check_early_exit_condition(top_point, top_crop_id, crop_list, per_image_outputs, gt_bbox)
-    
-    # Early Exit하면 select_crop 스킵
+        should_exit_early, early_exit_success = check_early_exit_condition(
+            top_point, top_crop_id, crop_list, per_image_outputs, gt_bbox
+        )    # Early Exit하면 select_crop 스킵
     if should_exit_early:
         top_q_crop_ids = []
         top_q_bboxes = []
@@ -691,7 +722,7 @@ if __name__ == '__main__':
 
     # Model Import
     model = Qwen2_5_VLForConditionalGenerationWithPointer.from_pretrained(
-        MLLM_PATH, torch_dtype="auto", attn_implementation="flash_attention_2",
+        MLLM_PATH, torch_dtype="auto", attn_implementation="sdpa",
         device_map="balanced", max_memory=max_memory, low_cpu_mem_usage=True
     )
     tokenizer = AutoTokenizer.from_pretrained(MLLM_PATH)
@@ -710,8 +741,9 @@ if __name__ == '__main__':
     init_iter_logger(  
         save_dir=save_dir,
         headers=[  # 순서 그대로 들어감
-            "idx", "crop_time", "early_exit", "num_crop", "num_selected_crop", "s1_time", "s1_hit", 
-            "s2_time", "s2_hit", "acc_uptonow", "total_time", "filename_wo_ext","instruction"
+            "idx", "crop_time", "num_crop", "early_exit", "num_selected_crop", 
+            "s1_time", "s1_flops_gflops", "s1_hit", "s2_time", "s2_flops_gflops", "s2_hit", 
+            "total_time", "total_flops_gflops", "acc_uptonow", "filename", "instruction"
         ],
         write_md=True,
         use_fsync=True,
@@ -727,33 +759,19 @@ if __name__ == '__main__':
 
         print("Num of sample: " + str(len(screenspot_data)), flush=True)
 
-        task_res = list()
+        # 통계 변수 초기화
+        task_res = []
         num_action = 0
-        corr_action = 0
-        res_board_dict = dict()
-        res_board_dict[1] = {
-            "top_q_crop_ids": [],
-            "is_gt_in_top_q": False, "raw_attn_dict": None,
-        }
-        res_board_dict[2] = {
-            "sub_res": []
-        }
-
-        seg_time_sum = 0.0
-        s1_time_sum = 0.0
-        s2_time_sum = 0.0
-        total_flops = 0.0
-
-        early_exit_count = 0
-        early_exit_success_count = 0
-        final_success_count = 0
+        seg_time_sum = s1_time_sum = s2_time_sum = total_flops = 0.0
+        early_exit_count = early_exit_success_count = final_success_count = 0
 
         for j, item in tqdm(enumerate(screenspot_data)):
 
-            print()
+            print("\n\n----------------------\n")
 
-            item_res = dict()
             num_action += 1
+            
+            # 파일 및 데이터 로드
             filename = item["img_filename"]
             filename_wo_ext, ext = os.path.splitext(filename)
             img_path = os.path.join(SCREENSPOT_IMGS, filename)
@@ -763,16 +781,19 @@ if __name__ == '__main__':
             original_image = Image.open(img_path).convert("RGB")
             instruction = item["instruction"]
             original_bbox = item["bbox"]
-            original_bbox = [original_bbox[0], original_bbox[1], original_bbox[0] + original_bbox[2], original_bbox[1] + original_bbox[3]]
-            question = QUESTION_TEMPLATE.format(task_prompt=instruction)
-
-            inst_dir_name = re.sub(r'\W+', '_', instruction).strip('_')
-
-            inst_dir = os.path.join(save_dir, "seg", filename_wo_ext, inst_dir_name)
-            s1_dir = os.path.join(inst_dir, "stage1")
-            s2_dir = os.path.join(inst_dir, "stage2")
-            os.makedirs(s1_dir, exist_ok=True)
-            os.makedirs(s2_dir, exist_ok=True)
+            original_bbox = [original_bbox[0], original_bbox[1], 
+                           original_bbox[0] + original_bbox[2], original_bbox[1] + original_bbox[3]]
+            
+            # 디렉토리 설정 (시각화용 - 필요시에만)
+            if any([STAGE0_VIS, STAGE1_VIS, STAGE2_VIS]):
+                inst_dir_name = re.sub(r'\W+', '_', instruction).strip('_')
+                inst_dir = os.path.join(save_dir, "seg", filename_wo_ext, inst_dir_name)
+                s1_dir = os.path.join(inst_dir, "stage1") 
+                s2_dir = os.path.join(inst_dir, "stage2")
+                os.makedirs(s1_dir, exist_ok=True)
+                os.makedirs(s2_dir, exist_ok=True)
+            else:
+                inst_dir = s1_dir = s2_dir = None
 
             #! ==================================================================
             #! Stage 0 | Segmentation
@@ -781,16 +802,13 @@ if __name__ == '__main__':
             seg_start = time.time()
             crop_list = crop(
                 image_path=img_path,
-                output_json_path=f"{s1_dir}/output.json",
-                output_image_path=s1_dir,
                 save_visualization=False
             )
             s0_crop_list = resize_crop_list(crop_list=crop_list, ratio=S1_RESIZE_RATIO)
             seg_end = time.time()
             seg_time = seg_end - seg_start
-            print(f"🕖 S0 Time: {seg_time:.2f} sec")
 
-            if STAGE0_VIS:
+            if STAGE0_VIS and inst_dir:
                 all_crops_bboxes = [crop["bbox"] for crop in s0_crop_list]
                 visualize_crop(save_dir=inst_dir, gt_bbox=original_bbox, top_q_bboxes=all_crops_bboxes,
                                 instruction=instruction, filename="s1_all_crop.png", click_point=None)
@@ -805,7 +823,6 @@ if __name__ == '__main__':
                 s1_inputs = get_model_inputs(s1_msgs, tokenizer, processor, model.device)
                 wrapped_model = ModelKwargsWrapper(model)
                 s1_flops, _ = profile(wrapped_model, inputs=(s1_inputs,), verbose=False)
-                print(f"🔥 Stage 1 FLOPs: {s1_flops / 1e9:.2f} GFLOPs")
 
             s1_start = time.time()
 
@@ -813,7 +830,7 @@ if __name__ == '__main__':
                 msgs=s1_msgs,
                 crop_list=s0_crop_list,
                 gt_bbox=original_bbox,
-                attn_vis_dir=s1_dir
+                attn_vis_dir=s1_dir or ""
             )
             s1_infence_end = time.time()
 
@@ -823,28 +840,14 @@ if __name__ == '__main__':
                   early_exit_success_count += 1
 
             s1_time = s1_infence_end - s1_start
-            print(f"🕖 S1 Inference Time: {s1_time:.2f} sec")
             seg_time_sum += seg_time
             s1_time_sum += s1_time
 
-            if STAGE1_VIS:  # Stage 1 | top Q Visualize + GT가 안에 들어가는지 체크
-                visualize_crop(save_dir=inst_dir, gt_bbox=original_bbox, top_q_bboxes=s1_top_q_bboxes,
-                                instruction=instruction, filename="s1_top_q.png", click_point=None)
-
             # GT가 안에 들어가는지 체크
-            if early_exit_success:
-                s1_hit = True
-            else:
-                s1_hit = check_gt_in_selected_crops(top_q_bboxes=s1_top_q_bboxes, gt_bbox=original_bbox)
+            s1_hit = early_exit_success or (not should_exit_early and check_gt_in_selected_crops(s1_top_q_bboxes, original_bbox))
 
-            res_board_dict[1]["top_q_crop_ids"] = s1_top_q_crop_ids
-            res_board_dict[1]["early_exit"] = bool(should_exit_early)
-
-            for c in s0_crop_list_out:
-                if "img" in c: del c["img"]
-                if "resized_img" in c: del c["resized_img"]
-                if "token_span" in c: del c["token_span"]
-            res_board_dict[1]["crop_list"] = s0_crop_list_out
+            # 불필요한 딕셔너리 연산 제거 - 결과 저장용도만
+            # res_board_dict는 사실상 미사용
             
             #! ==================================================================
             #! [Stage 2] Attention Refinement Pass
@@ -855,7 +858,6 @@ if __name__ == '__main__':
                 final_success = early_exit_success
                 s2_time = 0.0
                 s2_flops = 0.0
-                print("✅🚨 Early Exit Success") if early_exit_success else print("❌🚨 Early Exit Fail")
             else:
                 original_crop_map = {c['id']: c for c in crop_list}
                 s2_input_crop_ids = set()
@@ -872,7 +874,6 @@ if __name__ == '__main__':
                     s2_inputs = get_model_inputs(s2_msgs, tokenizer, processor, model.device)
                     wrapped_model = ModelKwargsWrapper(model)
                     s2_flops, _ = profile(wrapped_model, inputs=(s2_inputs,), verbose=False)
-                    print(f"🔥 Stage 2 FLOPs: {s2_flops / 1e9:.2f} GFLOPs")
 
                 s2_inference_start = time.time()
 
@@ -880,19 +881,20 @@ if __name__ == '__main__':
                     crop_list=s2_input_crops,
                     instruction=instruction,
                     original_image=original_image,
-                    save_dir=s2_dir,
+                    save_dir=s2_dir or "",
                     gt_bbox=original_bbox
                 )
                 s2_inference_end = time.time()
                 s2_time = s2_inference_end - s2_inference_start
-                print("✅ Grounding Success") if final_success else print("❌ Grounding Fail")
-                print(f"🕖 S2 Inference Time: {s2_time:.2f} sec")
-
+                
+            # 성능 로깅
             total_time = seg_time + s1_time + s2_time
-            flops = s1_flops + (s2_flops if not should_exit_early else 0)
-            total_flops += flops
-            print(f"🕖 Total Inference Time: {total_time:.2f} sec")
-            print(f"🔥 Total FLOPs: {flops / 1e9:.2f} GFLOPs")
+            total_flops_this = s1_flops + (s2_flops if not should_exit_early else 0)
+            total_flops += total_flops_this
+            
+            print(f"🕖 Times - Seg: {seg_time:.2f}s | S1: {s1_time:.2f}s | S2: {s2_time:.2f}s | Total: {total_time:.2f}s")
+            print(f"🔥 FLOPs - S1: {s1_flops/1e9:.2f} | S2: {s2_flops/1e9:.2f} | Total: {total_flops_this/1e9:.2f} GFLOPs")
+            print(f"{'✅🚨 Early Exit Success' if should_exit_early and early_exit_success else '❌🚨 Early Exit Fail' if should_exit_early else '✅ Grounding Success' if final_success else '❌ Grounding Fail'}")
 
             #! ==================================================================
             #! [End]
@@ -903,33 +905,45 @@ if __name__ == '__main__':
 
             up2now_gt_score = final_success_count / num_action * 100
             print(f"Up2Now Grounding Accuracy: {up2now_gt_score}%")
-            print("\n----------------------\n")
 
-            # Iter log
+            # Iter log - 개선된 로깅
             append_iter_log(
                 idx=j+1,
-                early_exit="✅" if should_exit_early else "🫥",
-                s1_hit="✅" if s1_hit or early_exit_success else "❌",
-                s2_hit="✅" if final_success or early_exit_success else "❌",
-                num_crop=len(s0_crop_list)-1,
-                num_selected_crop=len(s1_top_q_crop_ids),
+                filename=filename_wo_ext,
+                instruction=instruction[:50] + "..." if len(instruction) > 50 else instruction,
                 crop_time=f"{seg_time:.3f}",
+                num_crop=len(s0_crop_list)-1,
+                early_exit="☑️" if should_exit_early else "🫥",
+                num_selected_crop=len(s1_top_q_crop_ids) if not should_exit_early else 0,
                 s1_time=f"{s1_time:.3f}",
+                s1_flops_gflops=f"{s1_flops/1e9:.2f}",
+                s1_hit="✅" if s1_hit else "❌",
                 s2_time=f"{s2_time:.3f}",
-                acc_uptonow=f"{up2now_gt_score:.2f}",
-                total_time=f"{total_time}",
-                filename_wo_ext=filename_wo_ext,
-                instruction=instruction
+                s2_flops_gflops=f"{s2_flops/1e9:.2f}" if not should_exit_early else "0.00",
+                s2_hit="✅" if final_success else "❌",
+                total_time=f"{total_time:.3f}",
+                total_flops_gflops=f"{total_flops_this/1e9:.2f}",
+                acc_uptonow=f"{up2now_gt_score:.2f}"
             )
 
-            # JSON add
-            item_res['filename'] = filename
-            item_res['data_type'] = item["data_type"]
-            item_res['data_source'] = item["data_source"]
-            item_res['instruction'] = instruction
-            item_res['gt_bbox'] = original_bbox
-            item_res['num_crop'] = len(s0_crop_list)
-            item_res['flops'] = flops
+            # JSON 기록 - 핵심 정보만
+            item_res = {
+                'filename': filename,
+                'instruction': instruction,
+                'gt_bbox': original_bbox,
+                'num_crop': len(s0_crop_list) - 1,  # 썸네일 제외
+                'early_exit': should_exit_early,
+                'early_exit_success': early_exit_success,
+                's1_hit': s1_hit,
+                's2_hit': final_success,
+                'seg_time': seg_time,
+                's1_time': s1_time,
+                's2_time': s2_time,
+                'total_time': total_time,
+                's1_flops': s1_flops,
+                's2_flops': s2_flops if not should_exit_early else 0,
+                'total_flops': total_flops_this
+            }
             task_res.append(item_res)
 
         #! ==================================================
@@ -937,22 +951,32 @@ if __name__ == '__main__':
         with open(os.path.join(save_dir, dataset), "w") as f:
             json.dump(task_res, f, indent=4, ensure_ascii=False, cls=NpEncoder)
 
+        # 최종 성능 메트릭 계산
         metrics = {
             "task": task,
-            "total_num": num_action,
-            "seg_latency_mean": seg_time_sum / num_action,
-            "s1_latency_mean": s1_time_sum / num_action,
-            "s2_latency_mean": s2_time_sum / num_action,
-            "total_early_exit": early_exit_count,
-            "total_early_exit_success": early_exit_success_count,
-            "acc": final_success_count / num_action * 100,
-            "avg_flops": total_flops / num_action
+            "total_samples": num_action,
+            "accuracy": final_success_count / num_action * 100,
+            "early_exit_rate": early_exit_count / num_action * 100,
+            "early_exit_success_rate": early_exit_success_count / early_exit_count * 100 if early_exit_count > 0 else 0,
+            "avg_times": {
+                "segmentation": seg_time_sum / num_action,
+                "stage1": s1_time_sum / num_action,
+                "stage2": s2_time_sum / num_action,
+                "total": (seg_time_sum + s1_time_sum + s2_time_sum) / num_action
+            },
+            "avg_flops_gflops": total_flops / num_action / 1e9,
         }
 
         with open(os.path.join(save_dir, f"{task}_metrics.json"), "w") as mf:
             json.dump(metrics, mf, ensure_ascii=False, indent=4)
 
-        # 결과 출력
-        print("==================================================")
-        print(task + ": Total num: " + str(num_action))
-        print(task + f": Ground truth included Acc: " + up2now_gt_score)
+        # 최종 결과 출력
+        print("=" * 60)
+        print(f"📊 Final Results for {task}:")
+        print(f"Total Samples: {num_action}")
+        print(f"Accuracy: {metrics['accuracy']:.2f}%")
+        print(f"Early Exit Rate: {metrics['early_exit_rate']:.2f}%")
+        print(f"Early Exit Success Rate: {metrics['early_exit_success_rate']:.2f}%") 
+        print(f"Avg Times: Seg {metrics['avg_times']['segmentation']:.3f}s, S1 {metrics['avg_times']['stage1']:.3f}s, S2 {metrics['avg_times']['stage2']:.3f}s")
+        print(f"Avg FLOPs: {metrics['avg_flops_gflops']:.2f} GFLOPs")
+        print("=" * 60)
