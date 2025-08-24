@@ -7,12 +7,6 @@ SEED = 0
 import os
 os.environ["CUDA_DEVICE_ORDER"]="PCI_BUS_ID"
 os.environ["CUDA_VISIBLE_DEVICES"]= "1"  # 몇번 GPU 사용할지 ("0,1", "2" 등)
-max_memory = {
-    0: "75GiB",
-    # 1: "75GiB",
-    # 2: "75GiB",
-    "cpu": "120GiB",  # 남는 건 CPU 오프로딩xs
-}
 
 # Dataset & Model
 MLLM_PATH = "microsoft/GUI-Actor-3B-Qwen2.5-VL"
@@ -85,7 +79,7 @@ from visualize_util import (
     _visualize_early_exit_results, _visualize_stage1_results, _visualize_stage2_results, 
     visualize_crop, visualize_attn_map, visualize_aggregated_attention
 )
-from crop2_2 import crop  #! 어떤 crop 파일 사용?
+from crop import crop  #! 어떤 crop 파일 사용?
 from thop import profile #! flops
 
 #! ==============================================
@@ -426,7 +420,8 @@ if __name__ == '__main__':
     # Model Import
     model = Qwen2_5_VLForConditionalGenerationWithPointer.from_pretrained(
         MLLM_PATH, torch_dtype="auto", attn_implementation="sdpa",
-        device_map="balanced", max_memory=max_memory, low_cpu_mem_usage=True
+        device_map={"": "cuda:0"},   # balanced -> 단일 GPU 고정
+        low_cpu_mem_usage=True
     )
     tokenizer = AutoTokenizer.from_pretrained(MLLM_PATH)
     processor = AutoProcessor.from_pretrained(MLLM_PATH)

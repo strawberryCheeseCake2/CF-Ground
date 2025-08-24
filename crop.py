@@ -1,331 +1,353 @@
-# crop.py
-"""
-요구사항 요약:
-    - s1 폴더에 all.png 저장
-    - 20% 넘는 큰 그림은 최종적으로 반환하지 않으면 oversize/에 저장
-    - 20% 이하(또는 실패로 강제 포함)는 s1 폴더 바로 아래에
-        crop{번호}_rec{깊이}[ _fail].png 로 저장
-    * 번호는 '최종적으로 사용되는 crop'에 대해 1부터 부여
-    * level==0(썸네일)은 id=0 고정, 파일 저장은 all.png 만
-    - 좌표는 절대 좌표 유지, 중복 저장 금지
-    - MAX_RECURSION_DEPTH 번 반복해도 실패하면 fail로 강제 포함
-반환:
-    List[dict]: 0번 썸네일 + level1 crop들(dict는 run_grounding.py가 쓰는 스펙 유지)
-"""
+'''
+재귀 크롭 X
+합치는 알고리즘이 단순해서 16개 -> 1개로 합쳐지는 경우 발생 -> 이를 crop3에서 해결
 
-import os
-import json
-import shutil
-from pathlib import Path
-from typing import List, Dict, Tuple, Optional
-from dataclasses import dataclass, asdict
-from PIL import Image
+하지만 crop을 안했을때 오히려 GUI Actor에서는 정확도가 높음
+현재까지 최대 정확도
+
++ resize가 생각보다 속도가 오래걸림
+'''
 
 from utils_dcgen import ImgSegmentation
+from PIL import Image, ImageDraw
 
-# ------------------------------
-# 설정 상수
-# ------------------------------
-DIFF_THRESH    = 45            # dcgen ImgSegmentation 인자 유지
-DIFF_PORTION   = 0.9           # dcgen ImgSegmentation 인자 유지
+import os
+from time import time 
+import json
 
-MAX_AREA_RATIO = 0.40          #! 40% 보다 크면 재귀
-MAX_RECURSION_DEPTH = 3        # 최대 재귀 횟수
-RETRY_GROWTH   = 5             # var_thresh 증가 배율
+#! Hyper Parameter
+# 수직 최소 분할 비율: 폭이 너무 좁은 조각(=좌우로 얇음)은 이웃과 병합
+Y_MIN_RATIO = 0.20   # 전체 너비의 20% 미만이면 병합
 
-@dataclass
-class CropItem:
-    id: int
-    level: int
-    bbox: List[int]                  # [left, top, right, bottom] (절대 좌표)
-    recursion_depth: int = 0
-    fail: bool = False               # 세그 실패로 강제 채택 표시
-    parent_id: Optional[int] = None
-    filename: Optional[str] = None   # 디스크 저장 파일명
+# 수평 최소 분할 비율: 높이가 너무 낮은 조각(=상하로 얇음)은 이웃과 병합
+X_MIN_RATIO = 0.1   # 전체 높이의 10% 미만이면 병합  # TODO: crop이 잘게 10개 넘게씩이 좋을까 아니면 그냥 뭉치게가 좋을까 0.05 / 0.1
 
-# ------------------------------
-# 유틸
-# ------------------------------
+# 리사이즈 비율 (coarse/fine 분리)
+RESIZE_RATIO_1 = 0.1   # 1차 coarse segmentation
 
-def _area(b):
-    return max(0, b[2]-b[0]) * max(0, b[3]-b[1])
+#! 1차/2차 분할 파라미터
+FIRST_PASS = dict(
+    max_depth=1,      # 트리 분할 최대 깊이 (값 ↑ → 더 많이 잘라서 세부적으로 분할)
+    var_thresh=150,   # 픽셀 분산 기준 (값 ↑ → 단색/균일 구간도 "내용 있음"으로 인식 → 분할 줄어듦)
+    diff_thresh=20,   # 행간 픽셀 차이 허용치 (값 ↑ → 작은 경계 무시, 오직 큰 차이만 분리 → 분할 줄어듦)
+    diff_portion=0.7, # 차이가 일정 비율 이상일 때만 경계 인정 (값 ↑ → 더 강한 변화 필요 → 분할 줄어듦)
+    window_size=50    # 슬라이딩 윈도우 높이 (값 ↑ → 큰 구간 단위로 평균내서 안정적 경계 탐지, 작은 변화 무시됨)
+)
 
-def _ratio(b, W, H):
-    A = _area(b)
-    return A / float(max(1, W*H))
 
-def _bbox_to_tuple(b):
-    return (int(b[0]), int(b[1]), int(b[2]), int(b[3]))
+#! ---------------------------- Util ----------------------------
 
-def _dedup_key(b):
-    # 박스 중복 제거 키 (좌표 스냅)
-    return (int(b[0]), int(b[1]), int(b[2]), int(b[3]))
+def bbox_area(b):
+    l, t, r, btm = b
+    return max(0, r - l) * max(0, btm - t)
 
-def _safe_remove_tree(p: Path):
-    try:
-        if p.exists():
-            shutil.rmtree(p)
-    except Exception:
-        pass
+def bbox_w(b):
+    return max(0, b[2] - b[0])
 
-# ------------------------------
-# 세그멘테이션 1회 실행 + JSON 읽기
-# ------------------------------
+def bbox_h(b):
+    return max(0, b[3] - b[1])
 
-def _run_imgseg_once(image_path: str, max_depth: int, window_size: int, var_thresh: int, json_out: Path) -> Optional[List[Dict]]:
+def overlap_1d(a1, a2, b1, b2):
+    """ [a1,a2]와 [b1,b2] 구간의 겹침 길이 """
+    return max(0, min(a2, b2) - max(a1, b1))
+
+def vertical_overlap(a, b):
+    """ 두 bbox의 세로 방향 겹침 비율 (작은 쪽 기준) """
+    ov = overlap_1d(a[1], a[3], b[1], b[3])
+    denom = max(1, min(bbox_h(a), bbox_h(b)))
+    return ov / denom
+
+def horizontal_overlap(a, b):
+    """ 두 bbox의 가로 방향 겹침 비율 (작은 쪽 기준) """
+    ov = overlap_1d(a[0], a[2], b[0], b[2])
+    denom = max(1, min(bbox_w(a), bbox_w(b)))
+    return ov / denom
+
+def merge_two(a, b):
+    """ 두 bbox의 외접 사각형으로 병합 """
+    return (min(a[0], b[0]), min(a[1], b[1]), max(a[2], b[2]), max(a[3], b[3]))
+
+def collect_leaves_from_tree(tree_dict, base_level=0):
     """
-    ImgSegmentation 1회 실행하고 JSON을 json_out에 저장한 뒤 파싱해서 반환
-    각 항목은 {"bbox":[l,t,r,b], "level":int} 형태라고 가정
+    to_json_tree() 결과(dict)에서 리프 노드들만 (bbox, level)로 수집.
+    level은 base_level 기준으로 +1씩 내려감.
     """
-    try:
-        seg = ImgSegmentation(
-            img=image_path,
-            max_depth=max_depth,
-            var_thresh=var_thresh,
-            diff_thresh=DIFF_THRESH,
-            diff_portion=DIFF_PORTION,
-            window_size=window_size
-        )
-        seg.to_json(path=str(json_out))
-        with open(json_out, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        if not isinstance(data, list):
-            return None
-        return data
-    except Exception as e:
-        print(f"[seg] error var_thresh={var_thresh}: {e}")
-        return None
+    out = []
+    def _rec(node, level):
+        ch = node.get("children", [])
+        if not ch:
+            out.append((tuple(node["bbox"]), level))
+            return
+        for c in ch:
+            _rec(c, level + 1)
+    _rec(tree_dict, base_level)
+    return out
 
-def _run_imgseg_with_retries(image_path: str, max_depth: int, window_size: int, var_thresh: int, json_out: Path) -> Optional[List[Dict]]:
+def merge_small_segments(leaves, parent_size, min_w_ratio, min_h_ratio,
+                         v_overlap_thr=0.3, h_overlap_thr=0.3, max_iter=4):
     """
-    var_thresh를 점증시키며 시도
-    MAX_RECURSION_DEPTH 만큼 
+    너무 얇은 조각(폭/높이 기준)을 이웃과 병합.
+    - leaves: [(bbox, level), ...]
+    - parent_size: (W, H)  -> 이 좌표계 픽셀 스케일 기준으로 판정
+    - min_w_ratio/min_h_ratio: 비율 임계
+    - v_overlap_thr/h_overlap_thr: 이웃으로 간주할 최소 겹침 비율
     """
-    tried = []
-    cur = var_thresh
-    last = None
+    W, H = parent_size
+    cur = [(tuple(b), lvl) for (b, lvl) in leaves]
 
-    for _ in range(MAX_RECURSION_DEPTH):
-        tried.append(cur)
-        data = _run_imgseg_once(image_path, max_depth, window_size, cur, json_out)
-        if data is not None and len(data) > 0:
-            # 최소 level=1이 존재하는지 확인
-            if any((d.get("level", 1) != 0) for d in data):
-                return data
-        last = data
-        cur *= RETRY_GROWTH
+    def by_x(e): return (e[0][0] + e[0][2]) / 2.0
+    def by_y(e): return (e[0][1] + e[0][3]) / 2.0
 
-    # 최종 실패
-    print(f"[seg] no result after tries {tried}")
-    return last
+    for _ in range(max_iter):
+        changed = False
 
-# ------------------------------
-# 하위(부분) 이미지에 대해 재귀 분할
-# ------------------------------
+        # 1) 폭이 너무 좁은 것 -> 좌/우 이웃과 병합
+        cur.sort(key=by_x)
+        i = 0
+        while i < len(cur):
+            b, lvl = cur[i]
+            w = bbox_w(b)
+            if W > 0 and (w / W) < min_w_ratio:
+                # 좌/우 후보 중 세로 겹침 가장 큰 이웃
+                best_j = -1
+                best_ov = -1.0
+                for j in [i - 1, i + 1]:
+                    if 0 <= j < len(cur):
+                        b2, _ = cur[j]
+                        ov = vertical_overlap(b, b2)
+                        if ov > best_ov:
+                            best_ov = ov
+                            best_j = j
+                if best_j >= 0 and best_ov >= v_overlap_thr:
+                    b2, lvl2 = cur[best_j]
+                    merged = merge_two(b, b2)
+                    new_lvl = max(lvl, lvl2)
+                    for idx in sorted([i, best_j], reverse=True):
+                        cur.pop(idx)
+                    cur.insert(min(i, best_j), (merged, new_lvl))
+                    changed = True
+                    continue
+            i += 1
 
-def _recursive_split(
-    original_img: Image.Image,
-    abs_bbox: List[int],
-    depth: int,
-    max_depth_limit: int,
-    max_area_ratio: float,
-    max_depth: int, window_size: int, var_thresh: int,
-    work_root: Path
-) -> Tuple[List[Tuple[List[int], int, bool]], List[List[int]]]:
+        # 2) 높이가 너무 낮은 것 -> 상/하 이웃과 병합
+        cur.sort(key=by_y)
+        i = 0
+        while i < len(cur):
+            b, lvl = cur[i]
+            h = bbox_h(b)
+            if H > 0 and (h / H) < min_h_ratio:
+                best_j = -1
+                best_ov = -1.0
+                for j in [i - 1, i + 1]:
+                    if 0 <= j < len(cur):
+                        b2, _ = cur[j]
+                        ov = horizontal_overlap(b, b2)
+                        if ov > best_ov:
+                            best_ov = ov
+                            best_j = j
+                if best_j >= 0 and best_ov >= h_overlap_thr:
+                    b2, lvl2 = cur[best_j]
+                    merged = merge_two(b, b2)
+                    new_lvl = max(lvl, lvl2)
+                    for idx in sorted([i, best_j], reverse=True):
+                        cur.pop(idx)
+                    cur.insert(min(i, best_j), (merged, new_lvl))
+                    changed = True
+                    continue
+            i += 1
+
+        if not changed:
+            break
+
+    # 경계 스냅(정수화)
+    snapped = []
+    for (b, lvl) in cur:
+        l, t, r, btm = b
+        snapped.append(((int(round(l)), int(round(t)), int(round(r)), int(round(btm))), lvl))
+    return snapped
+
+
+#! ================================================================================================
+
+
+def crop(image_path, output_json_path=None, output_image_path=None, save_visualization=False, print_latency=False):
     """
-    반환:
-      kept: List of (abs_bbox, recursion_depth, fail_flag)
-      oversize_dump: 최종적으로 반환하지 않는(oversize) 절대 박스들
-    """
-    W, H = original_img.size
-
-    # 1) 큰 영역을 잘라 임시 파일로 세그 시도
-    l, t, r, b = _bbox_to_tuple(abs_bbox)
-    sub = original_img.crop((l, t, r, b))
-
-    tmp_dir = work_root / f"tmp_rec_{depth}"
-    tmp_dir.mkdir(parents=True, exist_ok=True)
-    tmp_img = tmp_dir / "img.png"
-    tmp_json = tmp_dir / "seg.json"
-    sub.save(tmp_img)
-
-    data = _run_imgseg_with_retries(str(tmp_img), max_depth=max_depth, window_size=window_size, var_thresh=var_thresh, json_out=tmp_json)
-
-    kept: List[Tuple[List[int], int, bool]] = []
-    oversize_dump: List[List[int]] = []
-
-    if data is None:
-        # 세그 자체가 실패 → 원래 abs_bbox를 fail로 포함
-        kept.append((abs_bbox, depth, True))
-        return kept, oversize_dump
-
-    # data 안에는 level 0(썸네일) + level 1들이 함께 있을 수 있음
-    # level 1만 처리
-    subs = [d for d in data if d.get("level", 1) != 0 and "bbox" in d]
-    if len(subs) == 0:
-        # 분할 결과 없음 → abs_bbox fail 포함
-        kept.append((abs_bbox, depth, True))
-        return kept, oversize_dump
-
-    for d in subs:
-        rel = d["bbox"]  # 부분 이미지 기준 좌표
-        sL, sT, sR, sB = int(rel[0]), int(rel[1]), int(rel[2]), int(rel[3])
-        # 절대 좌표 변환
-        abs_child = [l + sL, t + sT, l + sR, t + sB]
-        ratio = _ratio(abs_child, W, H)
-
-        if ratio <= max_area_ratio:
-            kept.append((abs_child, depth, False))
-        else:
-            # 더 쪼갤 수 있는지 확인
-            if depth + 1 < max_depth_limit:
-                child_kept, child_oversize = _recursive_split(
-                    original_img, abs_child, depth + 1, max_depth_limit, max_area_ratio,
-                    max_depth, window_size, var_thresh, work_root
-                )
-                kept.extend(child_kept)
-                oversize_dump.extend(child_oversize)
-            else:
-                # 더 못 쪼갬 → oversize로 보관 (반환 안 함)
-                oversize_dump.append(abs_child)
-
-    return kept, oversize_dump
-
-# ------------------------------
-# 메인 엔트리
-# ------------------------------
-
-def run_segmentation_recursive( image_path: str,
-                                max_depth: int,
-                                window_size: int,
-                                output_json_path: str,
-                                output_image_path: str,
-                                start_id: int = 0,
-                                var_thresh: int = 120,
-                                max_area_ratio: float = MAX_AREA_RATIO,
-                                max_recursion: int = 3):
+    이미지를 crop하여 결과 리스트 반환
     
-    s1_dir = Path(output_image_path)
-    s1_dir.mkdir(parents=True, exist_ok=True)
-    oversize_dir = s1_dir / "oversize"
-    oversize_dir.mkdir(exist_ok=True)
+    Args:
+        image_path: 입력 이미지 경로
+        output_json_path: JSON 저장 경로 (None이면 저장 안함)
+        output_image_path: 이미지 저장 경로 (None이면 저장 안함)
+        save_visualization: 시각화 이미지 저장 여부
+        print_latency: 실행 시간 출력 여부
+    
+    Returns:
+        results_for_grounding: grounding용 crop 결과 리스트
+    """
 
-    # 0) 원본 저장
-    try:
-        original_img = Image.open(image_path).convert("RGB")
-    except Exception as e:
-        print(f"[seg] cannot open image: {e}")
-        return None
-    W, H = original_img.size
-    (s1_dir / "all.png").write_bytes(Path(image_path).read_bytes())
+    start = time()
 
-    # 1) 초기 세그
-    output_json_path = Path(output_json_path)
-    data = _run_imgseg_with_retries(image_path, max_depth=max_depth, window_size=window_size, var_thresh=var_thresh, json_out=output_json_path)
+    # 0) 원본/작업 이미지 로드 및 리사이즈
+    orig_img_full = Image.open(image_path).convert("RGB")
+    orig_w, orig_h = orig_img_full.size
+    resized_w1, resized_h1 = int(orig_w * RESIZE_RATIO_1), int(orig_h * RESIZE_RATIO_1)
+    resized_w1 = max(1, resized_w1)
+    resized_h1 = max(1, resized_h1)
+    work_img = orig_img_full.resize((resized_w1, resized_h1))
 
-    if data is None or len(data) == 0:
-        print("[seg] initial segmentation failed → 썸네일만 반환")
-        return [{
-            "img": original_img,
-            "id": 0,
-            "bbox": [0, 0, W, H],
-            "level": 0
-        }]
+    abs_W1 = orig_w * RESIZE_RATIO_1
+    abs_H1 = orig_h * RESIZE_RATIO_1
 
-    # 2) 수집 단계
-    final_kept: List[Tuple[List[int], int, bool]] = []   # (abs_bbox, recursion_depth, fail_flag)
-    final_dump: List[List[int]] = []                    # oversize만 모아 저장용
-    seen = set()
+    time0 = time()
+    # print(f"[Crop] [0] {time0 - start:.3f}s", end = " | ")
 
-    # 초기 level==1 후보
-    init_candidates = [d for d in data if d.get("level", 1) != 0 and "bbox" in d]
+    # 1-2) 1차 분할
+    img_seg = ImgSegmentation(
+        img=work_img,
+        max_depth=FIRST_PASS["max_depth"],
+        var_thresh=FIRST_PASS["var_thresh"],
+        diff_thresh=FIRST_PASS["diff_thresh"],
+        diff_portion=FIRST_PASS["diff_portion"],
+        window_size=FIRST_PASS["window_size"]
+    )
 
-    # 초기 후보 각각 처리
-    for d in init_candidates:
-        b = [int(x) for x in d["bbox"]]
-        key = _dedup_key(b)
-        if key in seen:
-            continue
-        seen.add(key)
+    # 트리에서 리프만 수집(level 기준: 루트 0, 리프는 1)
+    tree = img_seg.to_json_tree()
+    leaves_lvl1 = collect_leaves_from_tree(tree, base_level=0)
 
-        ratio = _ratio(b, W, H)
-        if ratio <= max_area_ratio:
-            final_kept.append((b, 0, False))
-        else:
-            # 재귀 분할
-            work_root = s1_dir / "_tmp_work"
-            work_root.mkdir(exist_ok=True)
-            kept, dump = _recursive_split(
-                original_img, b, 1, max_recursion, max_area_ratio,
-                max_depth, window_size, var_thresh,
-                work_root=work_root
-            )
-            final_kept.extend(kept)
-            final_dump.extend(dump)
-            _safe_remove_tree(work_root)
 
-    # 3) oversize 저장 (반환하지 않는 것만)
-    dump_seen = set()
-    for b in final_dump:
-        k = _dedup_key(b)
-        if k in dump_seen:
-            continue
-        dump_seen.add(k)
-        try:
-            crop = original_img.crop(_bbox_to_tuple(b))
-            # 이름: over_{l}_{t}_{r}_{b}.png (고유)
-            fname = f"over_{b[0]}_{b[1]}_{b[2]}_{b[3]}.png"
-            crop.save(oversize_dir / fname)
-        except Exception as e:
-            print(f"[seg] oversize save fail: {e}")
+    time1 = time()
+    if print_latency:
+        print(f"[1] {time1 - time0:.3f}s", end = " | ")
 
-    # 4) 최종 반환 목록(레벨/ID 정리)
-    #    - id 0: 썸네일
-    #    - id 1..N: 채택된 crop (fail 포함)
-    #    - 번호 부여는 '최종적으로 사용되는 crop' 기준으로 1부터
-    # 좌표 중복 제거
-    kept_unique = []
-    kept_seen = set()
-    for b, rec, fail in final_kept:
-        k = _dedup_key(b)
-        if k in kept_seen:
-            continue
-        kept_seen.add(k)
-        kept_unique.append((b, rec, fail))
+    # 1-2) 제로-드롭 병합 보정(너무 얇은/낮은 조각은 이웃과 병합)
+    leaves_lvl1_merged = merge_small_segments(
+        leaves=leaves_lvl1,
+        parent_size=(abs_W1, abs_H1),  # ← 부모 bbox 말고, 원본×리사이즈 상수
+        min_w_ratio=Y_MIN_RATIO,
+        min_h_ratio=X_MIN_RATIO,
+        v_overlap_thr=0.3,
+        h_overlap_thr=0.3,
+        max_iter=4
+    )
 
-    # 정렬 기준: 상단-좌측 우선
-    kept_unique.sort(key=lambda x: (x[0][1], x[0][0]))
+    time2 = time()
+    if print_latency:
+        print(f"[2] {time2 - time1:.3f}s", end = " | ")
 
-    results: List[Dict] = []
-    # 썸네일 먼저
-    results.append({
-        "img": original_img,
+    # 3) 결과 JSON 저장 (옵션)
+    final_items = [(b_work, max(lvl, 1)) for (b_work, lvl) in leaves_lvl1_merged]
+    json_out = [{"bbox": [int(b[0]), int(b[1]), int(b[2]), int(b[3])], "level": int(lvl)} for (b, lvl) in final_items]
+
+    # JSON 저장 (경로가 제공된 경우에만)
+    if output_json_path:
+        with open(output_json_path, "w") as f:
+            json.dump(json_out, f, indent=2)
+
+    #! === 반환 리스트(grounding 호환 포맷) 구성 ===
+    results_for_grounding = []
+    # 0번 썸네일
+    results_for_grounding.append({
+        "img": orig_img_full.copy(),
         "id": 0,
-        "bbox": [0, 0, W, H]
+        "bbox": [0, 0, orig_w, orig_h]
     })
 
-    # 파일 저장 + id 부여
-    running_idx = 1
-    for b, rec, fail in kept_unique:
-        try:
-            crop_img = original_img.crop(_bbox_to_tuple(b))
-            # 파일명 규칙
-            fname = f"crop{running_idx}_rec{rec}{'_fail' if fail else ''}.png"
-            crop_img.save(s1_dir / fname)
+    # work_img → original 스케일팩터
+    sx = orig_w / float(resized_w1)
+    sy = orig_h / float(resized_h1)
 
-            results.append({
-                "img": crop_img,
-                "id": running_idx,
-                "bbox": b,
-                "recursion_depth": rec,
-                "fail": bool(fail),
-                "filename": fname
-            })
-            running_idx += 1
-        except Exception as e:
-            print(f"[seg] save error: {e}")
+    # k번 크롭들 (원본 좌표계 bbox + 이미지를 메모리에서 잘라서 포함)
+    k = 1
+    for item in json_out:
+        bbox = item.get("bbox")
+        if not bbox or len(bbox) != 4:
+            continue
+        l, t, r, b = bbox
+        # work_img → 원본 좌표로 스케일백
+        L = int(round(l * sx)); T = int(round(t * sy))
+        R = int(round(r * sx)); B = int(round(b * sy))
+        # 유효성 체크
+        L = max(0, min(orig_w, L)); R = max(0, min(orig_w, R))
+        T = max(0, min(orig_h, T)); B = max(0, min(orig_h, B))
+        if R <= L or B <= T:
+            continue
+        crop_img = orig_img_full.crop((L, T, R, B))
+        results_for_grounding.append({
+            "img": crop_img,
+            "id": k,
+            "bbox": [L, T, R, B],
+            "recursion_depth": 0,
+            "fail": False,
+            "filename": None
+        })
+        k += 1
 
-    # 디버그 출력
-    print(f"✂️  Total crop: {running_idx-1}")
+    end = time()
 
-    return results
+    if print_latency:
+        print(f"[3] {end - time2:.3f}s", end = " | ")
+        print(f"🕖 Crop Time : {end - start:.3f}s", end = " | ")
+        print(f"✂️ Crops : {len(final_items)}")
+
+
+    if not save_visualization:
+        return results_for_grounding
+    
+    #! ---------------------------- 시각화(원본 크기) ----------------------------
+
+    # 시각화는 경로가 제공되고 save_visualization이 True인 경우에만
+    if json_out and save_visualization and output_image_path:
+        orig_img = orig_img_full.copy()
+        draw = ImageDraw.Draw(orig_img)
+
+        palette = {
+            0: (255, 0, 0),
+            1: (0, 255, 0),
+            2: (0, 0, 255),
+            3: (255, 165, 0),
+            4: (255, 0, 255),
+            5: (0, 255, 255),
+        }
+        line_w = max(2, int(min(orig_w, orig_h) * 0.003))
+
+        for item in json_out:
+            bbox = item.get("bbox")
+            level = item.get("level", 0)
+            if not bbox or len(bbox) != 4:
+                continue
+            l, t, r, b = bbox
+            L = int(round(l * sx)); T = int(round(t * sy))
+            R = int(round(r * sx)); B = int(round(b * sy))
+            color = palette.get(level % len(palette), (255, 0, 0))
+            draw.rectangle([L, T, R, B], outline=color, width=line_w)
+
+        save_path = output_image_path + f"result.png"
+        orig_img.save(save_path)
+        print(f" | [SAVE] {save_path}")
+    elif save_visualization and not output_image_path:
+        print(" | [WARNING] save_visualization=True but output_image_path is None")
+    elif json_out and not save_visualization and print_latency:
+        print(" | [INFO] Visualization skipped (save_visualization=False)")
+
+    return results_for_grounding
+
+
+#! ================================================================================================
+
+if __name__ == '__main__':
+    # 테스트용 main: 데이터/출력 경로는 main 전역으로 유지
+    data_path = "./data/screenspotv2_imgs/"
+
+    jsonlist = json.load(open("./data/screenspot_mobile_v2.json"))
+    target_imgs = sorted(set(item["img_filename"] for item in jsonlist))
+
+    for fname in target_imgs:
+        os.makedirs(f"./crop_test/{fname}", exist_ok=True)
+        # 테스트 실행: 저장 경로는 main에서 지정한 output_path 사용
+        crop(image_path = data_path + fname,
+            output_json_path = f"./crop_test/{fname}/json.json",
+            output_image_path = f"./crop_test/{fname}/",
+            save_visualization = True,
+            print_latency = True
+            )
