@@ -6,7 +6,7 @@ SEED = 0
 # Enviroment
 import os
 os.environ["CUDA_DEVICE_ORDER"]="PCI_BUS_ID"
-os.environ["CUDA_VISIBLE_DEVICES"]= "1"  # 몇번 GPU 사용할지 ("0,1", "2" 등)
+os.environ["CUDA_VISIBLE_DEVICES"]= "0"  # 몇번 GPU 사용할지 ("0,1", "2" 등)
 
 # Dataset & Model
 MLLM_PATH = "microsoft/GUI-Actor-3B-Qwen2.5-VL"
@@ -67,6 +67,7 @@ from tqdm import tqdm
 import torch
 # from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor, AutoTokenizer, set_seed
 from transformers import AutoProcessor, AutoTokenizer, set_seed
+from thop import profile #! flops
 
 # Project-Local Modules
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
@@ -79,8 +80,7 @@ from visualize_util import (
     _visualize_early_exit_results, _visualize_stage1_results, _visualize_stage2_results, 
     visualize_crop, visualize_attn_map, visualize_aggregated_attention
 )
-from crop import crop  #! 어떤 crop 파일 사용?
-from thop import profile #! flops
+from crop2 import crop_img  #! 어떤 crop 파일 사용?
 
 #! ==============================================
 
@@ -498,7 +498,7 @@ if __name__ == '__main__':
             #! ==================================================================
 
             seg_start = time.time()
-            crop_list = crop(
+            crop_list = crop_img(
                 image_path=img_path,
                 save_visualization=False
             )

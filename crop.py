@@ -170,7 +170,7 @@ def merge_small_segments(leaves, parent_size, min_w_ratio, min_h_ratio,
 #! ================================================================================================
 
 
-def crop(image_path, output_json_path=None, output_image_path=None, save_visualization=False, print_latency=False):
+def crop_img(image_path, output_json_path=None, output_image_path=None, save_visualization=False, print_latency=False):
     """
     이미지를 crop하여 결과 리스트 반환
     
@@ -345,7 +345,7 @@ if __name__ == '__main__':
     for fname in target_imgs:
         os.makedirs(f"./crop_test/{fname}", exist_ok=True)
         # 테스트 실행: 저장 경로는 main에서 지정한 output_path 사용
-        crop(image_path = data_path + fname,
+        crop_img(image_path = data_path + fname,
             output_json_path = f"./crop_test/{fname}/json.json",
             output_image_path = f"./crop_test/{fname}/",
             save_visualization = True,

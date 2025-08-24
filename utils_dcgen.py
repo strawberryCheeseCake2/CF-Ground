@@ -258,10 +258,9 @@ class ImgSegmentation(ImgNode):
             cut = img.crop((bbox[0], lines[i-1], bbox[2], lines[i]))
             # if empty or too small, skip
 
-            #! 주석처리 -> 버리는거 줄이기
+            #! 주석처리 -> 작은것도 버리지 않음
             # if cut.size[1] < sliding_window:
             #     continue
-            #! 주석처리 -> 버리는거 줄이기
             # elif np.array(cut.convert("L")).var() < var_thresh:
             #     continue
             cut = (bbox[0], lines[i-1], bbox[2], lines[i])  # (left, top, right, bottom)
