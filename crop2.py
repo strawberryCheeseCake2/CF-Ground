@@ -1,5 +1,4 @@
-# crop.py
-# ------------------------------------------------------------------------------------
+'''
 # 2-Stage Segmentation:
 #   Stage 1) 좌우 분할만 수행 → 좌우 병합 기준으로 정리
 #   Stage 2) 각 좌우 세그먼트 내부에서 상하 분할 → 상하 병합 기준으로 정리
@@ -8,16 +7,14 @@
 #   - 너무 얇은 조각은 인접 이웃과 병합
 #   - 병합 편향 방지(좌/우, 상/하 병합 횟수 균형)
 #   - 최종적으로 모델 최소 변 길이(28px) 원본 좌표계에서 보장
-# ------------------------------------------------------------------------------------
+'''
 
-from utils_dcgen import ImgSegmentation
+from dcgen_segmentation import ImgSegmentation
 from PIL import Image, ImageDraw
 import math
 import os
 from time import time
 import json
-import cv2
-import numpy as np
 
 #! Hyper Parameter
 # 1단계 좌우 분할(수직 컷) 후 병합 기준
@@ -255,11 +252,7 @@ def crop_img(image_path, output_json_path=None, output_image_path=None, save_vis
     w1, h1 = max(1, int(W * RESIZE_RATIO_1)), max(1, int(H * RESIZE_RATIO_1))
 
     #! resize
-    # work_img = orig_img.resize((w1, h1))
-    work_img = orig_img.resize((w1, h1), resample=Image.BOX)
-    # work_img = Image.fromarray(
-    #     cv2.resize(np.array(orig_img), (w1, h1), interpolation=cv2.INTER_AREA)
-    # )
+    work_img = orig_img.resize((w1, h1))
 
     sx, sy = W / float(w1), H / float(h1)
 

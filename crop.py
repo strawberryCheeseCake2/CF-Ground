@@ -3,12 +3,12 @@
 합치는 알고리즘이 단순해서 16개 -> 1개로 합쳐지는 경우 발생 -> 이를 crop3에서 해결
 
 하지만 crop을 안했을때 오히려 GUI Actor에서는 정확도가 높음
-현재까지 최대 정확도
+아직까지 crop2.py보다 정확도가 높음
 
-+ resize가 생각보다 속도가 오래걸림
+하지만, crop을 안해서 PEAK MEMORY는 증가할듯
 '''
 
-from utils_dcgen import ImgSegmentation
+from dcgen_segmentation import ImgSegmentation
 from PIL import Image, ImageDraw
 
 import os
@@ -199,7 +199,8 @@ def crop_img(image_path, output_json_path=None, output_image_path=None, save_vis
     abs_H1 = orig_h * RESIZE_RATIO_1
 
     time0 = time()
-    # print(f"[Crop] [0] {time0 - start:.3f}s", end = " | ")
+    if print_latency:
+        print(f"[Crop] [0] {time0 - start:.3f}s", end = " | ")
 
     # 1-2) 1차 분할
     img_seg = ImgSegmentation(
@@ -288,10 +289,11 @@ def crop_img(image_path, output_json_path=None, output_image_path=None, save_vis
     if print_latency:
         print(f"[3] {end - time2:.3f}s", end = " | ")
         print(f"🕖 Crop Time : {end - start:.3f}s", end = " | ")
-        print(f"✂️ Crops : {len(final_items)}")
+        print(f"✂️ Crops : {len(final_items)}", end = "")
 
 
     if not save_visualization:
+        print()
         return results_for_grounding
     
     #! ---------------------------- 시각화(원본 크기) ----------------------------
