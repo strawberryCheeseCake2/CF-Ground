@@ -6,7 +6,7 @@ import matplotlib.pyplot as plt
 # ------------------------------
 # 경로 설정
 # ------------------------------
-dir = './attn_output/' + "0824_hoon_not_early_exit_2"
+dir = './attn_output/' + "0825_hoon_many_crop_0_5"
 csv_file = dir + '/iter_log.csv'
 output_dir = dir + '/vis'
 os.makedirs(output_dir, exist_ok=True)
@@ -89,9 +89,17 @@ def plot_hist(series, title, xlabel, path):
     x = series.dropna()
     if len(x) == 0:
         return
-    bins = auto_bins(x)
-    plt.figure(figsize=(6,4), dpi=150)
-    plt.hist(x, bins=bins, edgecolor='black', alpha=0.75)
+
+    # 정수형 데이터인지 확인
+    if pd.api.types.is_integer_dtype(x) or (x == x.astype(int)).all():
+        # 정수형 데이터에 대해 bin 크기를 1로 고정
+        bins = range(int(x.min()), int(x.max()) + 2)  # 각 정수마다 하나의 bin
+    else:
+        # 실수형 데이터에 대해 기존 auto_bins 사용
+        bins = auto_bins(x)
+
+    plt.figure(figsize=(6, 4), dpi=150)
+    plt.hist(x, bins=bins, edgecolor='black', alpha=0.75, align='left')
     plt.title(title)
     plt.xlabel(xlabel)
     plt.ylabel("Frequency")
