@@ -170,13 +170,12 @@ def merge_small_segments(leaves, parent_size, min_w_ratio, min_h_ratio,
 #! ================================================================================================
 
 
-def crop_img(image_path, output_json_path=None, output_image_path=None, save_visualization=False, print_latency=False):
+def crop_img(image_path, output_image_path=None, save_visualization=False, print_latency=False, skip_vertical_split=False):
     """
     이미지를 crop하여 결과 리스트 반환
     
     Args:
         image_path: 입력 이미지 경로
-        output_json_path: JSON 저장 경로 (None이면 저장 안함)
         output_image_path: 이미지 저장 경로 (None이면 저장 안함)
         save_visualization: 시각화 이미지 저장 여부
         print_latency: 실행 시간 출력 여부
@@ -240,11 +239,6 @@ def crop_img(image_path, output_json_path=None, output_image_path=None, save_vis
     final_items = [(b_work, max(lvl, 1)) for (b_work, lvl) in leaves_lvl1_merged]
     json_out = [{"bbox": [int(b[0]), int(b[1]), int(b[2]), int(b[3])], "level": int(lvl)} for (b, lvl) in final_items]
 
-    # JSON 저장 (경로가 제공된 경우에만)
-    if output_json_path:
-        with open(output_json_path, "w") as f:
-            json.dump(json_out, f, indent=2)
-
     #! === 반환 리스트(grounding 호환 포맷) 구성 ===
     results_for_grounding = []
     # 0번 썸네일
@@ -292,14 +286,14 @@ def crop_img(image_path, output_json_path=None, output_image_path=None, save_vis
         print(f"✂️ Crops : {len(final_items)}", end = "")
 
 
+    #! ---------------------------- 시각화(원본 크기) ----------------------------
+
+    # 시각화는 경로가 제공되고 save_visualization이 True인 경우에만
     if not save_visualization:
         print()
         return results_for_grounding
     
-    #! ---------------------------- 시각화(원본 크기) ----------------------------
-
-    # 시각화는 경로가 제공되고 save_visualization이 True인 경우에만
-    if json_out and save_visualization and output_image_path:
+    if json_out and output_image_path:
         orig_img = orig_img_full.copy()
         draw = ImageDraw.Draw(orig_img)
 
@@ -324,9 +318,8 @@ def crop_img(image_path, output_json_path=None, output_image_path=None, save_vis
             color = palette.get(level % len(palette), (255, 0, 0))
             draw.rectangle([L, T, R, B], outline=color, width=line_w)
 
-        save_path = output_image_path + f"result.png"
-        orig_img.save(save_path)
-        print(f" | [SAVE] {save_path}")
+        orig_img.save(output_image_path)
+        print(f" | [SAVE] {output_image_path}")
     elif save_visualization and not output_image_path:
         print(" | [WARNING] save_visualization=True but output_image_path is None")
     elif json_out and not save_visualization and print_latency:
@@ -343,13 +336,12 @@ if __name__ == '__main__':
 
     jsonlist = json.load(open("./data/screenspot_mobile_v2.json"))
     target_imgs = sorted(set(item["img_filename"] for item in jsonlist))
+    os.makedirs(f"./crop_test/", exist_ok=True)
 
     for fname in target_imgs:
-        os.makedirs(f"./crop_test/{fname}", exist_ok=True)
         # 테스트 실행: 저장 경로는 main에서 지정한 output_path 사용
         crop_img(image_path = data_path + fname,
-            output_json_path = f"./crop_test/{fname}/json.json",
-            output_image_path = f"./crop_test/{fname}/",
+            output_image_path = f"./crop_test/{fname}.png",
             save_visualization = True,
             print_latency = True
             )
