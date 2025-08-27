@@ -7,7 +7,7 @@
 1. Clone this repo to your local machine: 
 ```bash
 git clone https://github.com/strawberryCheeseCake2/CF-Ground.git
-cd GUI-Actor
+cd CF-Ground
 ```
 
 2. Create a conda environment: 
