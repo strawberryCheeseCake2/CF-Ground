@@ -4,13 +4,19 @@
 
 ## :rescue_worker_helmet: Installation
 
-1. Create a conda environment: 
+1. Clone this repo to your local machine: 
+```bash
+git clone https://github.com/strawberryCheeseCake2/CF-Ground.git
+cd GUI-Actor
+```
+
+2. Create a conda environment: 
 ```bash
 conda create -n gui_actor python=3.10
 conda activate gui_actor
 ```
 
-2. Install the dependencies: 
+3. Install the dependencies: 
 - NVIDIA GPU
 ```bash
 pip install -r requirements_gui_agent.txt
@@ -19,21 +25,6 @@ pip install -r requirements_gui_agent.txt
 ```bash
 pip install -r requirements_gui_agent_mac.txt
 ```
-
-## zonui
-
-1. Create a conda environment: 
-```bash
-conda create -n zonui python=3.10
-conda activate zonui
-```
-
-2. Install the dependencies:
-- NVIDIA GPU
-```bash
-pip install -r requirements_zonui.txt
-```
-
 
 ## :minidisc: Data Preparation
 1. Download the processed data from [here](https://huggingface.co/datasets/cckevinn/GUI-Actor-Data).
