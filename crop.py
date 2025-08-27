@@ -10,6 +10,7 @@
 
 from dcgen_segmentation import ImgSegmentation
 from PIL import Image, ImageDraw
+from crop_line import find_safe_horizontal_cut, force_horizontal_split
 
 import os
 from time import time 
@@ -170,7 +171,7 @@ def merge_small_segments(leaves, parent_size, min_w_ratio, min_h_ratio,
 #! ================================================================================================
 
 
-def crop_img(image_path, output_image_path=None, save_visualization=False, print_latency=False, skip_vertical_split=False):
+def crop_img(image_path, output_image_path=None, save_visualization=False, print_latency=False, additional_crop=False):
     """
     이미지를 crop하여 결과 리스트 반환
     
@@ -235,20 +236,17 @@ def crop_img(image_path, output_image_path=None, save_visualization=False, print
     if print_latency:
         print(f"[2] {time2 - time1:.3f}s", end = " | ")
 
-    # 3) 결과 JSON 저장 (옵션)
+    # 3) 결과 JSON
     final_items = [(b_work, max(lvl, 1)) for (b_work, lvl) in leaves_lvl1_merged]
     json_out = [{"bbox": [int(b[0]), int(b[1]), int(b[2]), int(b[3])], "level": int(lvl)} for (b, lvl) in final_items]
 
-    #! === 반환 리스트(grounding 호환 포맷) 구성 ===
     results_for_grounding = []
-    # 0번 썸네일
-    results_for_grounding.append({
+    results_for_grounding.append({  # 썸네일
         "img": orig_img_full.copy(),
         "id": 0,
         "bbox": [0, 0, orig_w, orig_h]
     })
 
-    # work_img → original 스케일팩터
     sx = orig_w / float(resized_w1)
     sy = orig_h / float(resized_h1)
 
@@ -277,23 +275,57 @@ def crop_img(image_path, output_image_path=None, save_visualization=False, print
             "filename": None
         })
         k += 1
+    
+    time3 = time()
+    if print_latency:
+        print(f"[3] {time3 - time2:.3f}s", end=" | ")
+
+    effective_k = len(json_out)
+    if additional_crop:
+        #! 크롭 실패시 폴백: 수평 분할
+        fallback_info = None
+        
+        if effective_k < 2:
+            # 썸네일만 유지
+            if len(results_for_grounding) > 1:
+                results_for_grounding = results_for_grounding[:1]
+
+            #! 수평 분할 실행
+            T_box, B_box, T_img, B_img = force_horizontal_split(orig_img_full)
+
+            results_for_grounding.append({
+                "img": T_img, "id": 1, "bbox": T_box,
+                "recursion_depth": 0, "fail": False, "filename": None
+            })
+            results_for_grounding.append({
+                "img": B_img, "id": 2, "bbox": B_box,
+                "recursion_depth": 0, "fail": False, "filename": None
+            })
+
+            # 시각화용 정보
+            fallback_info = {
+                "y_cut": T_box[3],
+                "T_box": T_box,
+                "B_box": B_box
+            }
 
     end = time()
 
     if print_latency:
-        print(f"[3] {end - time2:.3f}s", end = " | ")
+        if additional_crop:
+            if fallback_info is not None:
+                print(f"[4]🔥 {end - time2:.3f}s", end = " | ")
+            else:
+                print(f"[4]☑️ {end - time2:.3f}s", end = " | ")
         print(f"🕖 Crop Time : {end - start:.3f}s", end = " | ")
-        print(f"✂️ Crops : {len(final_items)}", end = "")
+        print(f"✂️ Crops : {len(results_for_grounding)-1}", end = "")  # 썸네일 제외 개수 출력
 
-
-    #! ---------------------------- 시각화(원본 크기) ----------------------------
-
-    # 시각화는 경로가 제공되고 save_visualization이 True인 경우에만
+    # ---------------------------- 시각화 ----------------------------
     if not save_visualization:
         print()
         return results_for_grounding
-    
-    if json_out and output_image_path:
+
+    if output_image_path:
         orig_img = orig_img_full.copy()
         draw = ImageDraw.Draw(orig_img)
 
@@ -307,6 +339,7 @@ def crop_img(image_path, output_image_path=None, save_visualization=False, print
         }
         line_w = max(2, int(min(orig_w, orig_h) * 0.003))
 
+        # 1) 세그먼트 박스 표시 (json_out)
         for item in json_out:
             bbox = item.get("bbox")
             level = item.get("level", 0)
@@ -318,15 +351,27 @@ def crop_img(image_path, output_image_path=None, save_visualization=False, print
             color = palette.get(level % len(palette), (255, 0, 0))
             draw.rectangle([L, T, R, B], outline=color, width=line_w)
 
-        orig_img.save(output_image_path)
-        print(f" | [SAVE] {output_image_path}")
-    elif save_visualization and not output_image_path:
-        print(" | [WARNING] save_visualization=True but output_image_path is None")
-    elif json_out and not save_visualization and print_latency:
-        print(" | [INFO] Visualization skipped (save_visualization=False)")
+        # 2) 폴백 컷 라인/박스 표시
+        if additional_crop:
+            y = int(fallback_info["y_cut"])
+            # 수평 컷 라인
+            draw.line([(0, y), (orig_w, y)], fill=(255, 0, 255), width=line_w)
+            # 선택적으로 상/하 박스 외곽도 그릴 수 있음
+            tL, tT, tR, tB = fallback_info["T_box"]
+            bL, bT, bR, bB = fallback_info["B_box"]
+            draw.rectangle([tL, tT, tR, tB], outline=(255, 0, 255), width=line_w)
+            draw.rectangle([bL, bT, bR, bB], outline=(255, 0, 255), width=line_w)
+
+        if effective_k < EFFECTIVE_MIN:  #! 일단 추가크롭한거만 이미지 저장
+            orig_img.save(output_image_path)
+            print("🔥", end="")
+        if print_latency:
+            print(f" | [SAVE] {output_image_path}")
+    else:
+        if print_latency:
+            print(" | [WARNING] save_visualization=True but output_image_path is None")
 
     return results_for_grounding
-
 
 #! ================================================================================================
 
@@ -341,7 +386,7 @@ if __name__ == '__main__':
     for fname in target_imgs:
         # 테스트 실행: 저장 경로는 main에서 지정한 output_path 사용
         crop_img(image_path = data_path + fname,
-            output_image_path = f"./crop_test/{fname}.png",
+            output_image_path = f"./crop_test/{fname}",
             save_visualization = True,
             print_latency = True
             )

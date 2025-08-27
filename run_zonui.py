@@ -24,7 +24,7 @@ from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor, Auto
 # Project-Local Modules
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 from qwen_vl_utils import process_vision_info
-from crop import run_segmentation_recursive  #! 어떤 crop 파일 사용?
+from crop import crop_img  #! 어떤 crop 파일 사용?
 from iter_logger import init_iter_logger, append_iter_log  # log csv 기록 파일
 
 #! Argument =======================
@@ -33,7 +33,7 @@ SEED = 0
 
 # Enviroment
 os.environ["CUDA_DEVICE_ORDER"]="PCI_BUS_ID"
-os.environ["CUDA_VISIBLE_DEVICES"]= "3"  # 몇번 GPU 사용할지 ("0,1", "2" 등)
+os.environ["CUDA_VISIBLE_DEVICES"]= "1"  # 몇번 GPU 사용할지 ("0,1", "2" 등)
 max_memory = {
     0: "75GiB",
     # 1: "75GiB",
@@ -64,9 +64,9 @@ TOP_Q = 0.5  # Top quantile for crop selection
 AGG_START = 20  # Starting layer for attention aggregation
 
 # Image Resize Ratios
-S1_RESIZE_RATIO = 0.30  # Stage 1 crop resize ratio
-S2_RESIZE_RATIO = 0.50  # Stage 2 crop resize ratio  
-THUMBNAIL_RESIZE_RATIO = 0.05  # Thumbnail resize ratio
+S1_RESIZE_RATIO = 0.25  # Stage 1 crop resize ratio
+S2_RESIZE_RATIO = 1.0  # Stage 2 crop resize ratio
+THUMBNAIL_RESIZE_RATIO = 0.10  # Thumbnail resize ratio
 
 TOPK_SINKS  = 20             # 공통 sink 좌표로 잡을 개수
 PER_MAP_TOPN_FRAC = 0.05     # 각 맵에서 상위 몇 %를 "상위값"으로 간주할지 (빈도수 집계용)
@@ -983,12 +983,9 @@ task instruction, a screen observation, guess where should you tap.
             # Stage 1 | Segmentation
             print("\n[Stage 1] Starting Segmentation...")
             stage1_start = time.time()
-            crop_list = run_segmentation_recursive(
-                image_path=img_path, max_depth=1, window_size=120,
-                output_json_path=f"{s1_dir}/output.json",
-                output_image_path=s1_dir,
-                start_id=0,
-                var_thresh=VAR_THRESH
+            crop_list = crop_img(
+                image_path=img_path,
+                additional_crop=True
             )
 
             if crop_list is None:
@@ -1155,7 +1152,7 @@ task instruction, a screen observation, guess where should you tap.
                 s2_hit="✅" if final_success else "❌",
                 filename_wo_ext=filename_wo_ext,
                 instruction=instruction,
-                num_crops=len(stage_crop_list),
+                num_crops=len(stage_crop_list)-1,
                 stage1_crop=f"{stage1_sec:.3f}",
                 stage1_select=f"{select_sec:.3f}",
                 acc_uptonow=f"{up2now:.2f}"

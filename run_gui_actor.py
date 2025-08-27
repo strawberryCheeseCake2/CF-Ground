@@ -2,30 +2,24 @@
 
 import os
 os.environ["CUDA_DEVICE_ORDER"]="PCI_BUS_ID"
-os.environ["CUDA_VISIBLE_DEVICES"]= "2"  # 몇번 GPU 사용할지 ("0,1", "2" 등)
+os.environ["CUDA_VISIBLE_DEVICES"]= "1"  # 몇번 GPU 사용할지 ("0,1", "2" 등)
 
-#! Hyperparameter ==========================================================================
+#! Hyperparameter ============================================================================
 
-# Model Architecture
-LAYER_NUM = 31
-
-# Stage 1: Segmentation & Selection
-SELECT_THRESHOLD = 0.70  # score >= tau * max_score 인 모든 crop select
-EARLY_EXIT = False
-early_exit_dir = "/early_exit/" if EARLY_EXIT else "/no_early_exit/"
-
-# Stage 2: Attention Refinement
-AGG_START = 20  # Starting layer for attention aggregation
 ATTN_IMPL = "eager"  # attention implement "eager" "sdpa" "flash" "efficient"
+SELECT_THRESHOLD = 0.7  # score >= tau * max_score 인 모든 crop select
+EARLY_EXIT = True
+ADDITIONAL_CROP = False  # crop에 실패했을때 수평으로 한번 크롭 할지 | False -> crop 실패시 바로 S2로 썸네일 없이 추론
 
 # Image Resize Ratios
 S1_RESIZE_RATIO = 0.25  # Stage 1 crop resize ratio
-S2_RESIZE_RATIO = 0.50  # Stage 2 crop resize ratio
+S2_RESIZE_RATIO = 0.5  # Stage 2 crop resize ratio
 THUMBNAIL_RESIZE_RATIO = 0.10  # Thumbnail resize ratio
 
-#! Save Path (방법을 바꾼다면 바꿔서 기록하기)
-SAVE_DIR = "./attn_output/" + ATTN_IMPL + early_exit_dir + "0825_crop"
+MAX_PIXELS = 1280 * 28 * 28
 
+early_exit_dir = "early_exit" if EARLY_EXIT else "no_early_exit"
+SAVE_DIR = f"./attn_output/{ATTN_IMPL}_{early_exit_dir}_{str(SELECT_THRESHOLD)}_" + "0825_additional_crop"  #! Save Path (특징이 있다면 마지막에 적어주세요)
 
 #! Argument (이제 바뀔 일 거의 없음) ===============================================================
 
@@ -43,6 +37,7 @@ STAGE0_VIS = False
 STAGE1_VIS = False
 STAGE2_VIS = False
 ITER_LOG = True  # csv, md
+TFOPS_PROFILING = True
 
 # Question
 # QUESTION_TEMPLATE="""Where should you tap to {task_prompt}?"""
@@ -58,10 +53,13 @@ task instruction, a screen observation, guess where should you tap.
 import json
 import re
 import sys
+sys.setrecursionlimit(2000)
 import time
 from copy import deepcopy
 from typing import List
 from math import sqrt
+import matplotlib.pyplot as plt
+import threading
 
 # Third-Party Libraries
 import numpy as np
@@ -70,7 +68,7 @@ from tqdm import tqdm
 import torch
 # from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor, AutoTokenizer, set_seed
 from transformers import AutoProcessor, AutoTokenizer, set_seed
-from thop import profile
+from deepspeed.profiling.flops_profiler import FlopsProfiler
 
 # Project-Local Modules
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
@@ -78,29 +76,9 @@ from iter_logger import init_iter_logger, append_iter_log  # log csv 기록 파�
 from gui_actor.modeling_qwen25vl import Qwen2_5_VLForConditionalGenerationWithPointer
 from gui_actor.multi_image_inference import inference
 from visualize_util import get_highest_attention_patch_bbox, _visualize_early_exit_results, _visualize_stage1_results, _visualize_stage2_results, visualize_crop
-from crop2 import crop_img  #! 어떤 crop 파일 사용?
+from crop import crop_img  #! 어떤 crop 파일 사용?
 
 #! ==============================================
-
-class ModelKwargsWrapper(torch.nn.Module):
-    def __init__(self, model):
-        super().__init__()
-        self.model = model
-    def forward(self, inputs_dict):
-        return self.model(**inputs_dict)
-
-def get_model_inputs(msgs, tokenizer, processor, device): # profiler 한테 모델 입력 주기 위해서
-    """Prepares model inputs from a conversation dictionary for FLOPs calculation."""
-    user_content = next((item['content'] for item in msgs if item['role'] == 'user'), [])
-    images = [content['image'] for content in user_content if content['type'] == 'image']
-    text = tokenizer.apply_chat_template(
-        msgs,
-        tokenize=False,
-        add_generation_prompt=True,
-    )
-    inputs = processor(text=[text], images=images, return_tensors='pt')
-    # Move all tensor inputs to the correct device
-    return {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in inputs.items()}
 
 class NpEncoder(json.JSONEncoder):
     def default(self, obj):
@@ -113,6 +91,40 @@ class NpEncoder(json.JSONEncoder):
         if isinstance(obj, (np.bool_, bool)):
             return bool(obj)
         return super(NpEncoder, self).default(obj)
+    
+def resize_image(image, resize_to_pixels=MAX_PIXELS):
+    image_width, image_height = image.size
+    if (resize_to_pixels is not None) and ((image_width * image_height) != resize_to_pixels):
+        resize_ratio = (resize_to_pixels / (image_width * image_height)) ** 0.5
+        image_width_resized, image_height_resized = int(image_width * resize_ratio), int(image_height * resize_ratio)
+        image = image.resize((image_width_resized, image_height_resized))
+    return image, image_width_resized, image_height_resized 
+
+# 예열 단계 추가
+def warm_up_model(model, tokenizer, processor):
+    print("🔄 Warming up the model...")
+    dummy_instruction = "This is a dummy instruction for warm-up."
+    dummy_image = Image.new("RGB", (1000, 1000), color=(255, 255, 255))  # 1000x1000 흰색 이미지
+    dummy_crop = {
+        "img": dummy_image,
+        "resized_img": dummy_image,
+        "id": 1,
+        "bbox": [0, 0, 1000, 1000]
+    }
+    dummy_crop_list = [dummy_crop]
+    dummy_msgs = create_guiactor_msgs(crop_list=dummy_crop_list, instruction=dummy_instruction)
+    
+    # 예열용 inference 실행
+    for _ in range(3):  # 3번 반복
+        with torch.no_grad():
+            if TFOPS_PROFILING:
+                prof.start_profile()
+            _ = inference(dummy_msgs, model, tokenizer, processor, use_placeholder=True, topk=3)
+            if TFOPS_PROFILING:
+                prof.stop_profile()
+                prof.get_total_flops()
+    print("✅ Warm-up complete!")
+
 
 def create_guiactor_msgs(crop_list, instruction):
     user_content = []
@@ -409,6 +421,15 @@ def point_in_bbox(point, bbox):
     l, t, r, b = bbox
     return (l <= x <= r) and (t <= y <= b)
 
+def monitor_memory(interval=0.1):
+    start = time.time()
+    while not stop_flag:
+        mem = torch.cuda.memory_allocated() / 1024**3
+        now = time.time() - start
+        mem_log.append(mem)
+        time_log.append(now)
+        time.sleep(interval)
+
 #! ================================================================================================
 
 if __name__ == '__main__':
@@ -423,7 +444,8 @@ if __name__ == '__main__':
     )
     tokenizer = AutoTokenizer.from_pretrained(MLLM_PATH)
     processor = AutoProcessor.from_pretrained(MLLM_PATH)
-    model.eval()
+
+    prof = FlopsProfiler(model)
 
     # save_dir 폴더명이 이미 존재하면 고유한 이름 생성 (save_dir -> save_dir_1 -> save_dir_2)
     save_dir = SAVE_DIR
@@ -438,13 +460,13 @@ if __name__ == '__main__':
         save_dir=save_dir,
         headers=[  # 순서 그대로 들어감
             "idx", "crop_time", "num_crop", "early_exit", "num_selected_crop", 
-            "s1_time", "s1_flops_gflops", "s1_hit", "s2_time", "s2_flops_gflops", "s2_hit", 
-            "total_time", "total_flops_gflops", "acc_uptonow", "filename", "instruction"
+            "s1_time", "s1_tflops", "s1_hit", "s2_time", "s2_tflops", "s2_hit", 
+            "total_time", "total_flops_tflops", "acc_uptonow", "filename", "instruction"
         ],
-        write_md=True,
-        use_fsync=True,
-        use_lock=False
+        write_md=True, use_fsync=True, use_lock=True
     )
+
+    # warm_up_model(model, tokenizer, processor)
 
     # Process
     for task in TASKS:
@@ -458,13 +480,26 @@ if __name__ == '__main__':
         # 통계 변수 초기화
         task_res = []
         num_action = 0
-        seg_time_sum = s1_time_sum = s2_time_sum = total_flops = 0.0
+        s0_time_sum = s1_time_sum = s2_time_sum = total_flops = 0.0
         early_exit_count = early_exit_success_count = final_success_count = 0
         
         # data_source별 통계 변수 초기화
         data_source_stats = {}
 
         for j, item in tqdm(enumerate(screenspot_data)):
+
+            #! 모니터링용 변수 초기화
+            mem_log = []
+            time_log = []
+            stop_flag = False
+
+            #! 측정 시작
+            monitor_thread = threading.Thread(target=monitor_memory, daemon=True)
+            monitor_thread.start()
+            torch.cuda.reset_peak_memory_stats()
+            # reset_gpu_memory()
+
+            s1_tflops = s2_tflops = 0.0
 
             print("\n\n----------------------\n")
 
@@ -483,8 +518,15 @@ if __name__ == '__main__':
             original_bbox = [original_bbox[0], original_bbox[1], 
                            original_bbox[0] + original_bbox[2], original_bbox[1] + original_bbox[3]]
             
+            w_orig, h_orig = original_image.size
+            # if w_orig * h_orig > MAX_PIXELS:
+            #     original_image, w_resized, h_resized = resize_image(original_image)
+                
             # data_source 정보 추출 (없으면 "unknown"으로 기본값 설정)
             data_source = item.get("data_source", "unknown")
+            
+            # data_source별 처리 옵션 -> 폰 (세로화면) = crop할 때 세로분할 안함
+            skip_vertical_split = data_source in ["ios", "android"]
             
             # 디렉토리 설정 (시각화용 - 필요시에만)
             if any([STAGE0_VIS, STAGE1_VIS, STAGE2_VIS]):
@@ -504,7 +546,8 @@ if __name__ == '__main__':
             seg_start = time.time()
             crop_list = crop_img(
                 image_path=img_path,
-                save_visualization=False
+                save_visualization=False,
+                additional_crop=ADDITIONAL_CROP
             )
             s0_crop_list = resize_crop_list(crop_list=crop_list, ratio=S1_RESIZE_RATIO)
             seg_end = time.time()
@@ -515,16 +558,16 @@ if __name__ == '__main__':
                 visualize_crop(save_dir=inst_dir, gt_bbox=original_bbox, top_q_bboxes=all_crops_bboxes,
                                 instruction=instruction, filename="s1_all_crop.png", img_path=img_path, click_point=None)
 
-            #! crop이 실패해서 썸네일이랑 전체이미지 1개인 경우
+            #! crop이 실패해서 썸네일이랑 전체이미지 1개인 경우 stage2로 스킵하고 원본 * S2_RESIZE_RATIO만 넣기
             # 만약 crop이 하나라면 썸네일과 일치해서
             # early exit, stage1, 앙상블, stage2의 과정들이 의미가 없기 때문에
             # 바로 50% 축소한걸로 inference하고 끝내기
             if len(s0_crop_list) == 2:
-                print(f"✂️  Crops : 1 | 🚀 Simple Processing using 0.5 resize")
+                print(f"✂️  Crops : 1 | 🚀 Simple Processing using S2_RESIZE_RATIO resize")
                 
-                # 원본 이미지를 0.5 리사이즈하여 직접 처리
+                # 원본 이미지를 S2_RESIZE_RATIO로 리사이즈하여 직접 처리
                 resized_image = original_image.resize(
-                    (int(original_image.width * 0.5), int(original_image.height * 0.5))
+                    (int(original_image.width * S2_RESIZE_RATIO), int(original_image.height * S2_RESIZE_RATIO))
                 )
                 
                 # crop 객체 생성 (resized_img 포함)
@@ -538,16 +581,18 @@ if __name__ == '__main__':
                 simple_crop_list = [simple_crop]
                 simple_msgs = create_guiactor_msgs(crop_list=simple_crop_list, instruction=instruction)
                 
-                # FLOPs 계산
-                with torch.no_grad():
-                    simple_inputs = get_model_inputs(simple_msgs, tokenizer, processor, model.device)
-                    wrapped_model = ModelKwargsWrapper(model)
-                    simple_flops, _ = profile(wrapped_model, inputs=(simple_inputs,), verbose=False)
-                
+                if TFOPS_PROFILING:
+                    prof.start_profile()
+
                 simple_start = time.time()
                 simple_pred = inference(simple_msgs, model, tokenizer, processor, use_placeholder=True, topk=3)
                 simple_end = time.time()
                 simple_time = simple_end - simple_start
+                
+                if TFOPS_PROFILING:
+                    prof.stop_profile()
+                    simple_flops = prof.get_total_flops()
+                    simple_flops /= 1e12
                 
                 # 결과 처리
                 per_image_outputs = simple_pred["per_image"]
@@ -565,8 +610,8 @@ if __name__ == '__main__':
                 # 통계 설정
                 s1_time = 0.0
                 s2_time = simple_time
-                s1_flops = 0
-                s2_flops = simple_flops
+                s1_tflops = 0
+                s2_tflops = simple_flops
                 should_exit_early = False
                 early_exit_success = False
                 s1_hit = final_success
@@ -579,13 +624,13 @@ if __name__ == '__main__':
                 #! ==================================================================
 
                 # Calculate Stage 1 FLOPs
-                s1_msgs = create_guiactor_msgs(crop_list=s0_crop_list, instruction=instruction)
-                with torch.no_grad():
-                    s1_inputs = get_model_inputs(s1_msgs, tokenizer, processor, model.device)
-                    wrapped_model = ModelKwargsWrapper(model)
-                    s1_flops, _ = profile(wrapped_model, inputs=(s1_inputs,), verbose=False)
+
+                if TFOPS_PROFILING:
+                    prof.start_profile()
 
                 s1_start = time.time()
+
+                s1_msgs = create_guiactor_msgs(crop_list=s0_crop_list, instruction=instruction)
 
                 s1_top_q_crop_ids, s1_top_q_bboxes, s0_crop_list_out, should_exit_early, early_exit_success = run_selection_pass_with_guiactor(
                     msgs=s1_msgs,
@@ -597,13 +642,17 @@ if __name__ == '__main__':
                     instruction=instruction
                 )
                 s1_infence_end = time.time()
+                s1_time = s1_infence_end - s1_start
+
+                if TFOPS_PROFILING:
+                    prof.stop_profile()
+                    s1_tflops = prof.get_total_flops()
+                    s1_tflops /= 1e12
 
                 if should_exit_early:
                    early_exit_count +=1
                    if early_exit_success:
                       early_exit_success_count += 1
-
-                s1_time = s1_infence_end - s1_start
 
                 # GT가 안에 들어가는지 체크
                 s1_hit = early_exit_success or (not should_exit_early and check_gt_in_selected_crops(s1_top_q_bboxes, original_bbox))
@@ -616,10 +665,11 @@ if __name__ == '__main__':
                 #! ==================================================================
                 
                 # Early Exit
+                s2_tflops = 0.0
                 if should_exit_early:
                     final_success = early_exit_success
                     s2_time = 0.0
-                    s2_flops = 0.0
+                    s2_tflops = 0.0
                 else:
                     original_crop_map = {c['id']: c for c in crop_list}
                     s2_input_crop_ids = set()
@@ -632,11 +682,9 @@ if __name__ == '__main__':
                     # Calculate Stage 2 FLOPs
                     s2_resized_crops = resize_crop_list(crop_list=s2_input_crops, ratio=S2_RESIZE_RATIO)
                     s2_msgs = create_guiactor_msgs(crop_list=s2_resized_crops, instruction=instruction)
-                    with torch.no_grad():
-                        s2_inputs = get_model_inputs(s2_msgs, tokenizer, processor, model.device)
-                        wrapped_model = ModelKwargsWrapper(model)
-                        s2_flops, _ = profile(wrapped_model, inputs=(s2_inputs,), verbose=False)
 
+                    if TFOPS_PROFILING:
+                        prof.start_profile()
                     s2_inference_start = time.time()
 
                     final_success = run_refinement_pass_with_guiactor(
@@ -649,24 +697,47 @@ if __name__ == '__main__':
                     )
                     s2_inference_end = time.time()
                     s2_time = s2_inference_end - s2_inference_start
+                    if TFOPS_PROFILING:
+                        prof.stop_profile()
+                        s2_tflops = prof.get_total_flops()
+                        s2_tflops /= 1e12
+
+            time.sleep(1)
+
+            #! 측정 종료
+            stop_flag = True
+            monitor_thread.join()
+
+            #! 메모리 그래프 출력만
+            plt.figure(figsize=(10, 4))
+            plt.plot(time_log, mem_log)
+            plt.xlabel("Time (s)")
+            plt.ylabel("GPU Memory Allocated (GB)")
+            plt.title("GPU Memory Usage Over Time")
+            plt.grid(True)
+            plt.show()
+            plt.savefig(f"gpu_usage/{num_action}.png")
+            print(f"Graph saved as gpu_usage/{num_action}.png")
 
             #! ==================================================================
             #! [Common Processing]
             #! ==================================================================
             
             # 공통 통계 업데이트
-            seg_time_sum += seg_time
+            s0_time_sum += seg_time
             s1_time_sum += s1_time
                 
             # 성능 로깅
             total_time = seg_time + s1_time + s2_time
-            total_flops_this = s1_flops + (s2_flops if not should_exit_early else 0)
-            total_flops += total_flops_this
+            if TFOPS_PROFILING:
+                total_flops_this = s1_tflops + (s2_tflops if not should_exit_early else 0)
+                total_flops += total_flops_this
 
             if len(s0_crop_list) != 2:
                 print(f"✂️  Crops : {len(s0_crop_list_out)-1} | Select Crops : {len(s1_top_q_crop_ids)}")
             print(f"🕖 Times - Seg: {seg_time:.2f}s | S1: {s1_time:.2f}s | S2: {s2_time:.2f}s | Total: {total_time:.2f}s")
-            print(f"🔥 FLOPs - S1: {s1_flops/1e9:.2f} | S2: {s2_flops/1e9:.2f} | Total: {total_flops_this/1e9:.2f} GFLOPs")
+            if TFOPS_PROFILING:
+                print(f"🔥 FLOPs - S1: {s1_tflops:.2f} | S2: {s2_tflops:.2f} | Total: {total_flops_this:.2f} TFLOPs")
             print(f"{'✅🚨 Early Exit Success' if should_exit_early and early_exit_success else '❌🚨 Early Exit Fail' if should_exit_early else '✅ Grounding Success' if final_success else '❌ Grounding Fail'}")
 
             #! ==================================================================
@@ -680,7 +751,7 @@ if __name__ == '__main__':
             if data_source not in data_source_stats:
                 data_source_stats[data_source] = {
                     'num_action': 0,
-                    'seg_time_sum': 0.0,
+                    's0_time_sum': 0.0,
                     's1_time_sum': 0.0,
                     's2_time_sum': 0.0,
                     'total_flops': 0.0,
@@ -691,10 +762,11 @@ if __name__ == '__main__':
             
             stats = data_source_stats[data_source]
             stats['num_action'] += 1
-            stats['seg_time_sum'] += seg_time
+            stats['s0_time_sum'] += seg_time
             stats['s1_time_sum'] += s1_time
             stats['s2_time_sum'] += s2_time
-            stats['total_flops'] += total_flops_this
+            if TFOPS_PROFILING:
+                stats['total_flops'] += total_flops_this
             if should_exit_early:
                 stats['early_exit_count'] += 1
                 if early_exit_success:
@@ -715,13 +787,13 @@ if __name__ == '__main__':
                 early_exit="☑️" if should_exit_early else "🫥",
                 num_selected_crop=len(s1_top_q_crop_ids) if not should_exit_early else 0,
                 s1_time=f"{s1_time:.3f}",
-                s1_flops_gflops=f"{s1_flops/1e9:.2f}",
+                s1_tflops=f"{s1_tflops:.2f}",
                 s1_hit="✅" if s1_hit else "❌",
                 s2_time=f"{s2_time:.3f}",
-                s2_flops_gflops=f"{s2_flops/1e9:.2f}" if not should_exit_early else "0.00",
+                s2_tflops=f"{s2_tflops:.2f}" if not should_exit_early else "0.00",
                 s2_hit="✅" if final_success else "❌",
                 total_time=f"{total_time:.3f}",
-                total_flops_gflops=f"{total_flops_this/1e9:.2f}",
+                total_flops_tflops=f"{total_flops_this:.2f}",
                 acc_uptonow=f"{up2now_gt_score:.2f}"
             )
 
@@ -740,8 +812,8 @@ if __name__ == '__main__':
                 's1_time': s1_time,
                 's2_time': s2_time,
                 'total_time': total_time,
-                's1_flops': s1_flops,
-                's2_flops': s2_flops if not should_exit_early else 0,
+                's1_tflops': s1_tflops,
+                's2_tflops': s2_tflops if not should_exit_early else 0,
                 'total_flops': total_flops_this
             }
             task_res.append(item_res)
@@ -759,12 +831,12 @@ if __name__ == '__main__':
             "early_exit_rate": early_exit_count / num_action * 100,
             "early_exit_success_rate": early_exit_success_count / early_exit_count * 100 if early_exit_count > 0 else 0,
             "avg_times": {
-                "segmentation": seg_time_sum / num_action,
+                "segmentation": s0_time_sum / num_action,
                 "stage1": s1_time_sum / num_action,
                 "stage2": s2_time_sum / num_action,
-                "total": (seg_time_sum + s1_time_sum + s2_time_sum) / num_action
+                "total": (s0_time_sum + s1_time_sum + s2_time_sum) / num_action
             },
-            "avg_flops_gflops": total_flops / num_action / 1e9,
+            "avg_flops_tflops": total_flops / num_action,
         }
 
         with open(os.path.join(save_dir, f"{task}_metrics.json"), "w") as mf:
@@ -782,12 +854,12 @@ if __name__ == '__main__':
                     "early_exit_rate": stats['early_exit_count'] / stats['num_action'] * 100,
                     "early_exit_success_rate": stats['early_exit_success_count'] / stats['early_exit_count'] * 100 if stats['early_exit_count'] > 0 else 0,
                     "avg_times": {
-                        "segmentation": stats['seg_time_sum'] / stats['num_action'],
+                        "segmentation": stats['s0_time_sum'] / stats['num_action'],
                         "stage1": stats['s1_time_sum'] / stats['num_action'],
                         "stage2": stats['s2_time_sum'] / stats['num_action'],
-                        "total": (stats['seg_time_sum'] + stats['s1_time_sum'] + stats['s2_time_sum']) / stats['num_action']
+                        "total": (stats['s0_time_sum'] + stats['s1_time_sum'] + stats['s2_time_sum']) / stats['num_action']
                     },
-                    "avg_flops_gflops": stats['total_flops'] / stats['num_action'] / 1e9,
+                    "avg_flops_tflops": stats['total_flops'] / stats['num_action'],
                 }
         
         with open(os.path.join(save_dir, f"{task}_data_source_metrics.json"), "w") as dsf:
@@ -801,11 +873,11 @@ if __name__ == '__main__':
         print(f"Early Exit Rate: {metrics['early_exit_rate']:.2f}%")
         print(f"Early Exit Success Rate: {metrics['early_exit_success_rate']:.2f}%") 
         print(f"Avg Times: Seg {metrics['avg_times']['segmentation']:.3f}s, S1 {metrics['avg_times']['stage1']:.3f}s, S2 {metrics['avg_times']['stage2']:.3f}s, Total {metrics['avg_times']['total']:.3f}s")
-        print(f"Avg FLOPs: {metrics['avg_flops_gflops']:.2f} GFLOPs")
+        print(f"Avg FLOPs: {metrics['avg_flops_tflops']:.2f} TFLOPs")
         
         # data_source별 결과 출력
         print("\n📊 Results by Data Source:")
         for ds, ds_metrics in data_source_metrics.items():
             print(f"  {ds}: {ds_metrics['total_samples']} samples, Acc: {ds_metrics['accuracy']:.2f}%, "
-                  f"Early Exit: {ds_metrics['early_exit_rate']:.2f}%, FLOPs: {ds_metrics['avg_flops_gflops']:.2f}")
+                  f"Early Exit: {ds_metrics['early_exit_rate']:.2f}%, TFLOPs: {ds_metrics['avg_flops_tflops']:.2f}")
         print("=" * 60)

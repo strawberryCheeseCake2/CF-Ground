@@ -120,121 +120,115 @@ def grow_bbox_to_min(b, img_w, img_h, min_w=MODEL_MIN_SIDE, min_h=MODEL_MIN_SIDE
     R, B = min(img_w, R), min(img_h, B)
     return (L, T, R, B)
 
-# [ADDED] 균형 병합 보조 카운터
-def init_merge_counter(n):
-    # 좌우용(L/R) 또는 상하용(U/D)로 사용
-    return [{"L":0, "R":0, "U":0, "D":0} for _ in range(n)]
 
-# [ADDED] 좌우 병합(폭 기준)
+# [ADDED] 좌우 병합(폭 기준) - Repeated merging with directional counters
 def merge_lr(bboxes, parent_w, v_overlap_thr=V_OVERLAP_THR,
-             min_w_ratio=LR_MIN_W_RATIO, min_w_px=LR_MIN_W_PX, max_iter=4):
-    cur = list(bboxes)
-    counters = init_merge_counter(len(cur))
-
-    def threshold_w():
-        return max(int(math.ceil(parent_w * min_w_ratio)), min_w_px)
-
-    for _ in range(max_iter):
+             min_w_ratio=LR_MIN_W_RATIO, min_w_px=LR_MIN_W_PX):
+    threshold = max(int(math.ceil(parent_w * min_w_ratio)), min_w_px)
+    # Initialize each crop with directional merge counts
+    items = [{'box': b, 'L': 0, 'R': 0} for b in sorted(bboxes, key=by_cx)]
+    changed = True
+    while changed:
         changed = False
-        cur = sorted(cur, key=by_cx)
         i = 0
-        while i < len(cur):
-            b = cur[i]
-            w = bbox_w(b)
-            if w < threshold_w() and len(cur) > 1:
-                left_j = i - 1 if i - 1 >= 0 else None
-                right_j = i + 1 if i + 1 < len(cur) else None
-                candidates = []
-                if left_j is not None:
-                    bL = cur[left_j]
-                    ovL = vertical_overlap(b, bL)
-                    if ovL >= v_overlap_thr:
-                        # 비용: 병합 후 중심 이동 + 좌측 병합 횟수
-                        merged = merge_two(b, bL)
-                        cost = abs(by_cx(merged) - by_cx(b)) + 0.5 * counters[i]["L"]
-                        candidates.append(("L", left_j, cost, merged))
-                if right_j is not None:
-                    bR = cur[right_j]
-                    ovR = vertical_overlap(b, bR)
-                    if ovR >= v_overlap_thr:
-                        merged = merge_two(b, bR)
-                        cost = abs(by_cx(merged) - by_cx(b)) + 0.5 * counters[i]["R"]
-                        candidates.append(("R", right_j, cost, merged))
-                if candidates:
-                    candidates.sort(key=lambda x: x[2])  # 비용 최소
-                    side, j, _cost, merged = candidates[0]
-                    # 카운터 업데이트
-                    if side == "L":
-                        counters[i]["L"] += 1
+        new_items = []
+        skip = False
+        while i < len(items):
+            if skip:
+                skip = False
+                i += 1
+                continue
+            item = items[i]
+            if bbox_w(item['box']) < threshold and len(items) > 1:
+                left_available = (i > 0)
+                right_available = (i < len(items) - 1)
+                if left_available and right_available:
+                    # Decide direction based on merge counter
+                    cost_left = items[i-1]['R']
+                    cost_right = items[i+1]['L']
+                    if cost_left <= cost_right:
+                        new_box = merge_two(items[i-1]['box'], item['box'])
+                        items[i-1]['box'] = new_box
+                        items[i-1]['R'] += 1
+                        changed = True
                     else:
-                        counters[i]["R"] += 1
-                    # 병합 적용
-                    ii, jj = (i, j) if i < j else (j, i)
-                    del cur[jj]
-                    del cur[ii]
-                    cur.insert(ii, merged)
-                    # 카운터 배열 길이 동기화는 단순화해서 재초기화
-                    counters = init_merge_counter(len(cur))
+                        new_box = merge_two(item['box'], items[i+1]['box'])
+                        items[i+1]['box'] = new_box
+                        items[i+1]['L'] += 1
+                        changed = True
+                        skip = True
+                elif left_available:
+                    new_box = merge_two(items[i-1]['box'], item['box'])
+                    items[i-1]['box'] = new_box
+                    items[i-1]['R'] += 1
                     changed = True
-                    continue
+                elif right_available:
+                    new_box = merge_two(item['box'], items[i+1]['box'])
+                    items[i+1]['box'] = new_box
+                    items[i+1]['L'] += 1
+                    changed = True
+                    skip = True
+                else:
+                    new_items.append(item)
+            else:
+                new_items.append(item)
             i += 1
-        if not changed:
-            break
-    return cur
+        items = sorted(new_items, key=lambda x: by_cx(x['box']))
+    return [item['box'] for item in items]
 
-# [ADDED] 상하 병합(높이 기준)
+
+# [ADDED] 상하 병합(높이 기준) - Repeated merging with directional counters
 def merge_tb(bboxes, parent_h, h_overlap_thr=H_OVERLAP_THR,
-             min_h_ratio=TB_MIN_H_RATIO, min_h_px=TB_MIN_H_PX, max_iter=4):
-    cur = list(bboxes)
-    counters = init_merge_counter(len(cur))
-
-    def threshold_h():
-        return max(int(math.ceil(parent_h * min_h_ratio)), min_h_px)
-
-    for _ in range(max_iter):
+             min_h_ratio=TB_MIN_H_RATIO, min_h_px=TB_MIN_H_PX):
+    threshold = max(int(math.ceil(parent_h * min_h_ratio)), min_h_px)
+    items = [{'box': b, 'U': 0, 'D': 0} for b in sorted(bboxes, key=by_cy)]
+    changed = True
+    while changed:
         changed = False
-        cur = sorted(cur, key=by_cy)
         i = 0
-        while i < len(cur):
-            b = cur[i]
-            h = bbox_h(b)
-            if h < threshold_h() and len(cur) > 1:
-                up_j = i - 1 if i - 1 >= 0 else None
-                down_j = i + 1 if i + 1 < len(cur) else None
-                candidates = []
-                if up_j is not None:
-                    bU = cur[up_j]
-                    ovU = horizontal_overlap(b, bU)
-                    if ovU >= h_overlap_thr:
-                        merged = merge_two(b, bU)
-                        cost = abs(by_cy(merged) - by_cy(b)) + 0.5 * counters[i]["U"]
-                        candidates.append(("U", up_j, cost, merged))
-                if down_j is not None:
-                    bD = cur[down_j]
-                    ovD = horizontal_overlap(b, bD)
-                    if ovD >= h_overlap_thr:
-                        merged = merge_two(b, bD)
-                        cost = abs(by_cy(merged) - by_cy(b)) + 0.5 * counters[i]["D"]
-                        candidates.append(("D", down_j, cost, merged))
-                if candidates:
-                    candidates.sort(key=lambda x: x[2])
-                    side, j, _cost, merged = candidates[0]
-                    if side == "U":
-                        counters[i]["U"] += 1
+        new_items = []
+        skip = False
+        while i < len(items):
+            if skip:
+                skip = False
+                i += 1
+                continue
+            item = items[i]
+            if bbox_h(item['box']) < threshold and len(items) > 1:
+                up_available = (i > 0)
+                down_available = (i < len(items) - 1)
+                if up_available and down_available:
+                    cost_up = items[i-1]['D']
+                    cost_down = items[i+1]['U']
+                    if cost_up <= cost_down:
+                        new_box = merge_two(items[i-1]['box'], item['box'])
+                        items[i-1]['box'] = new_box
+                        items[i-1]['D'] += 1
+                        changed = True
                     else:
-                        counters[i]["D"] += 1
-                    ii, jj = (i, j) if i < j else (j, i)
-                    del cur[jj]
-                    del cur[ii]
-                    cur.insert(ii, merged)
-                    counters = init_merge_counter(len(cur))
+                        new_box = merge_two(item['box'], items[i+1]['box'])
+                        items[i+1]['box'] = new_box
+                        items[i+1]['U'] += 1
+                        changed = True
+                        skip = True
+                elif up_available:
+                    new_box = merge_two(items[i-1]['box'], item['box'])
+                    items[i-1]['box'] = new_box
+                    items[i-1]['D'] += 1
                     changed = True
-                    continue
+                elif down_available:
+                    new_box = merge_two(item['box'], items[i+1]['box'])
+                    items[i+1]['box'] = new_box
+                    items[i+1]['U'] += 1
+                    changed = True
+                    skip = True
+                else:
+                    new_items.append(item)
+            else:
+                new_items.append(item)
             i += 1
-        if not changed:
-            break
-    return cur
-
+        items = sorted(new_items, key=lambda x: by_cy(x['box']))
+    return [item['box'] for item in items]
 # [ADDED] 한 방향 강제 세그 생성 유틸
 def segment_once(segger, img, bbox, line_direct):
     # ImgSegmentation 내부의 cut_img_bbox를 직접 호출해서 한 방향만 분할
@@ -243,7 +237,7 @@ def segment_once(segger, img, bbox, line_direct):
 
 #! ================================================================================================
 
-def crop_img(image_path, output_json_path=None, output_image_path=None, save_visualization=False, print_latency=False):
+def crop_img(image_path, output_image_path=None, save_visualization=False, print_latency=False, skip_vertical_split=False):
     start = time()
 
     # 0) 원본/작업 이미지
@@ -257,33 +251,36 @@ def crop_img(image_path, output_json_path=None, output_image_path=None, save_vis
     sx, sy = W / float(w1), H / float(h1)
 
     # 1) Stage 1 - 좌우 분할만
-    seg_lr = ImgSegmentation(
-        img=work_img,
-        max_depth=FIRST_PASS_LR["max_depth"],
-        var_thresh=FIRST_PASS_LR["var_thresh"],
-        diff_thresh=FIRST_PASS_LR["diff_thresh"],
-        diff_portion=FIRST_PASS_LR["diff_portion"],
-        window_size=FIRST_PASS_LR["window_size"]
-    )
-    root_bbox_work = (0, 0, w1, h1)
-    lr_work = segment_once(seg_lr, work_img, root_bbox_work, line_direct="y")  # 수직 컷
+    if skip_vertical_split:
+        lr_merged = [(0, 0, W, H)]
+    else:
+        seg_lr = ImgSegmentation(
+            img=work_img,
+            max_depth=FIRST_PASS_LR["max_depth"],
+            var_thresh=FIRST_PASS_LR["var_thresh"],
+            diff_thresh=FIRST_PASS_LR["diff_thresh"],
+            diff_portion=FIRST_PASS_LR["diff_portion"],
+            window_size=FIRST_PASS_LR["window_size"]
+        )
+        root_bbox_work = (0, 0, w1, h1)
+        lr_work = segment_once(seg_lr, work_img, root_bbox_work, line_direct="y")  # 수직 컷
 
-    # 분할이 안 되면 전체 1개 처리
-    if not lr_work:
-        lr_work = [root_bbox_work]
+        # 분할이 안 되면 전체 1개 처리
+        if not lr_work:
+            lr_work = [root_bbox_work]
 
-    # work→orig 스케일백
-    lr_orig = []
-    for l,t,r,b in lr_work:
-        L = int(math.floor(l * sx)); T = int(math.floor(t * sy))
-        R = int(math.ceil (r * sx)); B = int(math.ceil (b * sy))
-        L, T = max(0, min(W, L)), max(0, min(H, T))
-        R, B = max(0, min(W, R)), max(0, min(H, B))
-        if R > L and B > T:
-            lr_orig.append((L,T,R,B))
+        # work→orig 스케일백
+        lr_orig = []
+        for l,t,r,b in lr_work:
+            L = int(math.floor(l * sx)); T = int(math.floor(t * sy))
+            R = int(math.ceil (r * sx)); B = int(math.ceil (b * sy))
+            L, T = max(0, min(W, L)), max(0, min(H, T))
+            R, B = max(0, min(W, R)), max(0, min(H, B))
+            if R > L and B > T:
+                lr_orig.append((L,T,R,B))
 
-    # 좌우 병합
-    lr_merged = merge_lr(lr_orig, parent_w=W)
+        # 좌우 병합
+        lr_merged = merge_lr(lr_orig, parent_w=W)
 
     # 2) Stage 2 - 각 좌우 세그 내부에서 상하 분할
     final_boxes = []
@@ -322,24 +319,14 @@ def crop_img(image_path, output_json_path=None, output_image_path=None, save_vis
         tb_merged = merge_tb(tb_orig, parent_h=(B0 - T0))
         final_boxes.extend(tb_merged)
 
-    # 3) 최종 최소 변 보장
-    safe_boxes = []
-    for b in final_boxes:
-        safe = grow_bbox_to_min(b, W, H, MODEL_MIN_SIDE, MODEL_MIN_SIDE)
-        safe_boxes.append(safe)
-
     # 4) 결과 JSON 구성
-    json_out = [{"bbox": [int(b[0]), int(b[1]), int(b[2]), int(b[3])], "level": 1} for b in safe_boxes]
-
-    if output_json_path:
-        with open(output_json_path, "w") as f:
-            json.dump(json_out, f, indent=2)
+    json_out = [{"bbox": [int(b[0]), int(b[1]), int(b[2]), int(b[3])], "level": 1} for b in final_boxes]
 
     # 5) 결과 리스트(grounding 포맷)
     results_for_grounding = []
     results_for_grounding.append({"img": orig_img.copy(), "id": 0, "bbox": [0,0,W,H]})
     k = 1
-    for b in safe_boxes:
+    for b in final_boxes:
         crop_img = orig_img.crop(b)
         # 모델 전처리 안전을 위해 최종적으로도 최소 변 확보
         if min(crop_img.size) < MODEL_MIN_SIDE:
@@ -362,7 +349,7 @@ def crop_img(image_path, output_json_path=None, output_image_path=None, save_vis
     end = time()
     if print_latency:
         print(f"🕖 Time: {end - start:.3f}s", end=" | ")
-        print(f"✂️ Crops: {len(safe_boxes)}", end=" | ")
+        print(f"✂️ Crops: {len(final_boxes)}", end=" | ")
 
     # 6) 시각화
     if save_visualization and output_image_path:
@@ -370,11 +357,10 @@ def crop_img(image_path, output_json_path=None, output_image_path=None, save_vis
         draw = ImageDraw.Draw(vis)
         line_w = max(2, int(min(W,H) * 0.003))
         palette = [(255,0,0),(0,255,0),(0,0,255),(255,165,0),(255,0,255),(0,255,255)]
-        for idx, b in enumerate(safe_boxes):
+        for idx, b in enumerate(final_boxes):
             color = palette[idx % len(palette)]
             draw.rectangle(b, outline=color, width=line_w)
-        save_path = os.path.join(output_image_path, "result.png")
-        os.makedirs(output_image_path, exist_ok=True)
+        save_path = os.path.join(output_image_path)
         vis.save(save_path)
         if print_latency:
             print(f"[SAVE] {save_path}")
@@ -387,12 +373,12 @@ if __name__ == '__main__':
     data_path = "./data/screenspotv2_imgs/"
     jsonlist = json.load(open("./data/screenspot_mobile_v2.json"))
     target_imgs = sorted(set(item["img_filename"] for item in jsonlist))
+    os.makedirs(f"./crop_test/", exist_ok=True)
     for fname in target_imgs:
-        os.makedirs(f"./crop_test/{fname}", exist_ok=True)
         crop_img(
             image_path = os.path.join(data_path, fname),
-            output_json_path = f"./crop_test/{fname}/json.json",
-            output_image_path = f"./crop_test/{fname}/",
+            output_image_path = f"./crop_test/{fname}",
             save_visualization = True,
-            print_latency = True
+            print_latency = True,
+            skip_vertical_split = False
         )
