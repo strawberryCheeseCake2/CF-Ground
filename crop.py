@@ -362,7 +362,7 @@ def crop_img(image_path, output_image_path=None, save_visualization=False, print
             draw.rectangle([tL, tT, tR, tB], outline=(255, 0, 255), width=line_w)
             draw.rectangle([bL, bT, bR, bB], outline=(255, 0, 255), width=line_w)
 
-        if effective_k < EFFECTIVE_MIN:  #! 일단 추가크롭한거만 이미지 저장
+        if effective_k < 2:  #! 일단 추가크롭한거만 이미지 저장
             orig_img.save(output_image_path)
             print("🔥", end="")
         if print_latency:

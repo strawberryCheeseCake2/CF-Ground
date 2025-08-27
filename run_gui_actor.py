@@ -1,8 +1,8 @@
 # run_gui_actor.py
 
 import os
-# os.environ["CUDA_DEVICE_ORDER"]="PCI_BUS_ID"
-# os.environ["CUDA_VISIBLE_DEVICES"]= "1"  # 몇번 GPU 사용할지 ("0,1", "2" 등)
+os.environ["CUDA_DEVICE_ORDER"]="PCI_BUS_ID"
+os.environ["CUDA_VISIBLE_DEVICES"]= "1"  # 몇번 GPU 사용할지 ("0,1", "2" 등)
 
 #! Hyperparameter ============================================================================
 
@@ -12,16 +12,14 @@ EARLY_EXIT = True
 ADDITIONAL_CROP = True  # True : crop에 실패했을때 수평으로 한번 크롭 | False : crop 실패시 바로 S2로 썸네일 없이 추론
 
 # Image Resize Ratios
+MAX_PIXELS = None  # 1280 * 28 * 28
 S1_RESIZE_RATIO = 0.25  # Stage 1 crop resize ratio
 S2_RESIZE_RATIO = 0.5  # Stage 2 crop resize ratio
 THUMBNAIL_RESIZE_RATIO = 0.10  # Thumbnail resize ratio
 
-MAX_PIXELS = 1280 * 28 * 28
+SAVE_DIR = f"./attn_output/" + "0827"  #! Save Path (특징이 있다면 적어주세요)
 
-early_exit_dir = "early_exit" if EARLY_EXIT else "no_early_exit"
-SAVE_DIR = f"./attn_output/{ATTN_IMPL}_{early_exit_dir}_{str(SELECT_THRESHOLD)}_" + "0825_additional_crop"  #! Save Path (특징이 있다면 마지막에 적어주세요)
-
-#! Argument (이제 바뀔 일 거의 없음) ===============================================================
+#! Argument ============================================================================
 
 SEED = 0
 
@@ -37,8 +35,8 @@ STAGE0_VIS = False
 STAGE1_VIS = False
 STAGE2_VIS = False
 ITER_LOG = True  # csv, md
-TFOPS_PROFILING = False
-MEMORY_EVAL = False
+TFOPS_PROFILING = True
+MEMORY_EVAL = True
 
 # Question
 # QUESTION_TEMPLATE="""Where should you tap to {task_prompt}?"""
@@ -48,7 +46,7 @@ task instruction, a screen observation, guess where should you tap.
 # Intruction
 {task_prompt}"""
 
-#! ==============================================
+#! ============================================================================
 
 # Standard Library
 import json
@@ -79,7 +77,7 @@ from gui_actor.multi_image_inference import inference
 from visualize_util import get_highest_attention_patch_bbox, _visualize_early_exit_results, _visualize_stage1_results, _visualize_stage2_results, visualize_crop
 from crop import crop_img  #! 어떤 crop 파일 사용?
 
-#! ==============================================
+#! ============================================================================
 
 class NpEncoder(json.JSONEncoder):
     def default(self, obj):
@@ -101,7 +99,7 @@ def resize_image(image, resize_to_pixels=MAX_PIXELS):
         image = image.resize((image_width_resized, image_height_resized))
     return image, image_width_resized, image_height_resized 
 
-# 예열 단계 추가
+
 def warm_up_model(model, tokenizer, processor):
     print("🔄 Warming up the model...")
     dummy_instruction = "This is a dummy instruction for warm-up."
@@ -445,12 +443,12 @@ if __name__ == '__main__':
         low_cpu_mem_usage=True
     )
     # Model Import (Mac)
-    model = Qwen2_5_VLForConditionalGenerationWithPointer.from_pretrained(
-        MLLM_PATH, torch_dtype="auto", attn_implementation=ATTN_IMPL,
-        device_map="mps", # Mac
-        # max_memory=max_memory, 
-        low_cpu_mem_usage=False
-    )
+    # model = Qwen2_5_VLForConditionalGenerationWithPointer.from_pretrained(
+    #     MLLM_PATH, torch_dtype="auto", attn_implementation=ATTN_IMPL,
+    #     device_map="mps", # Mac
+    #     # max_memory=max_memory, 
+    #     low_cpu_mem_usage=False
+    # )
     tokenizer = AutoTokenizer.from_pretrained(MLLM_PATH)
     processor = AutoProcessor.from_pretrained(MLLM_PATH)
 
@@ -526,8 +524,8 @@ if __name__ == '__main__':
                            original_bbox[0] + original_bbox[2], original_bbox[1] + original_bbox[3]]
             
             w_orig, h_orig = original_image.size
-            # if w_orig * h_orig > MAX_PIXELS:
-            #     original_image, w_resized, h_resized = resize_image(original_image)
+            if MAX_PIXELS is not None and w_orig * h_orig > MAX_PIXELS:
+                original_image, w_resized, h_resized = resize_image(original_image)
                 
             # data_source 정보 추출 (없으면 "unknown"으로 기본값 설정)
             data_source = item.get("data_source", "unknown")
@@ -545,6 +543,9 @@ if __name__ == '__main__':
                 os.makedirs(s2_dir, exist_ok=True)
             else:
                 inst_dir = s1_dir = s2_dir = None
+            if MEMORY_EVAL:
+                memory_dir = os.path.join(save_dir, "gpu_usage")
+                os.makedirs(memory_dir, exist_ok=True)
 
             #! ==================================================================
             #! Stage 0 | Segmentation
@@ -570,7 +571,7 @@ if __name__ == '__main__':
             # early exit, stage1, 앙상블, stage2의 과정들이 의미가 없기 때문에
             # 바로 50% 축소한걸로 inference하고 끝내기
             if len(s0_crop_list) == 2:
-                print(f"✂️  Crops : 1 | 🚀 Simple Processing using S2_RESIZE_RATIO resize")
+                print(f"✂️  Crops : 1 | 🚪 Simple Processing using S2_RESIZE_RATIO resize")
                 
                 # 원본 이미지를 S2_RESIZE_RATIO로 리사이즈하여 직접 처리
                 resized_image = original_image.resize(
@@ -621,7 +622,7 @@ if __name__ == '__main__':
                 s2_tflops = simple_flops
                 should_exit_early = False
                 early_exit_success = False
-                s1_hit = final_success
+                s1_hit = "✅🚪" if final_success else "❌🚪"
                 s1_top_q_crop_ids = []
                 s1_top_q_bboxes = []
                 
@@ -657,12 +658,16 @@ if __name__ == '__main__':
                     s1_tflops /= 1e12
 
                 if should_exit_early:
-                   early_exit_count +=1
-                   if early_exit_success:
-                      early_exit_success_count += 1
+                    print(f"✂️  Crops : 1 | 🚀 Early Exit")
+                    early_exit_count +=1
+                    if early_exit_success:
+                        s1_hit = "✅🚀"
+                        early_exit_success_count += 1
+                    else:
+                        s1_hit = "❌🚀"
 
-                # GT가 안에 들어가는지 체크
-                s1_hit = early_exit_success or (not should_exit_early and check_gt_in_selected_crops(s1_top_q_bboxes, original_bbox))
+                else:  # GT가 안에 들어가는지 체크
+                    s1_hit = "✅" if check_gt_in_selected_crops(s1_top_q_bboxes, original_bbox) else "❌"
 
                 # 불필요한 딕셔너리 연산 제거 - 결과 저장용도만
                 # res_board_dict는 사실상 미사용
@@ -709,20 +714,6 @@ if __name__ == '__main__':
                         s2_tflops = prof.get_total_flops()
                         s2_tflops /= 1e12
             
-            if MEMORY_EVAL:
-                time.sleep(1)
-                stop_flag = True
-                monitor_thread.join()
-
-                plt.figure(figsize=(10, 4))
-                plt.plot(time_log, mem_log)
-                plt.xlabel("Time (s)")
-                plt.ylabel("GPU Memory Allocated (GB)")
-                plt.title("GPU Memory Usage Over Time")
-                plt.grid(True)
-                plt.show()
-                plt.savefig(f"gpu_usage/{num_action}.png")
-                print(f"Graph saved as gpu_usage/{num_action}.png")
 
             #! ==================================================================
             #! [Common Processing]
@@ -738,7 +729,7 @@ if __name__ == '__main__':
                 total_flops_this = s1_tflops + (s2_tflops if not should_exit_early else 0)
                 total_flops += total_flops_this
 
-            if len(s0_crop_list) != 2:
+            if len(s0_crop_list) != 2 and not should_exit_early:
                 print(f"✂️  Crops : {len(s0_crop_list_out)-1} | Select Crops : {len(s1_top_q_crop_ids)}")
             print(f"🕖 Times - Seg: {seg_time:.2f}s | S1: {s1_time:.2f}s | S2: {s2_time:.2f}s | Total: {total_time:.2f}s")
             if TFOPS_PROFILING:
@@ -748,6 +739,20 @@ if __name__ == '__main__':
             #! ==================================================================
             #! [End]
             #! ==================================================================
+
+            if MEMORY_EVAL:
+                time.sleep(0.2)
+                stop_flag = True
+                monitor_thread.join()
+
+                plt.figure(figsize=(10, 4))
+                plt.plot(time_log, mem_log)
+                plt.xlabel("Time (s)")
+                plt.ylabel("GPU Memory Allocated (GB)")
+                plt.title("GPU Memory Usage Over Time")
+                plt.grid(True)
+                plt.show()
+                plt.savefig(f"{memory_dir}/{num_action}_{filename}")
 
             s2_time_sum += s2_time
             final_success_count += final_success
@@ -793,7 +798,7 @@ if __name__ == '__main__':
                 num_selected_crop=len(s1_top_q_crop_ids) if not should_exit_early else 0,
                 s1_time=f"{s1_time:.3f}",
                 s1_tflops=f"{s1_tflops:.2f}",
-                s1_hit="✅" if s1_hit else "❌",
+                s1_hit=s1_hit,
                 s2_time=f"{s2_time:.3f}",
                 s2_tflops=f"{s2_tflops:.2f}" if not should_exit_early else "0.00",
                 s2_hit="✅" if final_success else "❌",
@@ -808,7 +813,7 @@ if __name__ == '__main__':
                 'instruction': instruction,
                 'gt_bbox': original_bbox,
                 'data_source': data_source,
-                'num_crop': len(s0_crop_list) - 1,  # 썸네일 제외
+                'num_crop': len(s0_crop_list) - 1,
                 'early_exit': should_exit_early,
                 'early_exit_success': early_exit_success,
                 's1_hit': s1_hit,
@@ -832,6 +837,7 @@ if __name__ == '__main__':
         metrics = {
             "task": task,
             "total_samples": num_action,
+            # "stage1_accuracy": stage1_success_count / num_action * 100,  # 구현해야하는데, 현재 stage1스킵도 있고 early exit도 있어서 애매함
             "accuracy": final_success_count / num_action * 100,
             "early_exit_rate": early_exit_count / num_action * 100,
             "early_exit_success_rate": early_exit_success_count / early_exit_count * 100 if early_exit_count > 0 else 0,
@@ -842,6 +848,16 @@ if __name__ == '__main__':
                 "total": (s0_time_sum + s1_time_sum + s2_time_sum) / num_action
             },
             "avg_flops_tflops": total_flops / num_action,
+            "hyperparameters": {
+                "max_pixels": MAX_PIXELS,
+                "select_threshold": SELECT_THRESHOLD,
+                "early_exit": EARLY_EXIT,
+                "additional_crop": ADDITIONAL_CROP,
+                "s1_resize_ratio": S1_RESIZE_RATIO,
+                "s2_resize_ratio": S2_RESIZE_RATIO,
+                "thumbnail_resize_ratio" : THUMBNAIL_RESIZE_RATIO,
+                "attn_impl" : ATTN_IMPL
+            }
         }
 
         with open(os.path.join(save_dir, f"{task}_metrics.json"), "w") as mf:

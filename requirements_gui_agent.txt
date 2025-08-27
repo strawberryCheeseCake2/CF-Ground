@@ -1,10 +1,13 @@
-# pip install -r requirements_gui_agent.txt
+'''
+pip install torch==2.5.1 torchvision==0.20.1 torchaudio==2.5.1 --index-url https://download.pytorch.org/whl/cu121
+pip install -r requirements_gui_agent.txt
+'''
 
-torch==2.7.1
-torchvision
-torchaudio
+# torch==2.5.1
+# torchvision
+# torchaudio
 
-accelerate==1.1.1
+accelerate==1.8.1
 gradio
 gradio_client
 spaces
@@ -20,6 +23,4 @@ pre-commit==4.2.0
 matplotlib
 flash-attn==2.7.3
 
-# Visualization & Evaluation
-matplotlib
-deepspeed
+deepspeed  # Profiling GPU Usage
