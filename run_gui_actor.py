@@ -17,7 +17,9 @@ S1_RESIZE_RATIO = 0.25  # Stage 1 crop resize ratio
 S2_RESIZE_RATIO = 0.5  # Stage 2 crop resize ratio
 THUMBNAIL_RESIZE_RATIO = 0.10  # Thumbnail resize ratio
 
-SAVE_DIR = f"./attn_output/" + "0827"  #! Save Path (특징이 있다면 적어주세요)
+is_ee = "ee" if EARLY_EXIT else "not_ee"
+is_ac = "ac" if ADDITIONAL_CROP else "not_ac"
+SAVE_DIR = f"./attn_output/" + is_ee + "_" + is_ac + "_" + "0827"  #! Save Path (특징이 있다면 적어주세요)
 
 #! Argument ============================================================================
 
@@ -52,7 +54,7 @@ task instruction, a screen observation, guess where should you tap.
 import json
 import re
 import sys
-sys.setrecursionlimit(2000)
+sys.setrecursionlimit(2000)  # DeepSpeed logging
 import time
 from copy import deepcopy
 from typing import List
