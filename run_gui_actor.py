@@ -1,15 +1,15 @@
 # run_gui_actor.py
 
 import os
-os.environ["CUDA_DEVICE_ORDER"]="PCI_BUS_ID"
-os.environ["CUDA_VISIBLE_DEVICES"]= "1"  # 몇번 GPU 사용할지 ("0,1", "2" 등)
+# os.environ["CUDA_DEVICE_ORDER"]="PCI_BUS_ID"
+# os.environ["CUDA_VISIBLE_DEVICES"]= "1"  # 몇번 GPU 사용할지 ("0,1", "2" 등)
 
 #! Hyperparameter ============================================================================
 
 ATTN_IMPL = "eager"  # attention implement "eager" "sdpa" "flash" "efficient"
 SELECT_THRESHOLD = 0.7  # score >= tau * max_score 인 모든 crop select
 EARLY_EXIT = True
-ADDITIONAL_CROP = False  # crop에 실패했을때 수평으로 한번 크롭 할지 | False -> crop 실패시 바로 S2로 썸네일 없이 추론
+ADDITIONAL_CROP = True  # True : crop에 실패했을때 수평으로 한번 크롭 | False : crop 실패시 바로 S2로 썸네일 없이 추론
 
 # Image Resize Ratios
 S1_RESIZE_RATIO = 0.25  # Stage 1 crop resize ratio
@@ -37,7 +37,8 @@ STAGE0_VIS = False
 STAGE1_VIS = False
 STAGE2_VIS = False
 ITER_LOG = True  # csv, md
-TFOPS_PROFILING = True
+TFOPS_PROFILING = False
+MEMORY_EVAL = False
 
 # Question
 # QUESTION_TEMPLATE="""Where should you tap to {task_prompt}?"""
@@ -66,9 +67,9 @@ import numpy as np
 from PIL import Image
 from tqdm import tqdm
 import torch
-# from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor, AutoTokenizer, set_seed
 from transformers import AutoProcessor, AutoTokenizer, set_seed
-from deepspeed.profiling.flops_profiler import FlopsProfiler
+if TFOPS_PROFILING:
+    from deepspeed.profiling.flops_profiler import FlopsProfiler
 
 # Project-Local Modules
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
@@ -436,16 +437,25 @@ if __name__ == '__main__':
 
     set_seed(SEED)
 
-    # Model Import
+    # Model Import (NVIDIA CUDA)
     model = Qwen2_5_VLForConditionalGenerationWithPointer.from_pretrained(
         MLLM_PATH, torch_dtype="auto", attn_implementation=ATTN_IMPL,
-        device_map={"": "cuda:0"},   # balanced -> 단일 GPU 고정
+        device_map="balanced",  # NVIDIA GPU
+        # max_memory=max_memory, 
         low_cpu_mem_usage=True
+    )
+    # Model Import (Mac)
+    model = Qwen2_5_VLForConditionalGenerationWithPointer.from_pretrained(
+        MLLM_PATH, torch_dtype="auto", attn_implementation=ATTN_IMPL,
+        device_map="mps", # Mac
+        # max_memory=max_memory, 
+        low_cpu_mem_usage=False
     )
     tokenizer = AutoTokenizer.from_pretrained(MLLM_PATH)
     processor = AutoProcessor.from_pretrained(MLLM_PATH)
 
-    prof = FlopsProfiler(model)
+    if TFOPS_PROFILING:
+        prof = FlopsProfiler(model)
 
     # save_dir 폴더명이 이미 존재하면 고유한 이름 생성 (save_dir -> save_dir_1 -> save_dir_2)
     save_dir = SAVE_DIR
@@ -488,18 +498,15 @@ if __name__ == '__main__':
 
         for j, item in tqdm(enumerate(screenspot_data)):
 
-            #! 모니터링용 변수 초기화
-            mem_log = []
-            time_log = []
-            stop_flag = False
+            if MEMORY_EVAL:
+                mem_log = []
+                time_log = []
+                stop_flag = False
+                monitor_thread = threading.Thread(target=monitor_memory, daemon=True)
+                monitor_thread.start()
+                torch.cuda.reset_peak_memory_stats()
 
-            #! 측정 시작
-            monitor_thread = threading.Thread(target=monitor_memory, daemon=True)
-            monitor_thread.start()
-            torch.cuda.reset_peak_memory_stats()
-            # reset_gpu_memory()
-
-            s1_tflops = s2_tflops = 0.0
+            s1_tflops = s2_tflops = total_flops_this = 0.0
 
             print("\n\n----------------------\n")
 
@@ -701,23 +708,21 @@ if __name__ == '__main__':
                         prof.stop_profile()
                         s2_tflops = prof.get_total_flops()
                         s2_tflops /= 1e12
+            
+            if MEMORY_EVAL:
+                time.sleep(1)
+                stop_flag = True
+                monitor_thread.join()
 
-            time.sleep(1)
-
-            #! 측정 종료
-            stop_flag = True
-            monitor_thread.join()
-
-            #! 메모리 그래프 출력만
-            plt.figure(figsize=(10, 4))
-            plt.plot(time_log, mem_log)
-            plt.xlabel("Time (s)")
-            plt.ylabel("GPU Memory Allocated (GB)")
-            plt.title("GPU Memory Usage Over Time")
-            plt.grid(True)
-            plt.show()
-            plt.savefig(f"gpu_usage/{num_action}.png")
-            print(f"Graph saved as gpu_usage/{num_action}.png")
+                plt.figure(figsize=(10, 4))
+                plt.plot(time_log, mem_log)
+                plt.xlabel("Time (s)")
+                plt.ylabel("GPU Memory Allocated (GB)")
+                plt.title("GPU Memory Usage Over Time")
+                plt.grid(True)
+                plt.show()
+                plt.savefig(f"gpu_usage/{num_action}.png")
+                print(f"Graph saved as gpu_usage/{num_action}.png")
 
             #! ==================================================================
             #! [Common Processing]
