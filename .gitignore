@@ -6,11 +6,9 @@ data/
 
 # output
 attn_output/
-output/
 crop_test/
+_gpu_usage/
 
 # conda env
 env_zonui/
 env_gui_actor/
-
-GUI_Actor/

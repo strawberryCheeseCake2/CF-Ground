@@ -1,0 +1,14 @@
+{
+    "task": "mobile",
+    "total_samples": 501,
+    "accuracy": 85.22954091816366,
+    "early_exit_rate": 0.0,
+    "early_exit_success_rate": 0,
+    "avg_times": {
+        "segmentation": 0.13955666347891985,
+        "stage1": 0.3003061188909108,
+        "stage2": 0.48375713515900326,
+        "total": 0.923619917528834
+    },
+    "avg_flops_tflops": 13.599313585283378
+}

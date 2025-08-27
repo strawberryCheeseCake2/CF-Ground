@@ -1,0 +1,47 @@
+{
+    "ios": {
+        "task": "mobile",
+        "data_source": "ios",
+        "total_samples": 238,
+        "accuracy": 88.23529411764706,
+        "early_exit_rate": 0.0,
+        "early_exit_success_rate": 0,
+        "avg_times": {
+            "segmentation": 0.14402077378345138,
+            "stage1": 0.21581492303800182,
+            "stage2": 0.5912772487191593,
+            "total": 0.9511129455406124
+        },
+        "avg_flops_tflops": 14.891402906868752
+    },
+    "android": {
+        "task": "mobile",
+        "data_source": "android",
+        "total_samples": 211,
+        "accuracy": 85.78199052132702,
+        "early_exit_rate": 0.0,
+        "early_exit_success_rate": 0,
+        "avg_times": {
+            "segmentation": 0.11998086405026404,
+            "stage1": 0.2406557578046175,
+            "stage2": 0.4369220191268559,
+            "total": 0.7975586409817375
+        },
+        "avg_flops_tflops": 11.548909394324161
+    },
+    "shop": {
+        "task": "mobile",
+        "data_source": "shop",
+        "total_samples": 52,
+        "accuracy": 86.53846153846155,
+        "early_exit_rate": 0.0,
+        "early_exit_success_rate": 0,
+        "avg_times": {
+            "segmentation": 0.17040941806939933,
+            "stage1": 0.24736919769873986,
+            "stage2": 0.6642284805958087,
+            "total": 1.0820070963639479
+        },
+        "avg_flops_tflops": 21.181648122640926
+    }
+}
