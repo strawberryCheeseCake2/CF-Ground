@@ -377,7 +377,7 @@ def crop_img(image_path, output_image_path=None, save_visualization=False, print
 
 if __name__ == '__main__':
     # 테스트용 main: 데이터/출력 경로는 main 전역으로 유지
-    data_path = "./data/screenspotv2_imgs/"
+    data_path = "./data/screenspotv2_images/"
 
     jsonlist = json.load(open("./data/screenspot_mobile_v2.json"))
     target_imgs = sorted(set(item["img_filename"] for item in jsonlist))
@@ -388,5 +388,6 @@ if __name__ == '__main__':
         crop_img(image_path = data_path + fname,
             output_image_path = f"./crop_test/{fname}",
             save_visualization = True,
-            print_latency = True
+            print_latency = True,
+            additional_crop = True
             )

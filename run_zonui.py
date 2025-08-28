@@ -43,7 +43,7 @@ max_memory = {
 
 # Dataset & Model
 MLLM_PATH = "zonghanHZH/ZonUI-3B"
-SCREENSPOT_IMGS = "./data/screenspotv2_imgs"  # input image 경로
+SCREENSPOT_IMGS = "./data/screenspotv2_images"  # input image 경로
 SCREENSPOT_TEST = "./data"  # json파일 경로
 SAVE_DIR = "./attn_output/" + "0821_all"  #! 결과 저장 경로 (방법을 바꾼다면 바꿔서 기록하기)
 SAMPLING = False  # data 섞을지
