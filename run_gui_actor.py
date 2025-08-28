@@ -27,7 +27,7 @@ SEED = 0
 
 # Dataset & Model
 MLLM_PATH = "microsoft/GUI-Actor-3B-Qwen2.5-VL"
-SCREENSPOT_IMGS = "./data/screenspotv2_images"  # input image 경로
+SCREENSPOT_IMGS = "./data/screenspotv2_image"  # input image 경로
 SCREENSPOT_JSON = "./data"  # json파일 경로
 TASKS = ["mobile"]
 SAMPLE_RANGE = slice(None)  #! 샘플 범위 지정 (3번 샘플이면 3,4 / 5~9번 샘플이면 5,10 / 전체 사용이면 None)

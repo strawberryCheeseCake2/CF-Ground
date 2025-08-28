@@ -370,7 +370,7 @@ def crop_img(image_path, output_image_path=None, save_visualization=False, print
 #! ================================================================================================
 
 if __name__ == '__main__':
-    data_path = "./data/screenspotv2_images/"
+    data_path = "./data/screenspotv2_image/"
     jsonlist = json.load(open("./data/screenspot_mobile_v2.json"))
     target_imgs = sorted(set(item["img_filename"] for item in jsonlist))
     os.makedirs(f"./crop_test/", exist_ok=True)
