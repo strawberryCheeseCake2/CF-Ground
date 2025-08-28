@@ -4,7 +4,7 @@ import os
 os.environ["CUDA_DEVICE_ORDER"]="PCI_BUS_ID"
 os.environ["CUDA_VISIBLE_DEVICES"]= "1"  # 몇번 GPU 사용할지 ("0,1", "2" 등)
 
-#! Hyperparameter ============================================================================
+#! Hyperparameter =====================================================================================
 
 ATTN_IMPL = "eager"  # attention implement "eager" "sdpa" "flash" "efficient"
 SELECT_THRESHOLD = 0.7  # score >= tau * max_score 인 모든 crop select
@@ -21,7 +21,7 @@ is_ee = "ee" if EARLY_EXIT else "not_ee"
 is_ac = "ac" if ADDITIONAL_CROP else "not_ac"
 SAVE_DIR = f"./attn_output/" + is_ee + "_" + is_ac + "_" + "0827"  #! Save Path (특징이 있다면 적어주세요)
 
-#! Argument ============================================================================
+#! Argument ==========================================================================================
 
 SEED = 0
 
@@ -48,7 +48,7 @@ task instruction, a screen observation, guess where should you tap.
 # Intruction
 {task_prompt}"""
 
-#! ============================================================================
+#! ==================================================================================================
 
 # Standard Library
 import json
@@ -79,7 +79,7 @@ from gui_actor.multi_image_inference import inference
 from visualize_util import get_highest_attention_patch_bbox, _visualize_early_exit_results, _visualize_stage1_results, _visualize_stage2_results, visualize_crop
 from crop import crop_img  #! 어떤 crop 파일 사용?
 
-#! ============================================================================
+#! ==============================================================================================
 
 class NpEncoder(json.JSONEncoder):
     def default(self, obj):

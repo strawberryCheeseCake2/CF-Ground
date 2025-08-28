@@ -314,9 +314,9 @@ def crop_img(image_path, output_image_path=None, save_visualization=False, print
     if print_latency:
         if additional_crop:
             if fallback_info is not None:
-                print(f"[4]🔥 {end - time2:.3f}s", end = " | ")
+                print(f"[4]🔥 {end - time3:.3f}s", end = " | ")
             else:
-                print(f"[4]☑️ {end - time2:.3f}s", end = " | ")
+                print(f"[4]         ", end = " | ")
         print(f"🕖 Crop Time : {end - start:.3f}s", end = " | ")
         print(f"✂️ Crops : {len(results_for_grounding)-1}", end = "")  # 썸네일 제외 개수 출력
 
@@ -352,7 +352,7 @@ def crop_img(image_path, output_image_path=None, save_visualization=False, print
             draw.rectangle([L, T, R, B], outline=color, width=line_w)
 
         # 2) 폴백 컷 라인/박스 표시
-        if additional_crop:
+        if additional_crop and fallback_info is not None:
             y = int(fallback_info["y_cut"])
             # 수평 컷 라인
             draw.line([(0, y), (orig_w, y)], fill=(255, 0, 255), width=line_w)
@@ -365,6 +365,8 @@ def crop_img(image_path, output_image_path=None, save_visualization=False, print
         if effective_k < 2:  #! 일단 추가크롭한거만 이미지 저장
             orig_img.save(output_image_path)
             print("🔥", end="")
+        else:
+            print("  ", end="")
         if print_latency:
             print(f" | [SAVE] {output_image_path}")
     else:
