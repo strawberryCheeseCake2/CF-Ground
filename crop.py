@@ -1,185 +1,55 @@
 '''
-재귀 크롭 X
-합치는 알고리즘이 단순해서 16개 -> 1개로 합쳐지는 경우 발생 -> 이를 crop3에서 해결
+멀티 컷팅 크롭 시스템
+crop_line.py의 find_multi_cuts와 generate_grid_crops를 사용하여
+수평/수직으로 여러 번 자르는 방식으로 이미지를 분할
 
-하지만 crop을 안했을때 오히려 GUI Actor에서는 정확도가 높음
-아직까지 crop2.py보다 정확도가 높음
-
-하지만, crop을 안해서 PEAK MEMORY는 증가할듯
+- 수평 컷 횟수와 수직 컷 횟수를 지정 가능
+- 각 컷 위치에서 허용 범위 내에서 RGB 차이가 가장 적은 지점 선택
+- 격자 형태로 이미지 분할하여 여러 개의 크롭 생성
 '''
 
-from dcgen_segmentation import ImgSegmentation
 from PIL import Image, ImageDraw
-from crop_line import find_safe_horizontal_cut, force_horizontal_split
+from crop_line import find_multi_cuts, generate_grid_crops
 
 import os
 from time import time 
 import json
 
 #! Hyper Parameter
-# 수직 최소 분할 비율: 폭이 너무 좁은 조각(=좌우로 얇음)은 이웃과 병합
-Y_MIN_RATIO = 0.20   # 전체 너비의 20% 미만이면 병합
-
-# 수평 최소 분할 비율: 높이가 너무 낮은 조각(=상하로 얇음)은 이웃과 병합
-X_MIN_RATIO = 0.1   # 전체 높이의 10% 미만이면 병합  # TODO: crop이 잘게 10개 넘게씩이 좋을까 아니면 그냥 뭉치게가 좋을까 0.05 / 0.1
-
-# 리사이즈 비율 (coarse/fine 분리)
-RESIZE_RATIO_1 = 0.1   # 1차 coarse segmentation
-
-#! 1차/2차 분할 파라미터
-FIRST_PASS = dict(
-    max_depth=1,      # 트리 분할 최대 깊이 (값 ↑ → 더 많이 잘라서 세부적으로 분할)
-    var_thresh=150,   # 픽셀 분산 기준 (값 ↑ → 단색/균일 구간도 "내용 있음"으로 인식 → 분할 줄어듦)
-    diff_thresh=20,   # 행간 픽셀 차이 허용치 (값 ↑ → 작은 경계 무시, 오직 큰 차이만 분리 → 분할 줄어듦)
-    diff_portion=0.7, # 차이가 일정 비율 이상일 때만 경계 인정 (값 ↑ → 더 강한 변화 필요 → 분할 줄어듦)
-    window_size=50    # 슬라이딩 윈도우 높이 (값 ↑ → 큰 구간 단위로 평균내서 안정적 경계 탐지, 작은 변화 무시됨)
-)
-
-
-#! ---------------------------- Util ----------------------------
-
-def bbox_area(b):
-    l, t, r, btm = b
-    return max(0, r - l) * max(0, btm - t)
-
-def bbox_w(b):
-    return max(0, b[2] - b[0])
-
-def bbox_h(b):
-    return max(0, b[3] - b[1])
-
-def overlap_1d(a1, a2, b1, b2):
-    """ [a1,a2]와 [b1,b2] 구간의 겹침 길이 """
-    return max(0, min(a2, b2) - max(a1, b1))
-
-def vertical_overlap(a, b):
-    """ 두 bbox의 세로 방향 겹침 비율 (작은 쪽 기준) """
-    ov = overlap_1d(a[1], a[3], b[1], b[3])
-    denom = max(1, min(bbox_h(a), bbox_h(b)))
-    return ov / denom
-
-def horizontal_overlap(a, b):
-    """ 두 bbox의 가로 방향 겹침 비율 (작은 쪽 기준) """
-    ov = overlap_1d(a[0], a[2], b[0], b[2])
-    denom = max(1, min(bbox_w(a), bbox_w(b)))
-    return ov / denom
-
-def merge_two(a, b):
-    """ 두 bbox의 외접 사각형으로 병합 """
-    return (min(a[0], b[0]), min(a[1], b[1]), max(a[2], b[2]), max(a[3], b[3]))
-
-def collect_leaves_from_tree(tree_dict, base_level=0):
-    """
-    to_json_tree() 결과(dict)에서 리프 노드들만 (bbox, level)로 수집.
-    level은 base_level 기준으로 +1씩 내려감.
-    """
-    out = []
-    def _rec(node, level):
-        ch = node.get("children", [])
-        if not ch:
-            out.append((tuple(node["bbox"]), level))
-            return
-        for c in ch:
-            _rec(c, level + 1)
-    _rec(tree_dict, base_level)
-    return out
-
-def merge_small_segments(leaves, parent_size, min_w_ratio, min_h_ratio,
-                         v_overlap_thr=0.3, h_overlap_thr=0.3, max_iter=4):
-    """
-    너무 얇은 조각(폭/높이 기준)을 이웃과 병합.
-    - leaves: [(bbox, level), ...]
-    - parent_size: (W, H)  -> 이 좌표계 픽셀 스케일 기준으로 판정
-    - min_w_ratio/min_h_ratio: 비율 임계
-    - v_overlap_thr/h_overlap_thr: 이웃으로 간주할 최소 겹침 비율
-    """
-    W, H = parent_size
-    cur = [(tuple(b), lvl) for (b, lvl) in leaves]
-
-    def by_x(e): return (e[0][0] + e[0][2]) / 2.0
-    def by_y(e): return (e[0][1] + e[0][3]) / 2.0
-
-    for _ in range(max_iter):
-        changed = False
-
-        # 1) 폭이 너무 좁은 것 -> 좌/우 이웃과 병합
-        cur.sort(key=by_x)
-        i = 0
-        while i < len(cur):
-            b, lvl = cur[i]
-            w = bbox_w(b)
-            if W > 0 and (w / W) < min_w_ratio:
-                # 좌/우 후보 중 세로 겹침 가장 큰 이웃
-                best_j = -1
-                best_ov = -1.0
-                for j in [i - 1, i + 1]:
-                    if 0 <= j < len(cur):
-                        b2, _ = cur[j]
-                        ov = vertical_overlap(b, b2)
-                        if ov > best_ov:
-                            best_ov = ov
-                            best_j = j
-                if best_j >= 0 and best_ov >= v_overlap_thr:
-                    b2, lvl2 = cur[best_j]
-                    merged = merge_two(b, b2)
-                    new_lvl = max(lvl, lvl2)
-                    for idx in sorted([i, best_j], reverse=True):
-                        cur.pop(idx)
-                    cur.insert(min(i, best_j), (merged, new_lvl))
-                    changed = True
-                    continue
-            i += 1
-
-        # 2) 높이가 너무 낮은 것 -> 상/하 이웃과 병합
-        cur.sort(key=by_y)
-        i = 0
-        while i < len(cur):
-            b, lvl = cur[i]
-            h = bbox_h(b)
-            if H > 0 and (h / H) < min_h_ratio:
-                best_j = -1
-                best_ov = -1.0
-                for j in [i - 1, i + 1]:
-                    if 0 <= j < len(cur):
-                        b2, _ = cur[j]
-                        ov = horizontal_overlap(b, b2)
-                        if ov > best_ov:
-                            best_ov = ov
-                            best_j = j
-                if best_j >= 0 and best_ov >= h_overlap_thr:
-                    b2, lvl2 = cur[best_j]
-                    merged = merge_two(b, b2)
-                    new_lvl = max(lvl, lvl2)
-                    for idx in sorted([i, best_j], reverse=True):
-                        cur.pop(idx)
-                    cur.insert(min(i, best_j), (merged, new_lvl))
-                    changed = True
-                    continue
-            i += 1
-
-        if not changed:
-            break
-
-    # 경계 스냅(정수화)
-    snapped = []
-    for (b, lvl) in cur:
-        l, t, r, btm = b
-        snapped.append(((int(round(l)), int(round(t)), int(round(r)), int(round(btm))), lvl))
-    return snapped
-
+# 멀티 컷팅 파라미터
+DEFAULT_STRIPE_H = 50           # 스트립 두께
+DEFAULT_SMOOTH_RADIUS = 5       # 스무딩 반경
+DEFAULT_SAMPLE_STRIDE = 20      # 샘플링 보폭
+DEFAULT_H_CUTS = 3             # 수평 컷 횟수 (4개 구간)
+DEFAULT_V_CUTS = 1             # 수직 컷 횟수 (2개 구간)
+DEFAULT_H_TOLERANCE = 0.12     # 수평 허용 범위
+DEFAULT_V_TOLERANCE = 0.4     # 수직 허용 범위
 
 #! ================================================================================================
 
 
-def crop_img(image_path, output_image_path=None, save_visualization=False, print_latency=False, additional_crop=False):
+def crop_img(image_path, output_image_path=None, save_visualization=False, print_latency=False,
+             stripe_h=DEFAULT_STRIPE_H, smooth_radius=DEFAULT_SMOOTH_RADIUS, 
+             sample_stride=DEFAULT_SAMPLE_STRIDE, h_cuts=DEFAULT_H_CUTS, v_cuts=DEFAULT_V_CUTS,
+             h_tolerance=DEFAULT_H_TOLERANCE, v_tolerance=DEFAULT_V_TOLERANCE,
+             gt_bboxes=None  # 정답 bbox 리스트 추가
+             ):
     """
-    이미지를 crop하여 결과 리스트 반환
+    멀티 컷팅으로 이미지를 격자 형태로 분할하여 결과 리스트 반환
     
     Args:
         image_path: 입력 이미지 경로
         output_image_path: 이미지 저장 경로 (None이면 저장 안함)
         save_visualization: 시각화 이미지 저장 여부
         print_latency: 실행 시간 출력 여부
+        stripe_h: 스트립 두께
+        smooth_radius: 스무딩 반경
+        sample_stride: 샘플링 보폭
+        h_cuts: 수평 컷 횟수
+        v_cuts: 수직 컷 횟수
+        h_tolerance: 수평 허용 범위
+        v_tolerance: 수직 허용 범위
+        gt_bboxes: 정답 bbox 리스트 [[x, y, w, h], ...] 형식
     
     Returns:
         results_for_grounding: grounding용 crop 결과 리스트
@@ -187,209 +57,172 @@ def crop_img(image_path, output_image_path=None, save_visualization=False, print
 
     start = time()
 
-    # 0) 원본/작업 이미지 로드 및 리사이즈
-    orig_img_full = Image.open(image_path).convert("RGB")
-    orig_w, orig_h = orig_img_full.size
-    resized_w1, resized_h1 = int(orig_w * RESIZE_RATIO_1), int(orig_h * RESIZE_RATIO_1)
-    resized_w1 = max(1, resized_w1)
-    resized_h1 = max(1, resized_h1)
-    work_img = orig_img_full.resize((resized_w1, resized_h1))
+    # 원본 이미지 로드
+    orig_img = Image.open(image_path).convert("RGB")
+    orig_w, orig_h = orig_img.size
 
-    abs_W1 = orig_w * RESIZE_RATIO_1
-    abs_H1 = orig_h * RESIZE_RATIO_1
+    # 세로 화면 감지 및 수직 컷 제어
+    # allow_vertical_cut = orig_w > orig_h * 1.5
+    allow_vertical_cut = False
 
     time0 = time()
     if print_latency:
-        print(f"[Crop] [0] {time0 - start:.3f}s", end = " | ")
+        print(f"[Crop] [Load] {time0 - start:.3f}s", end = " | ")
 
-    # 1-2) 1차 분할
-    img_seg = ImgSegmentation(
-        img=work_img,
-        max_depth=FIRST_PASS["max_depth"],
-        var_thresh=FIRST_PASS["var_thresh"],
-        diff_thresh=FIRST_PASS["diff_thresh"],
-        diff_portion=FIRST_PASS["diff_portion"],
-        window_size=FIRST_PASS["window_size"]
+    # 멀티 컷팅 실행
+    bboxes, crop_imgs = generate_grid_crops(
+        orig_img,
+        stripe_h=stripe_h,
+        smooth_radius=smooth_radius,
+        sample_stride=sample_stride,
+        h_cuts=h_cuts,
+        v_cuts=v_cuts,
+        h_tolerance=h_tolerance,
+        v_tolerance=v_tolerance,
+        allow_vertical_cut=allow_vertical_cut
     )
-
-    # 트리에서 리프만 수집(level 기준: 루트 0, 리프는 1)
-    tree = img_seg.to_json_tree()
-    leaves_lvl1 = collect_leaves_from_tree(tree, base_level=0)
-
+    
+    # 컷 라인들 가져오기 (시각화용)
+    horizontal_cuts, vertical_cuts = find_multi_cuts(
+        orig_img,
+        stripe_h=stripe_h,
+        smooth_radius=smooth_radius,
+        sample_stride=sample_stride,
+        h_cuts=h_cuts,
+        v_cuts=v_cuts,
+        h_tolerance=h_tolerance,
+        v_tolerance=v_tolerance,
+        allow_vertical_cut=allow_vertical_cut
+    )
 
     time1 = time()
     if print_latency:
-        print(f"[1] {time1 - time0:.3f}s", end = " | ")
+        print(f"[Multi-Cut] {time1 - time0:.3f}s", end = " | ")
 
-    # 1-2) 제로-드롭 병합 보정(너무 얇은/낮은 조각은 이웃과 병합)
-    leaves_lvl1_merged = merge_small_segments(
-        leaves=leaves_lvl1,
-        parent_size=(abs_W1, abs_H1),  # ← 부모 bbox 말고, 원본×리사이즈 상수
-        min_w_ratio=Y_MIN_RATIO,
-        min_h_ratio=X_MIN_RATIO,
-        v_overlap_thr=0.3,
-        h_overlap_thr=0.3,
-        max_iter=4
-    )
-
-    time2 = time()
-    if print_latency:
-        print(f"[2] {time2 - time1:.3f}s", end = " | ")
-
-    # 3) 결과 JSON
-    final_items = [(b_work, max(lvl, 1)) for (b_work, lvl) in leaves_lvl1_merged]
-    json_out = [{"bbox": [int(b[0]), int(b[1]), int(b[2]), int(b[3])], "level": int(lvl)} for (b, lvl) in final_items]
-
+    # 결과 리스트 구성
     results_for_grounding = []
-    results_for_grounding.append({  # 썸네일
-        "img": orig_img_full.copy(),
-        "id": 0,
-        "bbox": [0, 0, orig_w, orig_h]
+    
+    # 썸네일 (전체 이미지)
+    results_for_grounding.append({
+        "img": orig_img.copy(), 
+        "id": 0, 
+        "bbox": [0, 0, orig_w, orig_h],
+        "recursion_depth": 0, 
+        "fail": False, 
+        "filename": None
     })
-
-    sx = orig_w / float(resized_w1)
-    sy = orig_h / float(resized_h1)
-
-    # k번 크롭들 (원본 좌표계 bbox + 이미지를 메모리에서 잘라서 포함)
-    k = 1
-    for item in json_out:
-        bbox = item.get("bbox")
-        if not bbox or len(bbox) != 4:
-            continue
-        l, t, r, b = bbox
-        # work_img → 원본 좌표로 스케일백
-        L = int(round(l * sx)); T = int(round(t * sy))
-        R = int(round(r * sx)); B = int(round(b * sy))
-        # 유효성 체크
-        L = max(0, min(orig_w, L)); R = max(0, min(orig_w, R))
-        T = max(0, min(orig_h, T)); B = max(0, min(orig_h, B))
-        if R <= L or B <= T:
-            continue
-        crop_img = orig_img_full.crop((L, T, R, B))
+    
+    # 크롭된 이미지들
+    for idx, (bbox, crop_img) in enumerate(zip(bboxes, crop_imgs)):
         results_for_grounding.append({
-            "img": crop_img,
-            "id": k,
-            "bbox": [L, T, R, B],
-            "recursion_depth": 0,
-            "fail": False,
+            "img": crop_img, 
+            "id": idx + 1, 
+            "bbox": bbox,
+            "recursion_depth": 0, 
+            "fail": False, 
             "filename": None
         })
-        k += 1
-    
-    time3 = time()
-    if print_latency:
-        print(f"[3] {time3 - time2:.3f}s", end=" | ")
-
-    effective_k = len(json_out)
-    if additional_crop:
-        #! 크롭 실패시 폴백: 수평 분할
-        fallback_info = None
-        
-        if effective_k < 2:
-            # 썸네일만 유지
-            if len(results_for_grounding) > 1:
-                results_for_grounding = results_for_grounding[:1]
-
-            #! 수평 분할 실행
-            T_box, B_box, T_img, B_img = force_horizontal_split(orig_img_full)
-
-            results_for_grounding.append({
-                "img": T_img, "id": 1, "bbox": T_box,
-                "recursion_depth": 0, "fail": False, "filename": None
-            })
-            results_for_grounding.append({
-                "img": B_img, "id": 2, "bbox": B_box,
-                "recursion_depth": 0, "fail": False, "filename": None
-            })
-
-            # 시각화용 정보
-            fallback_info = {
-                "y_cut": T_box[3],
-                "T_box": T_box,
-                "B_box": B_box
-            }
 
     end = time()
 
     if print_latency:
-        if additional_crop:
-            if fallback_info is not None:
-                print(f"[4]🔥 {end - time3:.3f}s", end = " | ")
-            else:
-                print(f"[4]         ", end = " | ")
-        print(f"🕖 Crop Time : {end - start:.3f}s", end = " | ")
+        print(f"[Total] {end - start:.3f}s", end = " | ")
         print(f"✂️ Crops : {len(results_for_grounding)-1}", end = "")  # 썸네일 제외 개수 출력
 
-    # ---------------------------- 시각화 ----------------------------
-    if not save_visualization:
+    if not save_visualization or output_image_path is None:
         print()
         return results_for_grounding
+    
+    # ---------------------------- 시각화 ----------------------------
 
-    if output_image_path:
-        orig_img = orig_img_full.copy()
-        draw = ImageDraw.Draw(orig_img)
+    vis_img = orig_img.copy()
+    draw = ImageDraw.Draw(vis_img)
 
-        palette = {
-            0: (255, 0, 0),
-            1: (0, 255, 0),
-            2: (0, 0, 255),
-            3: (255, 165, 0),
-            4: (255, 0, 255),
-            5: (0, 255, 255),
-        }
-        line_w = max(2, int(min(orig_w, orig_h) * 0.003))
+    palette = [
+        (255, 0, 0),    # 빨간색
+        (0, 255, 0),    # 초록색
+        (0, 0, 255),    # 파란색
+        (255, 165, 0),  # 주황색
+        (255, 0, 255),  # 마젠타
+        (0, 255, 255),  # 시안
+        (255, 255, 0),  # 노란색
+        (128, 0, 128),  # 보라색
+    ]
+    line_w = max(2, int(min(orig_w, orig_h) * 0.003))
 
-        # 1) 세그먼트 박스 표시 (json_out)
-        for item in json_out:
-            bbox = item.get("bbox")
-            level = item.get("level", 0)
-            if not bbox or len(bbox) != 4:
-                continue
-            l, t, r, b = bbox
-            L = int(round(l * sx)); T = int(round(t * sy))
-            R = int(round(r * sx)); B = int(round(b * sy))
-            color = palette.get(level % len(palette), (255, 0, 0))
-            draw.rectangle([L, T, R, B], outline=color, width=line_w)
+    # 수평 컷 라인들 그리기
+    for y in horizontal_cuts:
+        draw.line([(0, y), (orig_w, y)], fill=(255, 0, 255), width=line_w)
+    
+    # 수직 컷 라인들 그리기  
+    for x in vertical_cuts:
+        draw.line([(x, 0), (x, orig_h)], fill=(255, 0, 255), width=line_w)
+    
+    # 각 격자 영역 외곽선 그리기
+    for idx, bbox in enumerate(bboxes):
+        color = palette[idx % len(palette)]
+        draw.rectangle(bbox, outline=color, width=line_w)
 
-        # 2) 폴백 컷 라인/박스 표시
-        if additional_crop and fallback_info is not None:
-            y = int(fallback_info["y_cut"])
-            # 수평 컷 라인
-            draw.line([(0, y), (orig_w, y)], fill=(255, 0, 255), width=line_w)
-            # 선택적으로 상/하 박스 외곽도 그릴 수 있음
-            tL, tT, tR, tB = fallback_info["T_box"]
-            bL, bT, bR, bB = fallback_info["B_box"]
-            draw.rectangle([tL, tT, tR, tB], outline=(255, 0, 255), width=line_w)
-            draw.rectangle([bL, bT, bR, bB], outline=(255, 0, 255), width=line_w)
+    # 정답 bbox 그리기 (있는 경우)
+    if gt_bboxes:
+        gt_line_w = max(3, int(min(orig_w, orig_h) * 0.005))  # 더 두꺼운 선
+        for gt_bbox in gt_bboxes:
+            if len(gt_bbox) >= 4:
+                x, y, w, h = gt_bbox[:4]
+                # [x, y, w, h] → [L, T, R, B] 변환
+                gt_rect = [x, y, x + w, y + h]
+                # 빨간색으로 정답 bbox 그리기
+                draw.rectangle(gt_rect, outline=(255, 255, 0), width=gt_line_w)  # 노란색
 
-        if effective_k < 2:  #! 일단 추가크롭한거만 이미지 저장
-            orig_img.save(output_image_path)
-            print("🔥", end="")
-        else:
-            print("  ", end="")
-        if print_latency:
-            print(f" | [SAVE] {output_image_path}")
-    else:
-        if print_latency:
-            print(" | [WARNING] save_visualization=True but output_image_path is None")
+    vis_img.save(output_image_path)
+
+    if print_latency:
+        print(f" | [SAVE] {output_image_path}")
 
     return results_for_grounding
 
 #! ================================================================================================
 
 if __name__ == '__main__':
-    # 테스트용 main: 데이터/출력 경로는 main 전역으로 유지
+    # 테스트용 main
     data_path = "./data/screenspotv2_image/"
 
-    jsonlist = json.load(open("./data/screenspot_mobile_v2.json"))
-    target_imgs = sorted(set(item["img_filename"] for item in jsonlist))
-    os.makedirs(f"./crop_test/", exist_ok=True)
+    # device_type = "mobile"
+    # device_type = "web"
+    device_type = "desktop"
+
+    output_path = f"./crop_test/{device_type}"
+    os.makedirs(output_path, exist_ok=True)
+    jsonlist = json.load(open(f"./data/screenspot_{device_type}_v2.json"))
+
+    target_imgs = sorted(set(item["img_filename"] for item in jsonlist if "img_filename" in item))
+
+    # 파일별 정답 bbox 딕셔너리 생성
+    gt_bbox_dict = {}
+    for item in jsonlist:
+        if "img_filename" in item and "bbox" in item:
+            fname = item["img_filename"]
+            if fname not in gt_bbox_dict:
+                gt_bbox_dict[fname] = []
+            gt_bbox_dict[fname].append(item["bbox"])
 
     for fname in target_imgs:
-        # 테스트 실행: 저장 경로는 main에서 지정한 output_path 사용
-        crop_img(image_path = data_path + fname,
-            output_image_path = f"./crop_test/{fname}",
-            save_visualization = True,
-            print_latency = True,
-            additional_crop = True
-            )
+        # 해당 파일의 정답 bbox들 가져오기
+        gt_bboxes = gt_bbox_dict.get(fname, [])
+        
+        # 멀티 컷팅 테스트 실행
+        crop_img(
+            image_path=os.path.join(data_path, fname),
+            output_image_path=f"{output_path}/{fname}",
+            save_visualization=True,
+            print_latency=True,
+            gt_bboxes=gt_bboxes,  # 정답 bbox 전달
+            # 커스텀 파라미터 (필요시 조정)
+            stripe_h=50,
+            smooth_radius=5,
+            sample_stride=20,
+            h_cuts=3,           # 수평 3개 라인 (4개 구간)
+            v_cuts=1,           # 수직 1개 라인 (2개 구간)
+            h_tolerance=0.07,   # 수평 허용범위 ±7%
+            v_tolerance=0.07,   # 수직 허용범위 ±7%
+        )

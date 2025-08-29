@@ -9,17 +9,17 @@ os.environ["CUDA_VISIBLE_DEVICES"]= "1"  # 몇번 GPU 사용할지 ("0,1", "2" �
 ATTN_IMPL = "eager"  # attention implement "eager" "sdpa" "flash" "efficient"
 SELECT_THRESHOLD = 0.7  # score >= tau * max_score 인 모든 crop select
 EARLY_EXIT = True
-ADDITIONAL_CROP = True  # True : crop에 실패했을때 수평으로 한번 크롭 | False : crop 실패시 바로 S2로 썸네일 없이 추론
 
 # Image Resize Ratios
-MAX_PIXELS = None  # 1280 * 28 * 28
-S1_RESIZE_RATIO = 0.25  # Stage 1 crop resize ratio
-S2_RESIZE_RATIO = 0.5  # Stage 2 crop resize ratio
+# MAX_PIXELS = None
+# MAX_PIXELS = 1280 * 28 * 28
+MAX_PIXELS = 3211264
+S1_RESIZE_RATIO = 0.4  # Stage 1 crop resize ratio
+S2_RESIZE_RATIO = 0.8  # Stage 2 crop resize ratio
 THUMBNAIL_RESIZE_RATIO = 0.10  # Thumbnail resize ratio
 
 is_ee = "ee" if EARLY_EXIT else "not_ee"
-is_ac = "ac" if ADDITIONAL_CROP else "not_ac"
-SAVE_DIR = f"./attn_output/" + is_ee + "_" + is_ac + "_" + "0827"  #! Save Path (특징이 있다면 적어주세요)
+SAVE_DIR = f"./attn_output/" + is_ee + "_" + str(MAX_PIXELS) + "_" + str(S1_RESIZE_RATIO) + "_" + str(S2_RESIZE_RATIO) + "_" + "0828_newcrop"  #! Save Path (특징이 있다면 적어주세요)
 
 #! Argument ==========================================================================================
 
@@ -29,7 +29,7 @@ SEED = 0
 MLLM_PATH = "microsoft/GUI-Actor-3B-Qwen2.5-VL"
 SCREENSPOT_IMGS = "./data/screenspotv2_image"  # input image 경로
 SCREENSPOT_JSON = "./data"  # json파일 경로
-TASKS = ["mobile"]
+TASKS = ["mobile", "web", "desktop"]
 SAMPLE_RANGE = slice(None)  #! 샘플 범위 지정 (3번 샘플이면 3,4 / 5~9번 샘플이면 5,10 / 전체 사용이면 None)
 
 # Visualize & Logging
@@ -556,8 +556,7 @@ if __name__ == '__main__':
             seg_start = time.time()
             crop_list = crop_img(
                 image_path=img_path,
-                save_visualization=False,
-                additional_crop=ADDITIONAL_CROP
+                save_visualization=False
             )
             s0_crop_list = resize_crop_list(crop_list=crop_list, ratio=S1_RESIZE_RATIO)
             seg_end = time.time()
@@ -568,154 +567,93 @@ if __name__ == '__main__':
                 visualize_crop(save_dir=inst_dir, gt_bbox=original_bbox, top_q_bboxes=all_crops_bboxes,
                                 instruction=instruction, filename="s1_all_crop.png", img_path=img_path, click_point=None)
 
-            #! crop이 실패해서 썸네일이랑 전체이미지 1개인 경우 stage2로 스킵하고 원본 * S2_RESIZE_RATIO만 넣기
-            # 만약 crop이 하나라면 썸네일과 일치해서
-            # early exit, stage1, 앙상블, stage2의 과정들이 의미가 없기 때문에
-            # 바로 50% 축소한걸로 inference하고 끝내기
-            if len(s0_crop_list) == 2:
-                print(f"✂️  Crops : 1 | 🚪 Simple Processing using S2_RESIZE_RATIO resize")
-                
-                # 원본 이미지를 S2_RESIZE_RATIO로 리사이즈하여 직접 처리
-                resized_image = original_image.resize(
-                    (int(original_image.width * S2_RESIZE_RATIO), int(original_image.height * S2_RESIZE_RATIO))
-                )
-                
-                # crop 객체 생성 (resized_img 포함)
-                simple_crop = {
-                    "img": resized_image,
-                    "resized_img": resized_image,  # create_guiactor_msgs에서 사용
-                    "id": 1,
-                    "bbox": [0, 0, original_image.width, original_image.height]
-                }
-                
-                simple_crop_list = [simple_crop]
-                simple_msgs = create_guiactor_msgs(crop_list=simple_crop_list, instruction=instruction)
-                
-                if TFOPS_PROFILING:
-                    prof.start_profile()
+            #! ==================================================================
+            #! Stage 1 | Find Top Q + Inference
+            #! ==================================================================
 
-                simple_start = time.time()
-                simple_pred = inference(simple_msgs, model, tokenizer, processor, use_placeholder=True, topk=3)
-                simple_end = time.time()
-                simple_time = simple_end - simple_start
-                
-                if TFOPS_PROFILING:
-                    prof.stop_profile()
-                    simple_flops = prof.get_total_flops()
-                    simple_flops /= 1e12
-                
-                # 결과 처리
-                per_image_outputs = simple_pred["per_image"]
-                if len(per_image_outputs) > 0:
-                    result = per_image_outputs[0]
-                    top_point = result['topk_points'][0]
-                    
-                    # 좌표는 리사이즈된 이미지 기준이므로 원본 크기로 변환
-                    scale_factor = 0.5
-                    final_point = [top_point[0] * original_image.width, top_point[1] * original_image.height]
-                    final_success = point_in_bbox(final_point, original_bbox)
+            # Calculate Stage 1 FLOPs
+
+            if TFOPS_PROFILING:
+                prof.start_profile()
+
+            s1_start = time.time()
+
+            s1_msgs = create_guiactor_msgs(crop_list=s0_crop_list, instruction=instruction)
+
+            s1_top_q_crop_ids, s1_top_q_bboxes, s0_crop_list_out, should_exit_early, early_exit_success = run_selection_pass_with_guiactor(
+                msgs=s1_msgs,
+                crop_list=s0_crop_list,
+                gt_bbox=original_bbox,
+                attn_vis_dir=s1_dir or "",
+                original_image=original_image,
+                img_path=img_path,
+                instruction=instruction
+            )
+            s1_infence_end = time.time()
+            s1_time = s1_infence_end - s1_start
+
+            if TFOPS_PROFILING:
+                prof.stop_profile()
+                s1_tflops = prof.get_total_flops()
+                s1_tflops /= 1e12
+
+            if should_exit_early:
+                print(f"✂️  Crops : 1 | 🚀 Early Exit")
+                early_exit_count +=1
+                if early_exit_success:
+                    s1_hit = "✅🚀"
+                    early_exit_success_count += 1
                 else:
-                    final_success = False
-                
-                # 통계 설정
-                s1_time = 0.0
-                s2_time = simple_time
-                s1_tflops = 0
-                s2_tflops = simple_flops
-                should_exit_early = False
-                early_exit_success = False
-                s1_hit = "✅🚪" if final_success else "❌🚪"
-                s1_top_q_crop_ids = []
-                s1_top_q_bboxes = []
-                
-            else:
-                #! ==================================================================
-                #! Stage 1 | Find Top Q + Inference
-                #! ==================================================================
+                    s1_hit = "❌🚀"
 
-                # Calculate Stage 1 FLOPs
+            else:  # GT가 안에 들어가는지 체크
+                s1_hit = "✅" if check_gt_in_selected_crops(s1_top_q_bboxes, original_bbox) else "❌"
 
-                if TFOPS_PROFILING:
-                    prof.start_profile()
-
-                s1_start = time.time()
-
-                s1_msgs = create_guiactor_msgs(crop_list=s0_crop_list, instruction=instruction)
-
-                s1_top_q_crop_ids, s1_top_q_bboxes, s0_crop_list_out, should_exit_early, early_exit_success = run_selection_pass_with_guiactor(
-                    msgs=s1_msgs,
-                    crop_list=s0_crop_list,
-                    gt_bbox=original_bbox,
-                    attn_vis_dir=s1_dir or "",
-                    original_image=original_image,
-                    img_path=img_path,
-                    instruction=instruction
-                )
-                s1_infence_end = time.time()
-                s1_time = s1_infence_end - s1_start
-
-                if TFOPS_PROFILING:
-                    prof.stop_profile()
-                    s1_tflops = prof.get_total_flops()
-                    s1_tflops /= 1e12
-
-                if should_exit_early:
-                    print(f"✂️  Crops : 1 | 🚀 Early Exit")
-                    early_exit_count +=1
-                    if early_exit_success:
-                        s1_hit = "✅🚀"
-                        early_exit_success_count += 1
-                    else:
-                        s1_hit = "❌🚀"
-
-                else:  # GT가 안에 들어가는지 체크
-                    s1_hit = "✅" if check_gt_in_selected_crops(s1_top_q_bboxes, original_bbox) else "❌"
-
-                # 불필요한 딕셔너리 연산 제거 - 결과 저장용도만
-                # res_board_dict는 사실상 미사용
-                
-                #! ==================================================================
-                #! [Stage 2] Attention Refinement Pass
-                #! ==================================================================
-                
-                # Early Exit
-                s2_tflops = 0.0
-                if should_exit_early:
-                    final_success = early_exit_success
-                    s2_time = 0.0
-                    s2_tflops = 0.0
-                else:
-                    original_crop_map = {c['id']: c for c in crop_list}
-                    s2_input_crop_ids = set()
-                    if 0 in original_crop_map:
-                        s2_input_crop_ids.add(0)
-                    for crop_id in s1_top_q_crop_ids:
-                        s2_input_crop_ids.add(crop_id)
-                    s2_input_crops = [original_crop_map[cid] for cid in s2_input_crop_ids if cid in original_crop_map]
-
-                    # Calculate Stage 2 FLOPs
-                    s2_resized_crops = resize_crop_list(crop_list=s2_input_crops, ratio=S2_RESIZE_RATIO)
-                    s2_msgs = create_guiactor_msgs(crop_list=s2_resized_crops, instruction=instruction)
-
-                    if TFOPS_PROFILING:
-                        prof.start_profile()
-                    s2_inference_start = time.time()
-
-                    final_success = run_refinement_pass_with_guiactor(
-                        crop_list=s2_input_crops,
-                        instruction=instruction,
-                        original_image=original_image,
-                        save_dir=s2_dir or "",
-                        gt_bbox=original_bbox,
-                        img_path=img_path
-                    )
-                    s2_inference_end = time.time()
-                    s2_time = s2_inference_end - s2_inference_start
-                    if TFOPS_PROFILING:
-                        prof.stop_profile()
-                        s2_tflops = prof.get_total_flops()
-                        s2_tflops /= 1e12
+            # 불필요한 딕셔너리 연산 제거 - 결과 저장용도만
+            # res_board_dict는 사실상 미사용
             
+            #! ==================================================================
+            #! [Stage 2] Attention Refinement Pass
+            #! ==================================================================
+            
+            # Early Exit
+            s2_tflops = 0.0
+            if should_exit_early:
+                final_success = early_exit_success
+                s2_time = 0.0
+                s2_tflops = 0.0
+            else:
+                original_crop_map = {c['id']: c for c in crop_list}
+                s2_input_crop_ids = set()
+                if 0 in original_crop_map:
+                    s2_input_crop_ids.add(0)
+                for crop_id in s1_top_q_crop_ids:
+                    s2_input_crop_ids.add(crop_id)
+                s2_input_crops = [original_crop_map[cid] for cid in s2_input_crop_ids if cid in original_crop_map]
+
+                # Calculate Stage 2 FLOPs
+                s2_resized_crops = resize_crop_list(crop_list=s2_input_crops, ratio=S2_RESIZE_RATIO)
+                s2_msgs = create_guiactor_msgs(crop_list=s2_resized_crops, instruction=instruction)
+
+                if TFOPS_PROFILING:
+                    prof.start_profile()
+                s2_inference_start = time.time()
+
+                final_success = run_refinement_pass_with_guiactor(
+                    crop_list=s2_input_crops,
+                    instruction=instruction,
+                    original_image=original_image,
+                    save_dir=s2_dir or "",
+                    gt_bbox=original_bbox,
+                    img_path=img_path
+                )
+                s2_inference_end = time.time()
+                s2_time = s2_inference_end - s2_inference_start
+                if TFOPS_PROFILING:
+                    prof.stop_profile()
+                    s2_tflops = prof.get_total_flops()
+                    s2_tflops /= 1e12
+        
 
             #! ==================================================================
             #! [Common Processing]
@@ -854,7 +792,6 @@ if __name__ == '__main__':
                 "max_pixels": MAX_PIXELS,
                 "select_threshold": SELECT_THRESHOLD,
                 "early_exit": EARLY_EXIT,
-                "additional_crop": ADDITIONAL_CROP,
                 "s1_resize_ratio": S1_RESIZE_RATIO,
                 "s2_resize_ratio": S2_RESIZE_RATIO,
                 "thumbnail_resize_ratio" : THUMBNAIL_RESIZE_RATIO,
