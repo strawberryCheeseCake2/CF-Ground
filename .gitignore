@@ -1,9 +1,6 @@
 # cache
 __pycache__/
 
-# data
-data/
-
 # output
 attn_output/
 crop_test/

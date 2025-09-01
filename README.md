@@ -28,5 +28,5 @@ pip install -r requirements_gui_agent_mac.txt
 ```
 
 ## :minidisc: Data Preparation
-1. Download the processed data from [here](https://huggingface.co/datasets/cckevinn/GUI-Actor-Data).
-2. Modify the paths in the [data_config.yaml](./data/data_config.yaml) file to point to the downloaded data.
+1. Download the processed data from [here](https://huggingface.co/datasets/OS-Copilot/ScreenSpot-v2/tree/main).
+2. Move files at ./data folder
