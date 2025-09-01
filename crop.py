@@ -94,24 +94,11 @@ def find_horizontal_cuts(
     return horizontal_cuts
 
 
-def crop_img(orig_img:Image.Image, output_image_path=None, save_visualization=False, print_latency=False, gt_bboxes=None):
+def crop_img(orig_img:Image.Image, h_cuts:int=None, h_tolerance:int=None, output_image_path=None, save_visualization=False, print_latency=False, gt_bboxes=None):
     """
     멀티 컷팅으로 이미지를 격자 형태로 분할하여 결과 리스트 반환
     
     Args:
-        image_path: 입력 이미지 경로
-        output_image_path: 이미지 저장 경로 (None이면 저장 안함)
-        save_visualization: 시각화 이미지 저장 여부
-        print_latency: 실행 시간 출력 여부
-        stripe_h: 스트립 두께
-        smooth_radius: 스무딩 반경
-        sample_stride: 샘플링 보폭
-        h_cuts: 수평 컷 횟수 (None이면 가로세로 비율로 자동 결정)
-        v_cuts: 수직 컷 횟수
-        h_tolerance: 수평 허용 범위
-        v_tolerance: 수직 허용 범위
-        gt_bboxes: 정답 bbox 리스트 [[x, y, w, h], ...] 형식
-    
     Returns:
         results_for_grounding: grounding용 crop 결과 리스트
     """
@@ -119,17 +106,17 @@ def crop_img(orig_img:Image.Image, output_image_path=None, save_visualization=Fa
     start = time()
 
     orig_w, orig_h = orig_img.size
-
     #! 높이의 pixel에 따라서 나누는 횟수 지정
-    if orig_h < 1000:  # 
-        h_cuts = 1
-        h_tolerance = 0.20
-    elif orig_h < 1440:  # 중간화질 -> 3등분
-        h_cuts = 2
-        h_tolerance = 0.12
-    else:  # 고화질이나 세로화면은 4등분
-        h_cuts = 3
-        h_tolerance = 0.08
+    if h_cuts is None:
+        if orig_h < 1000:  # 저화질이나 가로화면 -> 2등분
+            h_cuts = 1
+            h_tolerance = 0.20
+        elif orig_h < 1440:  # 중간화질 -> 3등분
+            h_cuts = 2
+            h_tolerance = 0.12
+        else:  # 고화질이나 세로화면 -> 4등분
+            h_cuts = 3
+            h_tolerance = 0.08
 
     #! ======================================
 

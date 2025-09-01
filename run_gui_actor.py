@@ -1,8 +1,15 @@
 # run_gui_actor.py
 
 import os
+import argparse
 os.environ["CUDA_DEVICE_ORDER"]="PCI_BUS_ID"
 os.environ["CUDA_VISIBLE_DEVICES"]= "2"  # 몇번 GPU 사용할지 ("0,1", "2" 등)
+
+# Argument parsing - 기본값은 기존 설정 유지
+parser = argparse.ArgumentParser()
+parser.add_argument('--no_early_exit', action='store_true', help='Disable early exit')
+parser.add_argument('--max_pixels', type=int, help='Maximum pixels for image resize')
+args = parser.parse_args()
 
 #! Hyperparameter =====================================================================================
 
@@ -10,18 +17,22 @@ ATTN_IMPL = "eager"  # attention implement "eager" "sdpa" "flash" "efficient"
 
 # Image Resize Ratios
 # MAX_PIXELS = None
-MAX_PIXELS = 1280 * 28 * 28
+# MAX_PIXELS = 1280 * 28 * 28
 # MAX_PIXELS = 3211264
+MAX_PIXELS = args.max_pixels if args.max_pixels else None
 S1_RESIZE_RATIO = 0.35  # Stage 1 crop resize ratio
 S2_RESIZE_RATIO = 0.60  # Stage 2 crop resize ratio
 THUMBNAIL_RESIZE_RATIO = 0.10  # Thumbnail resize ratio
 
 SELECT_THRESHOLD = 0.7  # score >= tau * max_score 인 모든 crop select
-EARLY_EXIT = True
+# EARLY_EXIT 설정: --no_early_exit이면 False, 기본값 True
+
+EARLY_EXIT = False if args.no_early_exit else True
 EARLY_EXIT_THRE = 0.6  # 1등 attention * thre > 2등 attention이라면 early exit
 
 is_ee = "ee" if EARLY_EXIT else "not_ee"
-SAVE_DIR = f"./attn_output/" + is_ee + "_" + str(MAX_PIXELS) + "_" + str(S1_RESIZE_RATIO) + "_" + str(S2_RESIZE_RATIO) + "_" + "0901"  #! Save Path (특징이 있다면 적어주세요)
+SAVE_DIR = f"./attn_output/" + is_ee + "_" + str(MAX_PIXELS) + "_" + \
+    str(S1_RESIZE_RATIO) + "_" + str(S2_RESIZE_RATIO) + "_" + "0902"  #! Save Path (특징이 있다면 적어주세요)
 
 #! Argument ==========================================================================================
 
@@ -33,7 +44,7 @@ SCREENSPOT_IMGS = "./data/screenspotv2_image"  # input image 경로
 SCREENSPOT_JSON = "./data"  # json파일 경로
 TASKS = ["mobile", "web", "desktop"]
 SAMPLE_RANGE = slice(None)  #! 샘플 범위 지정 (3번 샘플이면 3,4 / 5~9번 샘플이면 5,10 / 전체 사용이면 None)
-# SAMPLE_RANGE = slice(0, 10)
+# SAMPLE_RANGE = slice(0, 3)
 
 # Visualize & Logging
 STAGE0_VIS = False
@@ -620,10 +631,21 @@ if __name__ == '__main__':
             original_bbox = item["bbox"]
             original_bbox = [original_bbox[0], original_bbox[1], 
                            original_bbox[0] + original_bbox[2], original_bbox[1] + original_bbox[3]]
+
+            orig_w, orig_h = original_image.size
             
-            w_orig, h_orig = original_image.size
-            if MAX_PIXELS is not None and w_orig * h_orig > MAX_PIXELS:
+            # 이미지 리사이즈 처리
+            if MAX_PIXELS is not None and orig_w * orig_h > MAX_PIXELS:
                 resized_image, w_resized, h_resized = resize_image(original_image)
+                # bbox도 리사이즈 비율에 맞춰 스케일링
+                resize_ratio = (w_resized * h_resized) ** 0.5 / (orig_w * orig_h) ** 0.5
+                scaled_bbox = [int(coord * resize_ratio) for coord in original_bbox]
+            else:
+                # 리사이즈가 필요없는 경우 원본 그대로 사용
+                resized_image = original_image
+                w_resized, h_resized = orig_w, orig_h
+                resize_ratio = 1.0
+                scaled_bbox = original_bbox
                 
             # data_source 정보 추출 (없으면 "unknown"으로 기본값 설정)
             data_source = item.get("data_source", "unknown")
@@ -647,16 +669,25 @@ if __name__ == '__main__':
             #! ==================================================================
 
             seg_start = time.time()
-            crop_list = crop_img(
-                orig_img = original_image
-            )
+
+            # resize 하지 않은 원본의 화질을 기준으로 crop 횟수 정하기
+            if orig_h < 1000:  # 저화질이나 가로화면 -> 2등분
+                h_cuts = 1
+                h_tolerance = 0.20
+            elif orig_h < 1440:  # 중간화질 -> 3등분
+                h_cuts = 2
+                h_tolerance = 0.12
+            else:  # 고화질이나 세로화면 -> 4등분
+                h_cuts = 3
+                h_tolerance = 0.08
+            crop_list = crop_img(orig_img=resized_image, h_cuts=h_cuts, h_tolerance=h_tolerance)  # resize된걸로 crop
             s0_crop_list = resize_crop_list(crop_list=crop_list, ratio=S1_RESIZE_RATIO)
             seg_end = time.time()
             seg_time = seg_end - seg_start
 
             if STAGE0_VIS and inst_dir:
                 all_crops_bboxes = [crop["bbox"] for crop in s0_crop_list]
-                visualize_crop(save_dir=inst_dir, gt_bbox=original_bbox, top_q_bboxes=all_crops_bboxes,
+                visualize_crop(save_dir=inst_dir, gt_bbox=scaled_bbox, top_q_bboxes=all_crops_bboxes,
                                 instruction=instruction, filename="s1_all_crop.png", img_path=img_path, click_point=None)
 
             #! ==================================================================
@@ -675,7 +706,7 @@ if __name__ == '__main__':
             s1_top_q_crop_ids, s1_top_q_bboxes, s0_crop_list_out, should_exit_early, early_exit_success = run_selection_pass_with_guiactor(
                 msgs=s1_msgs,
                 crop_list=s0_crop_list,
-                gt_bbox=original_bbox,
+                gt_bbox=scaled_bbox,  # 스케일된 bbox 사용
                 attn_vis_dir=s1_dir or "",
                 original_image=resized_image,
                 img_path=img_path,
@@ -700,8 +731,8 @@ if __name__ == '__main__':
                 stage1_success = False  # Early exit이므로 stage1 성공 여부 미정의
 
             else:  # GT가 안에 들어가는지 체크
-                s1_hit = "✅" if check_gt_in_selected_crops(s1_top_q_bboxes, original_bbox) else "❌"
-                stage1_success = check_gt_in_selected_crops(s1_top_q_bboxes, original_bbox)
+                s1_hit = "✅" if check_gt_in_selected_crops(s1_top_q_bboxes, scaled_bbox) else "❌"
+                stage1_success = check_gt_in_selected_crops(s1_top_q_bboxes, scaled_bbox)
                 if stage1_success:
                     stage1_success_count += 1
 
@@ -740,7 +771,7 @@ if __name__ == '__main__':
                     instruction=instruction,
                     original_image=resized_image,
                     save_dir=s2_dir or "",
-                    gt_bbox=original_bbox,
+                    gt_bbox=scaled_bbox,  # 스케일된 bbox 사용
                     img_path=img_path
                 )
                 s2_inference_end = time.time()
@@ -916,7 +947,7 @@ if __name__ == '__main__':
             }
         }
 
-        with open(os.path.join(save_dir, f"{task}_metrics.json"), "w") as mf:
+        with open(os.path.join(save_dir, f"results_{task}.json"), "w") as mf:
             json.dump(metrics, mf, ensure_ascii=False, indent=4)
 
         # data_source별 메트릭 저장
@@ -942,7 +973,7 @@ if __name__ == '__main__':
                     "avg_peak_memory_gb": round(stats['peak_memory_sum'] / stats['num_action'], 3) if MEMORY_EVAL else None
                 }
         
-        with open(os.path.join(save_dir, f"{task}_data_source_metrics.json"), "w") as dsf:
+        with open(os.path.join(save_dir, f"results_{task}_source.json"), "w") as dsf:
             json.dump(data_source_metrics, dsf, ensure_ascii=False, indent=4)
 
         # 최종 결과 출력
