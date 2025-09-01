@@ -32,8 +32,8 @@ MLLM_PATH = "microsoft/GUI-Actor-3B-Qwen2.5-VL"
 SCREENSPOT_IMGS = "./data/screenspotv2_image"  # input image 경로
 SCREENSPOT_JSON = "./data"  # json파일 경로
 TASKS = ["mobile", "web", "desktop"]
-# SAMPLE_RANGE = slice(None)  #! 샘플 범위 지정 (3번 샘플이면 3,4 / 5~9번 샘플이면 5,10 / 전체 사용이면 None)
-SAMPLE_RANGE = slice(0, 30)
+SAMPLE_RANGE = slice(None)  #! 샘플 범위 지정 (3번 샘플이면 3,4 / 5~9번 샘플이면 5,10 / 전체 사용이면 None)
+# SAMPLE_RANGE = slice(0, 10)
 
 # Visualize & Logging
 STAGE0_VIS = False
@@ -582,7 +582,7 @@ if __name__ == '__main__':
         task_res = []
         num_action = 0
         s0_time_sum = s1_time_sum = s2_time_sum = total_flops = 0.0
-        early_exit_count = early_exit_success_count = final_success_count = 0
+        early_exit_count = early_exit_success_count = final_success_count = stage1_success_count = 0
         peak_memory_sum = 0.0  # 피크 메모리 합계 추가
         
         # data_source별 통계 변수 초기화
@@ -697,9 +697,13 @@ if __name__ == '__main__':
                     early_exit_success_count += 1
                 else:
                     s1_hit = "❌🚀"
+                stage1_success = False  # Early exit이므로 stage1 성공 여부 미정의
 
             else:  # GT가 안에 들어가는지 체크
                 s1_hit = "✅" if check_gt_in_selected_crops(s1_top_q_bboxes, original_bbox) else "❌"
+                stage1_success = check_gt_in_selected_crops(s1_top_q_bboxes, original_bbox)
+                if stage1_success:
+                    stage1_success_count += 1
 
             # 불필요한 딕셔너리 연산 제거 - 결과 저장용도만
             # res_board_dict는 사실상 미사용
@@ -807,6 +811,7 @@ if __name__ == '__main__':
                     'early_exit_count': 0,
                     'early_exit_success_count': 0,
                     'final_success_count': 0,
+                    'stage1_success_count': 0,
                     'peak_memory_sum': 0.0  # 피크 메모리 합계 추가
                 }
             
@@ -823,6 +828,10 @@ if __name__ == '__main__':
                 stats['early_exit_count'] += 1
                 if early_exit_success:
                     stats['early_exit_success_count'] += 1
+            else:
+                # Early exit이 아닐 때만 stage1 성공 카운트
+                if stage1_success:
+                    stats['stage1_success_count'] += 1
             if final_success:
                 stats['final_success_count'] += 1
 
@@ -859,6 +868,7 @@ if __name__ == '__main__':
                 'num_crop': len(s0_crop_list) - 1,
                 'early_exit': should_exit_early,
                 'early_exit_success': early_exit_success,
+                'stage1_success': stage1_success if not should_exit_early else None,
                 's1_hit': s1_hit,
                 's2_hit': final_success,
                 'seg_time': seg_time,
@@ -878,10 +888,11 @@ if __name__ == '__main__':
             json.dump(task_res, f, indent=4, ensure_ascii=False, cls=NpEncoder)
 
         # 최종 성능 메트릭 계산
+        non_early_exit_samples = num_action - early_exit_count
         metrics = {
             "task": task,
             "total_samples": num_action,
-            # "stage1_accuracy": stage1_success_count / num_action * 100,  # 구현해야하는데, 현재 stage1스킵도 있고 early exit도 있어서 애매함
+            "stage1_accuracy": stage1_success_count / non_early_exit_samples * 100 if non_early_exit_samples > 0 else 0,
             "accuracy": final_success_count / num_action * 100,
             "early_exit_rate": early_exit_count / num_action * 100,
             "early_exit_success_rate": early_exit_success_count / early_exit_count * 100 if early_exit_count > 0 else 0,
@@ -912,10 +923,12 @@ if __name__ == '__main__':
         data_source_metrics = {}
         for ds, stats in data_source_stats.items():
             if stats['num_action'] > 0:
+                non_early_exit_samples = stats['num_action'] - stats['early_exit_count']
                 data_source_metrics[ds] = {
                     "task": task,
                     "data_source": ds,
                     "total_samples": stats['num_action'],
+                    "stage1_accuracy": stats['stage1_success_count'] / non_early_exit_samples * 100 if non_early_exit_samples > 0 else 0,
                     "accuracy": stats['final_success_count'] / stats['num_action'] * 100,
                     "early_exit_rate": stats['early_exit_count'] / stats['num_action'] * 100,
                     "early_exit_success_rate": stats['early_exit_success_count'] / stats['early_exit_count'] * 100 if stats['early_exit_count'] > 0 else 0,
@@ -936,6 +949,7 @@ if __name__ == '__main__':
         print("=" * 60)
         print(f"📊 Final Results for {task}:")
         print(f"Total Samples: {num_action}")
+        print(f"Stage1 Accuracy: {metrics['stage1_accuracy']:.2f}%")
         print(f"Accuracy: {metrics['accuracy']:.2f}%")
         print(f"Early Exit Rate: {metrics['early_exit_rate']:.2f}%")
         print(f"Early Exit Success Rate: {metrics['early_exit_success_rate']:.2f}%") 
@@ -948,6 +962,7 @@ if __name__ == '__main__':
         print("\n📊 Results by Data Source:")
         for ds, ds_metrics in data_source_metrics.items():
             memory_str = f", Mem: {ds_metrics['avg_peak_memory_gb']:.3f}GB" if MEMORY_EVAL and ds_metrics['avg_peak_memory_gb'] is not None else ""
-            print(f"  {ds}: {ds_metrics['total_samples']} samples, Acc: {ds_metrics['accuracy']:.2f}%, "
-                  f"Early Exit: {ds_metrics['early_exit_rate']:.2f}%, TFLOPs: {ds_metrics['avg_flops_tflops']:.2f}{memory_str}")
+            print(f"  {ds}: {ds_metrics['total_samples']} samples, S1 Acc: {ds_metrics['stage1_accuracy']:.2f}%, "
+                  f"Acc: {ds_metrics['accuracy']:.2f}%, Early Exit: {ds_metrics['early_exit_rate']:.2f}%, "
+                  f"TFLOPs: {ds_metrics['avg_flops_tflops']:.2f}{memory_str}")
         print("=" * 60)
