@@ -2,24 +2,26 @@
 
 import os
 os.environ["CUDA_DEVICE_ORDER"]="PCI_BUS_ID"
-os.environ["CUDA_VISIBLE_DEVICES"]= "1"  # 몇번 GPU 사용할지 ("0,1", "2" 등)
+os.environ["CUDA_VISIBLE_DEVICES"]= "2"  # 몇번 GPU 사용할지 ("0,1", "2" 등)
 
 #! Hyperparameter =====================================================================================
 
 ATTN_IMPL = "eager"  # attention implement "eager" "sdpa" "flash" "efficient"
-SELECT_THRESHOLD = 0.7  # score >= tau * max_score 인 모든 crop select
-EARLY_EXIT = True
 
 # Image Resize Ratios
 # MAX_PIXELS = None
-# MAX_PIXELS = 1280 * 28 * 28
-MAX_PIXELS = 3211264
-S1_RESIZE_RATIO = 0.4  # Stage 1 crop resize ratio
-S2_RESIZE_RATIO = 0.8  # Stage 2 crop resize ratio
+MAX_PIXELS = 1280 * 28 * 28
+# MAX_PIXELS = 3211264
+S1_RESIZE_RATIO = 0.35  # Stage 1 crop resize ratio
+S2_RESIZE_RATIO = 0.60  # Stage 2 crop resize ratio
 THUMBNAIL_RESIZE_RATIO = 0.10  # Thumbnail resize ratio
 
+SELECT_THRESHOLD = 0.7  # score >= tau * max_score 인 모든 crop select
+EARLY_EXIT = True
+EARLY_EXIT_THRE = 0.6  # 1등 attention * thre > 2등 attention이라면 early exit
+
 is_ee = "ee" if EARLY_EXIT else "not_ee"
-SAVE_DIR = f"./attn_output/" + is_ee + "_" + str(MAX_PIXELS) + "_" + str(S1_RESIZE_RATIO) + "_" + str(S2_RESIZE_RATIO) + "_" + "0828_newcrop"  #! Save Path (특징이 있다면 적어주세요)
+SAVE_DIR = f"./attn_output/" + is_ee + "_" + str(MAX_PIXELS) + "_" + str(S1_RESIZE_RATIO) + "_" + str(S2_RESIZE_RATIO) + "_" + "0901"  #! Save Path (특징이 있다면 적어주세요)
 
 #! Argument ==========================================================================================
 
@@ -30,7 +32,8 @@ MLLM_PATH = "microsoft/GUI-Actor-3B-Qwen2.5-VL"
 SCREENSPOT_IMGS = "./data/screenspotv2_image"  # input image 경로
 SCREENSPOT_JSON = "./data"  # json파일 경로
 TASKS = ["mobile", "web", "desktop"]
-SAMPLE_RANGE = slice(None)  #! 샘플 범위 지정 (3번 샘플이면 3,4 / 5~9번 샘플이면 5,10 / 전체 사용이면 None)
+# SAMPLE_RANGE = slice(None)  #! 샘플 범위 지정 (3번 샘플이면 3,4 / 5~9번 샘플이면 5,10 / 전체 사용이면 None)
+SAMPLE_RANGE = slice(0, 30)
 
 # Visualize & Logging
 STAGE0_VIS = False
@@ -39,6 +42,7 @@ STAGE2_VIS = False
 ITER_LOG = True  # csv, md
 TFOPS_PROFILING = True
 MEMORY_EVAL = True
+MEMORY_VIS = True
 
 # Question
 # QUESTION_TEMPLATE="""Where should you tap to {task_prompt}?"""
@@ -54,7 +58,7 @@ task instruction, a screen observation, guess where should you tap.
 import json
 import re
 import sys
-sys.setrecursionlimit(2000)  # DeepSpeed logging
+sys.setrecursionlimit(3000)  # DeepSpeed logging
 import time
 from copy import deepcopy
 from typing import List
@@ -280,34 +284,119 @@ def get_highest_attention_patch_bbox(image_result: dict) -> list:
     
     return [left, top, right, bottom]
 
+
+def get_highest_attention_patch_info(image_result: dict) -> dict:
+    """
+    per_image 결과에서 어텐션 스코어가 가장 높은 패치와 두 번째로 높은 패치를 찾아
+    해당 패치들의 정규화된 바운딩 박스 좌표와 스코어를 딕셔너리로 반환합니다.
+
+    Args:
+        image_result (dict): prediction_results['per_image'] 리스트의 단일 아이템.
+
+    Returns:
+        dict: 아래와 같은 구조의 딕셔너리
+              {
+                  'highest': {'bbox': [l,t,r,b], 'score': float}, 
+                  'second_highest': {'bbox': [l,t,r,b], 'score': float}
+              }
+    """
+    # 1. 입력 데이터 추출
+    attn_scores = np.array(image_result['attn_scores'][0])
+    n_width = image_result['n_width']
+    n_height = image_result['n_height']
+
+    # 2. 어텐션 스코어를 정렬하여 가장 높은 두 개의 인덱스 찾기
+    sorted_indices = np.argsort(attn_scores)
+    highest_score_idx = sorted_indices[-1]
+    second_highest_score_idx = sorted_indices[-2]
+
+    # 3. 인덱스를 사용하여 실제 스코어 값 가져오기
+    highest_score = attn_scores[highest_score_idx]
+    second_highest_score = attn_scores[second_highest_score_idx]
+
+    # 4. 바운딩 박스 계산을 위한 헬퍼 함수 정의
+    def _calculate_bbox(index: int) -> list:
+        """1차원 인덱스로부터 정규화된 바운딩 박스 좌표를 계산합니다."""
+        patch_y = index // n_width
+        patch_x = index % n_width
+
+        patch_norm_width = 1.0 / n_width
+        patch_norm_height = 1.0 / n_height
+        
+        left = patch_x * patch_norm_width
+        top = patch_y * patch_norm_height
+        right = (patch_x + 1) * patch_norm_width
+        bottom = (patch_y + 1) * patch_norm_height
+        
+        return [left, top, right, bottom]
+
+    # 5. 가장 높은 스코어와 두 번째로 높은 스코어의 바운딩 박스 계산
+    highest_bbox = _calculate_bbox(highest_score_idx)
+    second_highest_bbox = _calculate_bbox(second_highest_score_idx)
+    
+    # 6. 딕셔너리 형태로 결과 반환 (스코어 포함)
+    return {
+        'highest': {
+            'bbox': highest_bbox,
+            'score': float(highest_score) # numpy float을 일반 float으로 변환
+        },
+        'second_highest': {
+            'bbox': second_highest_bbox,
+            'score': float(second_highest_score) # numpy float을 일반 float으로 변환
+        }
+    }
+
 def check_early_exit_condition(top_point, top_crop_id, crop_list, per_image_outputs, gt_bbox, original_image):
     """Early Exit 조건 확인"""
     if top_point is None or top_crop_id == -1:
-        return False, False
+        return False, False, None
     
+    should_exit_early = False
+    early_exit_success = False
+    corrected_point = None
+
     ori_w, ori_h = original_image.size
-    
+
     # 썸네일의 최고 attention patch 찾기
     thumb_res = next((res for res in per_image_outputs if res['index'] == 0), None)
-    thumb_top_patch_bbox = get_highest_attention_patch_bbox(thumb_res)
-    l, t, r, b = thumb_top_patch_bbox
-    denorm_thumb_top_patch_bbox = [l*ori_w, t*ori_h, r*ori_w, b*ori_h]
-    
-    # 좌표 보정
-    top_crop = next((c for c in crop_list if c['id'] == top_crop_id), None)
-    top_crop_bbox = top_crop["bbox"]
-    corrected_point = denormalize_crop_point(
-        point_in_crop=top_point, 
-        crop_size=top_crop['img'].size,
-        crop_bbox=top_crop_bbox
-    )
-    
-    should_exit_early = point_in_bbox(corrected_point, denorm_thumb_top_patch_bbox)
+    # thumb_top_patch_bbox = get_highest_attention_patch_bbox(thumb_res)
+ 
+    top2_patches = get_highest_attention_patch_info(thumb_res)
+    top1 = top2_patches['highest']
+    top2 = top2_patches['second_highest']
 
-    # Early Exit 맞았는가?
-    early_exit_success = point_in_bbox(corrected_point, gt_bbox)
+    top1_score = top1['score']
+    top2_score = top2['score']
+
+    if  EARLY_EXIT_THRE * top1_score > top2_score:  # early exit
+
+        l, t, r, b = top1['bbox']
+        denorm_thumb_top_patch_bbox = [l*ori_w, t*ori_h, r*ori_w, b*ori_h]
+        
+        # 좌표 보정
+        top_crop = next((c for c in crop_list if c['id'] == top_crop_id), None)
+        top_crop_bbox = top_crop["bbox"]
+        corrected_point = denormalize_crop_point(
+            point_in_crop=top_point, 
+            crop_size=top_crop['img'].size,
+            crop_bbox=top_crop_bbox
+        )
+        
+        should_exit_early = point_in_bbox(corrected_point, denorm_thumb_top_patch_bbox)
+
+        # Early Exit 맞았는가?
+        early_exit_success = point_in_bbox(corrected_point, gt_bbox)
+    elif STAGE1_VIS:
+
+        top_crop = next((c for c in crop_list if c['id'] == top_crop_id), None)
+        top_crop_bbox = top_crop["bbox"]
+        corrected_point = denormalize_crop_point(
+            point_in_crop=top_point, 
+            crop_size=top_crop['img'].size,
+            crop_bbox=top_crop_bbox
+        )
     
-    return should_exit_early, early_exit_success
+    return should_exit_early, early_exit_success, corrected_point
 
 def run_selection_pass_with_guiactor(msgs, crop_list, gt_bbox: List, attn_vis_dir: str, original_image, img_path, instruction):
     """Stage 1 inference 및 Early Exit 판단"""
@@ -324,7 +413,7 @@ def run_selection_pass_with_guiactor(msgs, crop_list, gt_bbox: List, attn_vis_di
     
     if EARLY_EXIT:
         top_point, top_crop_id = find_top_crop_for_early_exit(crop_list, per_image_outputs)
-        should_exit_early, early_exit_success = check_early_exit_condition(
+        should_exit_early, early_exit_success, corrected_top_point = check_early_exit_condition(
             top_point, top_crop_id, crop_list, per_image_outputs, gt_bbox, original_image
         )    # Early Exit하면 select_crop 스킵
     if should_exit_early:
@@ -337,7 +426,7 @@ def run_selection_pass_with_guiactor(msgs, crop_list, gt_bbox: List, attn_vis_di
     
     # 시각화 (필요시)
     if STAGE1_VIS and EARLY_EXIT and should_exit_early:
-        _visualize_early_exit_results(crop_list, pred, gt_bbox, attn_vis_dir, instruction, img_path)
+        _visualize_early_exit_results(crop_list, pred, corrected_top_point, gt_bbox, attn_vis_dir, instruction, img_path)
     elif STAGE1_VIS and not should_exit_early:
         _visualize_stage1_results(crop_list, pred, attn_vis_dir, instruction)
     
@@ -465,21 +554,23 @@ if __name__ == '__main__':
         save_dir = f"{SAVE_DIR}_{suffix}"
     os.makedirs(save_dir)
 
-    # 바로바로 log csv, md 저장 어떻게 할지
-    init_iter_logger(  
-        save_dir=save_dir,
-        headers=[  # 순서 그대로 들어감
-            "idx", "crop_time", "num_crop", "early_exit", "num_selected_crop", 
-            "s1_time", "s1_tflops", "s1_hit", "s2_time", "s2_tflops", "s2_hit", 
-            "total_time", "total_flops_tflops", "acc_uptonow", "filename", "instruction"
-        ],
-        write_md=True, use_fsync=True, use_lock=True
-    )
-
-    # warm_up_model(model, tokenizer, processor)
+    warm_up_model(model, tokenizer, processor)
 
     # Process
     for task in TASKS:
+        # 각 task별로 별도의 로그 파일 생성
+        init_iter_logger(  
+            save_dir=save_dir,
+            csv_name=f"iter_log_{task}.csv",
+            md_name=f"iter_log_{task}.md",
+            headers=[  # 순서 그대로 들어감
+                "idx", "crop_time", "num_crop", "early_exit", "num_selected_crop", 
+                "s1_time", "s1_tflops", "s1_hit", "s2_time", "s2_tflops", "s2_hit", 
+                "total_time", "total_flops_tflops", "peak_memory_gb", "acc_uptonow", 
+                "filename", "instruction"
+            ],
+            write_md=True, use_fsync=True, use_lock=True
+        )
         task_res = dict()
         dataset = "screenspot_" + task + "_v2.json"
         screenspot_data = json.load(open(os.path.join(SCREENSPOT_JSON, dataset), 'r'))
@@ -492,9 +583,14 @@ if __name__ == '__main__':
         num_action = 0
         s0_time_sum = s1_time_sum = s2_time_sum = total_flops = 0.0
         early_exit_count = early_exit_success_count = final_success_count = 0
+        peak_memory_sum = 0.0  # 피크 메모리 합계 추가
         
         # data_source별 통계 변수 초기화
         data_source_stats = {}
+
+        if MEMORY_VIS:
+            memory_dir = os.path.join(save_dir, "gpu_usage", task)
+            os.makedirs(memory_dir, exist_ok=True)
 
         for j, item in tqdm(enumerate(screenspot_data)):
 
@@ -527,7 +623,7 @@ if __name__ == '__main__':
             
             w_orig, h_orig = original_image.size
             if MAX_PIXELS is not None and w_orig * h_orig > MAX_PIXELS:
-                original_image, w_resized, h_resized = resize_image(original_image)
+                resized_image, w_resized, h_resized = resize_image(original_image)
                 
             # data_source 정보 추출 (없으면 "unknown"으로 기본값 설정)
             data_source = item.get("data_source", "unknown")
@@ -545,9 +641,6 @@ if __name__ == '__main__':
                 os.makedirs(s2_dir, exist_ok=True)
             else:
                 inst_dir = s1_dir = s2_dir = None
-            if MEMORY_EVAL:
-                memory_dir = os.path.join(save_dir, "gpu_usage")
-                os.makedirs(memory_dir, exist_ok=True)
 
             #! ==================================================================
             #! Stage 0 | Segmentation
@@ -555,8 +648,7 @@ if __name__ == '__main__':
 
             seg_start = time.time()
             crop_list = crop_img(
-                image_path=img_path,
-                save_visualization=False
+                orig_img = original_image
             )
             s0_crop_list = resize_crop_list(crop_list=crop_list, ratio=S1_RESIZE_RATIO)
             seg_end = time.time()
@@ -585,7 +677,7 @@ if __name__ == '__main__':
                 crop_list=s0_crop_list,
                 gt_bbox=original_bbox,
                 attn_vis_dir=s1_dir or "",
-                original_image=original_image,
+                original_image=resized_image,
                 img_path=img_path,
                 instruction=instruction
             )
@@ -642,7 +734,7 @@ if __name__ == '__main__':
                 final_success = run_refinement_pass_with_guiactor(
                     crop_list=s2_input_crops,
                     instruction=instruction,
-                    original_image=original_image,
+                    original_image=resized_image,
                     save_dir=s2_dir or "",
                     gt_bbox=original_bbox,
                     img_path=img_path
@@ -681,21 +773,28 @@ if __name__ == '__main__':
             #! ==================================================================
 
             if MEMORY_EVAL:
-                time.sleep(0.2)
+                time.sleep(0.1)
                 stop_flag = True
                 monitor_thread.join()
 
-                plt.figure(figsize=(10, 4))
-                plt.plot(time_log, mem_log)
-                plt.xlabel("Time (s)")
-                plt.ylabel("GPU Memory Allocated (GB)")
-                plt.title("GPU Memory Usage Over Time")
-                plt.grid(True)
-                plt.show()
-                plt.savefig(f"{memory_dir}/{num_action}_{filename}")
+                # 피크 메모리 계산 (GB 단위, 소수점 3자리)
+                peak_memory = max(mem_log) if mem_log else 0.0
+                peak_memory_gb = round(peak_memory, 3)
+
+                if MEMORY_VIS:
+                    plt.figure(figsize=(10, 4))
+                    plt.plot(time_log, mem_log)
+                    plt.xlabel("Time (s)")
+                    plt.ylabel("GPU Memory Allocated (GB)")
+                    plt.title("GPU Memory Usage Over Time")
+                    plt.grid(True)
+                    plt.savefig(f"{memory_dir}/{num_action}_{filename}")
+                    plt.close()  # 메모리 누수 방지를 위해 close 추가
 
             s2_time_sum += s2_time
             final_success_count += final_success
+            if MEMORY_EVAL:
+                peak_memory_sum += peak_memory_gb
 
             # data_source별 통계 업데이트
             if data_source not in data_source_stats:
@@ -707,7 +806,8 @@ if __name__ == '__main__':
                     'total_flops': 0.0,
                     'early_exit_count': 0,
                     'early_exit_success_count': 0,
-                    'final_success_count': 0
+                    'final_success_count': 0,
+                    'peak_memory_sum': 0.0  # 피크 메모리 합계 추가
                 }
             
             stats = data_source_stats[data_source]
@@ -717,6 +817,8 @@ if __name__ == '__main__':
             stats['s2_time_sum'] += s2_time
             if TFOPS_PROFILING:
                 stats['total_flops'] += total_flops_this
+            if MEMORY_EVAL:
+                stats['peak_memory_sum'] += peak_memory_gb
             if should_exit_early:
                 stats['early_exit_count'] += 1
                 if early_exit_success:
@@ -744,6 +846,7 @@ if __name__ == '__main__':
                 s2_hit="✅" if final_success else "❌",
                 total_time=f"{total_time:.3f}",
                 total_flops_tflops=f"{total_flops_this:.2f}",
+                peak_memory_gb=f"{peak_memory_gb:.3f}" if MEMORY_EVAL else "N/A",
                 acc_uptonow=f"{up2now_gt_score:.2f}"
             )
 
@@ -764,7 +867,8 @@ if __name__ == '__main__':
                 'total_time': total_time,
                 's1_tflops': s1_tflops,
                 's2_tflops': s2_tflops if not should_exit_early else 0,
-                'total_flops': total_flops_this
+                'total_flops': total_flops_this,
+                'peak_memory_gb': peak_memory_gb if MEMORY_EVAL else None
             }
             task_res.append(item_res)
 
@@ -788,10 +892,12 @@ if __name__ == '__main__':
                 "total": (s0_time_sum + s1_time_sum + s2_time_sum) / num_action
             },
             "avg_flops_tflops": total_flops / num_action,
+            "avg_peak_memory_gb": round(peak_memory_sum / num_action, 3) if MEMORY_EVAL else None,
             "hyperparameters": {
                 "max_pixels": MAX_PIXELS,
                 "select_threshold": SELECT_THRESHOLD,
                 "early_exit": EARLY_EXIT,
+                "early_exit_thre": EARLY_EXIT_THRE,
                 "s1_resize_ratio": S1_RESIZE_RATIO,
                 "s2_resize_ratio": S2_RESIZE_RATIO,
                 "thumbnail_resize_ratio" : THUMBNAIL_RESIZE_RATIO,
@@ -820,6 +926,7 @@ if __name__ == '__main__':
                         "total": (stats['s0_time_sum'] + stats['s1_time_sum'] + stats['s2_time_sum']) / stats['num_action']
                     },
                     "avg_flops_tflops": stats['total_flops'] / stats['num_action'],
+                    "avg_peak_memory_gb": round(stats['peak_memory_sum'] / stats['num_action'], 3) if MEMORY_EVAL else None
                 }
         
         with open(os.path.join(save_dir, f"{task}_data_source_metrics.json"), "w") as dsf:
@@ -834,10 +941,13 @@ if __name__ == '__main__':
         print(f"Early Exit Success Rate: {metrics['early_exit_success_rate']:.2f}%") 
         print(f"Avg Times: Seg {metrics['avg_times']['segmentation']:.3f}s, S1 {metrics['avg_times']['stage1']:.3f}s, S2 {metrics['avg_times']['stage2']:.3f}s, Total {metrics['avg_times']['total']:.3f}s")
         print(f"Avg FLOPs: {metrics['avg_flops_tflops']:.2f} TFLOPs")
+        if MEMORY_EVAL and metrics['avg_peak_memory_gb'] is not None:
+            print(f"Avg Peak Memory: {metrics['avg_peak_memory_gb']:.3f} GB")
         
         # data_source별 결과 출력
         print("\n📊 Results by Data Source:")
         for ds, ds_metrics in data_source_metrics.items():
+            memory_str = f", Mem: {ds_metrics['avg_peak_memory_gb']:.3f}GB" if MEMORY_EVAL and ds_metrics['avg_peak_memory_gb'] is not None else ""
             print(f"  {ds}: {ds_metrics['total_samples']} samples, Acc: {ds_metrics['accuracy']:.2f}%, "
-                  f"Early Exit: {ds_metrics['early_exit_rate']:.2f}%, TFLOPs: {ds_metrics['avg_flops_tflops']:.2f}")
+                  f"Early Exit: {ds_metrics['early_exit_rate']:.2f}%, TFLOPs: {ds_metrics['avg_flops_tflops']:.2f}{memory_str}")
         print("=" * 60)

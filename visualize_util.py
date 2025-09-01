@@ -516,15 +516,15 @@ def visualize_aggregated_attention(
 
     return bool(is_grounding_success)
 
-
-def _visualize_early_exit_results(crop_list, pred, gt_bbox, attn_vis_dir, instruction, img_path):
+def _visualize_early_exit_results(crop_list, pred, top_point, gt_bbox, attn_vis_dir, instruction, img_path):
     """Early Exit 시각화"""
     s1_att_vis_path = attn_vis_dir + "/output.png"
     visualize_results(crop_list, pred, instruction=instruction, save_path=s1_att_vis_path)
     
     # 임시로 빈 리스트로 처리 (Early Exit이므로 crop selection 없음)
     visualize_crop(save_dir=attn_vis_dir, gt_bbox=gt_bbox, 
-                   top_q_bboxes=[], instruction=instruction, filename="ee_gt_vis.png", img_path=img_path)
+                   top_q_bboxes=[], instruction=instruction, filename="ee_gt_vis.png", img_path=img_path,
+                    click_point=top_point)
 
 
 def _visualize_stage1_results(crop_list, pred, attn_vis_dir, instruction):
