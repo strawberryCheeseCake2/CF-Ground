@@ -5,6 +5,7 @@ import argparse
 os.environ["CUDA_DEVICE_ORDER"]="PCI_BUS_ID"
 os.environ["CUDA_VISIBLE_DEVICES"]= "2"  # 몇번 GPU 사용할지 ("0,1", "2" 등)
 
+# Argument parsing - 기본값은 기존 설정 유지
 parser = argparse.ArgumentParser()
 parser.add_argument('--no_early_exit', action='store_true', help='Disable early exit')
 parser.add_argument('--max_pixels', type=int, help='Maximum pixels for image resize')
@@ -39,6 +40,7 @@ SEED = 0
 
 # Dataset & Model
 MLLM_PATH = "microsoft/GUI-Actor-3B-Qwen2.5-VL"
+MLLM_PATH = "/data/mingyu/CF-Ground/guiactor_proj/checkpoints/qwen25vl_warmup_2/checkpoint-56000"
 SCREENSPOT_IMGS = "./data/screenspotv2_image"  # input image 경로
 SCREENSPOT_JSON = "./data"  # json파일 경로
 TASKS = ["mobile", "web", "desktop"]
@@ -538,7 +540,9 @@ if __name__ == '__main__':
 
     # Model Import (NVIDIA CUDA)
     model = Qwen2_5_VLForConditionalGenerationWithPointer.from_pretrained(
-        MLLM_PATH, torch_dtype="auto", attn_implementation=ATTN_IMPL,
+        MLLM_PATH,
+        torch_dtype="auto",
+        attn_implementation=ATTN_IMPL,
         device_map="balanced",  # NVIDIA GPU
         # max_memory=max_memory, 
         low_cpu_mem_usage=True
@@ -670,7 +674,7 @@ if __name__ == '__main__':
             seg_start = time.time()
 
             # resize 하지 않은 원본의 화질을 기준으로 crop 횟수 정하기
-            if orig_h < 960:  # 저화질이나 가로화면 -> 2등분
+            if orig_h < 1000:  # 저화질이나 가로화면 -> 2등분
                 h_cuts = 1
                 h_tolerance = 0.20
             elif orig_h < 1440:  # 중간화질 -> 3등분

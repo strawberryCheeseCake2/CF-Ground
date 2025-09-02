@@ -108,7 +108,7 @@ def crop_img(orig_img:Image.Image, h_cuts:int=None, h_tolerance:int=None, output
     orig_w, orig_h = orig_img.size
     #! 높이의 pixel에 따라서 나누는 횟수 지정
     if h_cuts is None:
-        if orig_h < 1000:  # 저화질이나 가로화면 -> 2등분
+        if orig_h < 960:  # 저화질이나 가로화면 -> 2등분
             h_cuts = 1
             h_tolerance = 0.20
         elif orig_h < 1440:  # 중간화질 -> 3등분
