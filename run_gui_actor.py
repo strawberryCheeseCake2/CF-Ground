@@ -1,9 +1,12 @@
 # run_gui_actor.py
+import setproctitle
+setproctitle.setproctitle('CF_ground_gui_actor')
+
 
 import os
 import argparse
 os.environ["CUDA_DEVICE_ORDER"]="PCI_BUS_ID"
-os.environ["CUDA_VISIBLE_DEVICES"]= "2"  # 몇번 GPU 사용할지 ("0,1", "2" 등)
+os.environ["CUDA_VISIBLE_DEVICES"]= "3"  # 몇번 GPU 사용할지 ("0,1", "2" 등)
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--no_early_exit', action='store_true', help='Disable early exit')
@@ -31,7 +34,7 @@ EARLY_EXIT_THRE = 0.6  # 1등 attention * thre > 2등 attention이라면 early e
 
 is_ee = "ee" if EARLY_EXIT else "not_ee"
 SAVE_DIR = f"./attn_output/" + is_ee + "_" + str(MAX_PIXELS) + "_" + \
-    str(S1_RESIZE_RATIO) + "_" + str(S2_RESIZE_RATIO) + "_" + "0902"  #! Save Path (특징이 있다면 적어주세요)
+    str(S1_RESIZE_RATIO) + "_" + str(S2_RESIZE_RATIO) + "_" + "MaxPixelProcessor"  #! Save Path (특징이 있다면 적어주세요)
 
 #! Argument ==========================================================================================
 
@@ -89,7 +92,7 @@ if TFOPS_PROFILING:
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from iter_logger import init_iter_logger, append_iter_log  # log csv 기록 파일
 from gui_actor.modeling_qwen25vl import Qwen2_5_VLForConditionalGenerationWithPointer
-from gui_actor.multi_image_inference import inference
+from gui_actor.multi_image_inference import multi_image_inference
 from visualize_util import get_highest_attention_patch_bbox, _visualize_early_exit_results, _visualize_stage1_results, _visualize_stage2_results, visualize_crop
 from crop import crop_img  #! 어떤 crop 파일 사용?
 
@@ -134,7 +137,7 @@ def warm_up_model(model, tokenizer, processor):
         with torch.no_grad():
             if TFOPS_PROFILING:
                 prof.start_profile()
-            _ = inference(dummy_msgs, model, tokenizer, processor, use_placeholder=True, topk=3)
+            _ = multi_image_inference(dummy_msgs, model, tokenizer, processor, use_placeholder=True, topk=3)
             if TFOPS_PROFILING:
                 prof.stop_profile()
                 prof.get_total_flops()
@@ -412,7 +415,7 @@ def run_selection_pass_with_guiactor(msgs, crop_list, gt_bbox: List, attn_vis_di
     """Stage 1 inference 및 Early Exit 판단"""
     
     # Inference 수행
-    pred = inference(msgs, model, tokenizer, processor, use_placeholder=True, topk=3)
+    pred = multi_image_inference(msgs, model, tokenizer, processor, use_placeholder=True, topk=3)
     per_image_outputs = pred["per_image"]
     
     # Attention scores 계산
@@ -481,7 +484,7 @@ def run_refinement_pass_with_guiactor(crop_list: List, instruction: str, origina
     s2_msgs = create_guiactor_msgs(crop_list=s2_resized_crop_list, instruction=instruction)
 
     # Inference
-    pred = inference(s2_msgs, model, tokenizer, processor, use_placeholder=True, topk=3)
+    pred = multi_image_inference(s2_msgs, model, tokenizer, processor, use_placeholder=True, topk=3)
     per_image_outputs = pred["per_image"]
     
     # 최고 점수 crop 찾기
@@ -551,7 +554,7 @@ if __name__ == '__main__':
     #     low_cpu_mem_usage=False
     # )
     tokenizer = AutoTokenizer.from_pretrained(MLLM_PATH)
-    processor = AutoProcessor.from_pretrained(MLLM_PATH)
+    processor = AutoProcessor.from_pretrained(MLLM_PATH, max_pixels=MAX_PIXELS)
 
     if TFOPS_PROFILING:
         prof = FlopsProfiler(model)
@@ -634,17 +637,17 @@ if __name__ == '__main__':
             orig_w, orig_h = original_image.size
             
             # 이미지 리사이즈 처리
-            if MAX_PIXELS is not None and orig_w * orig_h > MAX_PIXELS:
-                resized_image, w_resized, h_resized = resize_image(original_image)
-                # bbox도 리사이즈 비율에 맞춰 스케일링
-                resize_ratio = (w_resized * h_resized) ** 0.5 / (orig_w * orig_h) ** 0.5
-                scaled_bbox = [int(coord * resize_ratio) for coord in original_bbox]
-            else:
-                # 리사이즈가 필요없는 경우 원본 그대로 사용
-                resized_image = original_image
-                w_resized, h_resized = orig_w, orig_h
-                resize_ratio = 1.0
-                scaled_bbox = original_bbox
+            # if MAX_PIXELS is not None and orig_w * orig_h > MAX_PIXELS:
+            #     resized_image, w_resized, h_resized = resize_image(original_image)
+            #     # bbox도 리사이즈 비율에 맞춰 스케일링
+            #     resize_ratio = (w_resized * h_resized) ** 0.5 / (orig_w * orig_h) ** 0.5
+            #     scaled_bbox = [int(coord * resize_ratio) for coord in original_bbox]
+            # else:
+            # 리사이즈 X
+            resized_image = original_image
+            w_resized, h_resized = orig_w, orig_h
+            resize_ratio = 1.0
+            scaled_bbox = original_bbox
                 
             # data_source 정보 추출 (없으면 "unknown"으로 기본값 설정)
             data_source = item.get("data_source", "unknown")

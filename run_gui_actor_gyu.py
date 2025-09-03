@@ -3,9 +3,15 @@
 import os
 import argparse
 os.environ["CUDA_DEVICE_ORDER"]="PCI_BUS_ID"
-os.environ["CUDA_VISIBLE_DEVICES"]= "2"  # 몇번 GPU 사용할지 ("0,1", "2" 등)
+os.environ["CUDA_VISIBLE_DEVICES"]= "0"  # 몇번 GPU 사용할지 ("0,1", "2" 등)
 
-# Argument parsing - 기본값은 기존 설정 유지
+max_memory = {
+    0: "40GiB",
+    # 1: "75GiB",
+    # 2: "75GiB",
+    "cpu": "120GiB",  # 남는 건 CPU 오프로딩xs
+}
+
 parser = argparse.ArgumentParser()
 parser.add_argument('--no_early_exit', action='store_true', help='Disable early exit')
 parser.add_argument('--max_pixels', type=int, help='Maximum pixels for image resize')
@@ -18,21 +24,21 @@ ATTN_IMPL = "eager"  # attention implement "eager" "sdpa" "flash" "efficient"
 # Image Resize Ratios
 # MAX_PIXELS = None
 # MAX_PIXELS = 1280 * 28 * 28
-# MAX_PIXELS = 3211264
-MAX_PIXELS = args.max_pixels if args.max_pixels else None
+MAX_PIXELS = 3211264
+# MAX_PIXELS = args.max_pixels if args.max_pixels else None
 S1_RESIZE_RATIO = 0.35  # Stage 1 crop resize ratio
-S2_RESIZE_RATIO = 0.60  # Stage 2 crop resize ratio
+S2_RESIZE_RATIO = 1.00  # Stage 2 crop resize ratio
 THUMBNAIL_RESIZE_RATIO = 0.10  # Thumbnail resize ratio
 
 SELECT_THRESHOLD = 0.7  # score >= tau * max_score 인 모든 crop select
 # EARLY_EXIT 설정: --no_early_exit이면 False, 기본값 True
 
-EARLY_EXIT = False if args.no_early_exit else True
+EARLY_EXIT = False
 EARLY_EXIT_THRE = 0.6  # 1등 attention * thre > 2등 attention이라면 early exit
 
 is_ee = "ee" if EARLY_EXIT else "not_ee"
 SAVE_DIR = f"./attn_output/" + is_ee + "_" + str(MAX_PIXELS) + "_" + \
-    str(S1_RESIZE_RATIO) + "_" + str(S2_RESIZE_RATIO) + "_" + "0902"  #! Save Path (특징이 있다면 적어주세요)
+    str(S1_RESIZE_RATIO) + "_" + str(S2_RESIZE_RATIO) + "_" + "0903_gyu_s2_100_vis"  #! Save Path (특징이 있다면 적어주세요)
 
 #! Argument ==========================================================================================
 
@@ -40,17 +46,17 @@ SEED = 0
 
 # Dataset & Model
 MLLM_PATH = "microsoft/GUI-Actor-3B-Qwen2.5-VL"
-MLLM_PATH = "/data/mingyu/CF-Ground/guiactor_proj/checkpoints/qwen25vl_warmup_2/checkpoint-56000"
 SCREENSPOT_IMGS = "./data/screenspotv2_image"  # input image 경로
 SCREENSPOT_JSON = "./data"  # json파일 경로
 TASKS = ["mobile", "web", "desktop"]
+# TASKS = ["web",]
 SAMPLE_RANGE = slice(None)  #! 샘플 범위 지정 (3번 샘플이면 3,4 / 5~9번 샘플이면 5,10 / 전체 사용이면 None)
 # SAMPLE_RANGE = slice(0, 3)
 
 # Visualize & Logging
-STAGE0_VIS = False
-STAGE1_VIS = False
-STAGE2_VIS = False
+STAGE0_VIS = True
+STAGE1_VIS = True
+STAGE2_VIS = True
 ITER_LOG = True  # csv, md
 TFOPS_PROFILING = True
 MEMORY_EVAL = True
@@ -70,7 +76,7 @@ task instruction, a screen observation, guess where should you tap.
 import json
 import re
 import sys
-sys.setrecursionlimit(3000)  # DeepSpeed logging
+sys.setrecursionlimit(10000)  # DeepSpeed logging
 import time
 from copy import deepcopy
 from typing import List
@@ -540,11 +546,9 @@ if __name__ == '__main__':
 
     # Model Import (NVIDIA CUDA)
     model = Qwen2_5_VLForConditionalGenerationWithPointer.from_pretrained(
-        MLLM_PATH,
-        torch_dtype="auto",
-        attn_implementation=ATTN_IMPL,
+        MLLM_PATH, torch_dtype="auto", attn_implementation=ATTN_IMPL,
         device_map="balanced",  # NVIDIA GPU
-        # max_memory=max_memory, 
+        max_memory=max_memory, 
         low_cpu_mem_usage=True
     )
     # Model Import (Mac)
@@ -637,14 +641,14 @@ if __name__ == '__main__':
 
             orig_w, orig_h = original_image.size
             
-            # # 이미지 리사이즈 처리
+            # 이미지 리사이즈 처리
             # if MAX_PIXELS is not None and orig_w * orig_h > MAX_PIXELS:
             #     resized_image, w_resized, h_resized = resize_image(original_image)
             #     # bbox도 리사이즈 비율에 맞춰 스케일링
             #     resize_ratio = (w_resized * h_resized) ** 0.5 / (orig_w * orig_h) ** 0.5
             #     scaled_bbox = [int(coord * resize_ratio) for coord in original_bbox]
             # else:
-            # 리사이즈가 필요없는 경우 원본 그대로 사용
+                # 리사이즈가 필요없는 경우 원본 그대로 사용
             resized_image = original_image
             w_resized, h_resized = orig_w, orig_h
             resize_ratio = 1.0

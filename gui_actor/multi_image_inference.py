@@ -182,11 +182,17 @@ def get_prediction_region_point(attn_scores, n_width, n_height, top_n=30, activa
 
 # ... (기존 import 및 ForceFollowTokensLogitsProcessor, get_prediction_region_point 함수는 그대로 사용) ...
 
-def inference(conversation, model, tokenizer, data_processor, logits_processor=None, use_placeholder=False, topk=5):
+def multi_image_inference(conversation, model, tokenizer, data_processor, logits_processor=None, use_placeholder=False, topk=5):
     """
     여러 이미지가 포함된 대화를 처리하고, 각 이미지별로 grounding 결과를 반환합니다.
     """
-    # ... (logits_processor 초기화 로직은 동일) ...
+    if logits_processor is None:
+        logits_processor = ForceFollowTokensLogitsProcessor(
+            token_a_id=tokenizer.encode(DEFAULT_POINTER_PAD_TOKEN)[0],
+            forced_sequence=[
+                tokenizer.encode(DEFAULT_POINTER_END_TOKEN)[0]
+            ]
+        )
     
     assiatant_starter = "" if not use_placeholder else "<|im_start|>assistant<|recipient|>os\npyautogui.click(<|pointer_start|><|pointer_pad|><|pointer_end|>)"
 
@@ -210,7 +216,7 @@ def inference(conversation, model, tokenizer, data_processor, logits_processor=N
     # --- 2. 모델 생성 (기존과 동일) ---
     results = model.generate(**inputs,
                             max_new_tokens=2048 if not use_placeholder else 1,
-                            # logits_processor=... # 필요시 추가
+                            logits_processor=LogitsProcessorList([logits_processor]),
                             return_dict_in_generate=True,
                             output_hidden_states=True
                             )

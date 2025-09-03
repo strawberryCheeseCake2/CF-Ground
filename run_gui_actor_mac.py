@@ -88,7 +88,7 @@ if TFOPS_PROFILING:
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from iter_logger import init_iter_logger, append_iter_log  # log csv 기록 파일
 from gui_actor.modeling_qwen25vl import Qwen2_5_VLForConditionalGenerationWithPointer
-from gui_actor.multi_image_inference import inference
+from gui_actor.multi_image_inference import multi_image_inference
 from visualize_util import get_highest_attention_patch_bbox, _visualize_early_exit_results, _visualize_stage1_results, _visualize_stage2_results, visualize_crop
 from crop import crop_img  #! 어떤 crop 파일 사용?
 
@@ -133,7 +133,7 @@ def warm_up_model(model, tokenizer, processor):
         with torch.no_grad():
             if TFOPS_PROFILING:
                 prof.start_profile()
-            _ = inference(dummy_msgs, model, tokenizer, processor, use_placeholder=True, topk=3)
+            _ = multi_image_inference(dummy_msgs, model, tokenizer, processor, use_placeholder=True, topk=3)
             if TFOPS_PROFILING:
                 prof.stop_profile()
                 prof.get_total_flops()
@@ -411,7 +411,7 @@ def run_selection_pass_with_guiactor(msgs, crop_list, gt_bbox: List, attn_vis_di
     """Stage 1 inference 및 Early Exit 판단"""
     
     # Inference 수행
-    pred = inference(msgs, model, tokenizer, processor, use_placeholder=True, topk=3)
+    pred = multi_image_inference(msgs, model, tokenizer, processor, use_placeholder=True, topk=3)
     per_image_outputs = pred["per_image"]
     
     # Attention scores 계산
@@ -480,7 +480,7 @@ def run_refinement_pass_with_guiactor(crop_list: List, instruction: str, origina
     s2_msgs = create_guiactor_msgs(crop_list=s2_resized_crop_list, instruction=instruction)
 
     # Inference
-    pred = inference(s2_msgs, model, tokenizer, processor, use_placeholder=True, topk=3)
+    pred = multi_image_inference(s2_msgs, model, tokenizer, processor, use_placeholder=True, topk=3)
     per_image_outputs = pred["per_image"]
     
     # 최고 점수 crop 찾기
