@@ -27,6 +27,13 @@ pip install -r requirements_gui_agent.txt
 pip install -r requirements_gui_agent_mac.txt
 ```
 
-## :minidisc: Data Preparation
-1. Download the processed data from [here](https://huggingface.co/datasets/OS-Copilot/ScreenSpot-v2/tree/main).
-2. Move files at ./data folder
+## :minidisc: Data Download
+
+```bash
+cd data
+wget https://huggingface.co/datasets/OS-Copilot/ScreenSpot-v2/resolve/main/screenspot_mobile_v2.json
+wget https://huggingface.co/datasets/OS-Copilot/ScreenSpot-v2/resolve/main/screenspot_web_v2.json
+wget https://huggingface.co/datasets/OS-Copilot/ScreenSpot-v2/resolve/main/screenspot_desktop_v2.json
+wget https://huggingface.co/datasets/OS-Copilot/ScreenSpot-v2/resolve/main/screenspotv2_image.zip
+unzip screenspotv2_image.zip
+```
