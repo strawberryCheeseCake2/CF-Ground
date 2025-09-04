@@ -1,6 +1,6 @@
 # run_gui_actor.py
-import setproctitle
-setproctitle.setproctitle('CF_ground_gui_actor')
+# import setproctitle
+# setproctitle.setproctitle('CF_ground_gui_actor')
 
 
 import os
@@ -20,10 +20,10 @@ ATTN_IMPL = "eager"  # attention implement "eager" "sdpa" "flash" "efficient"
 # Image Resize Ratios
 # MAX_PIXELS = None
 # MAX_PIXELS = 1280 * 28 * 28
-# MAX_PIXELS = 3211264
-MAX_PIXELS = args.max_pixels if args.max_pixels else None
+MAX_PIXELS = 3211264
+# MAX_PIXELS = args.max_pixels if args.max_pixels else None
 S1_RESIZE_RATIO = 0.35  # Stage 1 crop resize ratio
-S2_RESIZE_RATIO = 0.60  # Stage 2 crop resize ratio
+S2_RESIZE_RATIO = 1.00  # Stage 2 crop resize ratio
 THUMBNAIL_RESIZE_RATIO = 0.10  # Thumbnail resize ratio
 
 SELECT_THRESHOLD = 0.7  # score >= tau * max_score 인 모든 crop select
@@ -56,14 +56,6 @@ ITER_LOG = True  # csv, md
 TFOPS_PROFILING = True
 MEMORY_EVAL = True
 MEMORY_VIS = True
-
-# Question
-# QUESTION_TEMPLATE="""Where should you tap to {task_prompt}?"""
-QUESTION_TEMPLATE="""
-You are an assistant trained to navigate the android phone. Given a
-task instruction, a screen observation, guess where should you tap.
-# Intruction
-{task_prompt}"""
 
 #! ==================================================================================================
 
