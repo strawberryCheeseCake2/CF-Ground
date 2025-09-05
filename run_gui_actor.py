@@ -33,8 +33,7 @@ EARLY_EXIT = False if args.no_early_exit else True
 EARLY_EXIT_THRE = 0.6  # 1등 attention * thre > 2등 attention이라면 early exit
 
 is_ee = "ee" if EARLY_EXIT else "not_ee"
-SAVE_DIR = f"./attn_output/" + is_ee + "_" + str(MAX_PIXELS) + "_" + \
-    str(S1_RESIZE_RATIO) + "_" + str(S2_RESIZE_RATIO) + "_" + "MaxPixelProcessor"  #! Save Path (특징이 있다면 적어주세요)
+SAVE_DIR = f"./attn_output/" + is_ee + "MaxPixelProcessor"  #! Save Path (특징이 있다면 적어주세요)
 
 #! Argument ==========================================================================================
 

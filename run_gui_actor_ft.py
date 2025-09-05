@@ -18,10 +18,10 @@ ATTN_IMPL = "eager"  # attention implement "eager" "sdpa" "flash" "efficient"
 # Image Resize Ratios
 # MAX_PIXELS = None
 # MAX_PIXELS = 1280 * 28 * 28
-# MAX_PIXELS = 3211264
-MAX_PIXELS = args.max_pixels if args.max_pixels else None
+MAX_PIXELS = 3211264
+# MAX_PIXELS = args.max_pixels if args.max_pixels else None
 S1_RESIZE_RATIO = 0.35  # Stage 1 crop resize ratio
-S2_RESIZE_RATIO = 0.60  # Stage 2 crop resize ratio
+S2_RESIZE_RATIO = 1.00  # Stage 2 crop resize ratio
 THUMBNAIL_RESIZE_RATIO = 0.10  # Thumbnail resize ratio
 
 SELECT_THRESHOLD = 0.7  # score >= tau * max_score 인 모든 crop select
@@ -32,7 +32,7 @@ EARLY_EXIT_THRE = 0.6  # 1등 attention * thre > 2등 attention이라면 early e
 
 is_ee = "ee" if EARLY_EXIT else "not_ee"
 SAVE_DIR = f"./attn_output/" + is_ee + "_" + str(MAX_PIXELS) + "_" + \
-    str(S1_RESIZE_RATIO) + "_" + str(S2_RESIZE_RATIO) + "_" + "0902"  #! Save Path (특징이 있다면 적어주세요)
+    str(S1_RESIZE_RATIO) + "_" + str(S2_RESIZE_RATIO) + "_" + "0905_ft_vis"  #! Save Path (특징이 있다면 적어주세요)
 
 #! Argument ==========================================================================================
 
@@ -40,7 +40,7 @@ SEED = 0
 
 # Dataset & Model
 MLLM_PATH = "microsoft/GUI-Actor-3B-Qwen2.5-VL"
-MLLM_PATH = "/data/mingyu/CF-Ground/guiactor_proj/checkpoints/qwen25vl_warmup_2/checkpoint-56000"
+MLLM_PATH = "/data/mingyu/CF-Ground/guiactor_proj/checkpoints/qwen25vl_warmup_2/checkpoint-128000"
 SCREENSPOT_IMGS = "./data/screenspotv2_image"  # input image 경로
 SCREENSPOT_JSON = "./data"  # json파일 경로
 TASKS = ["mobile", "web", "desktop"]
@@ -48,9 +48,9 @@ SAMPLE_RANGE = slice(None)  #! 샘플 범위 지정 (3번 샘플이면 3,4 / 5~9
 # SAMPLE_RANGE = slice(0, 3)
 
 # Visualize & Logging
-STAGE0_VIS = False
-STAGE1_VIS = False
-STAGE2_VIS = False
+STAGE0_VIS = True
+STAGE1_VIS = True
+STAGE2_VIS = True
 ITER_LOG = True  # csv, md
 TFOPS_PROFILING = True
 MEMORY_EVAL = True

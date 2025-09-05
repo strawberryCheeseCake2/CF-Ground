@@ -23,8 +23,8 @@ ATTN_IMPL = "eager"  # attention implement "eager" "sdpa" "flash" "efficient"
 
 # Image Resize Ratios
 # MAX_PIXELS = None
-# MAX_PIXELS = 1280 * 28 * 28
-MAX_PIXELS = 3211264
+MAX_PIXELS = 1280 * 28 * 28
+# MAX_PIXELS = 3211264
 # MAX_PIXELS = args.max_pixels if args.max_pixels else None
 S1_RESIZE_RATIO = 0.35  # Stage 1 crop resize ratio
 S2_RESIZE_RATIO = 1.00  # Stage 2 crop resize ratio
@@ -38,8 +38,9 @@ EARLY_EXIT_THRE = 0.6  # 1등 attention * thre > 2등 attention이라면 early e
 
 is_ee = "ee" if EARLY_EXIT else "not_ee"
 SAVE_DIR = f"./attn_output/" + is_ee + "_" + str(MAX_PIXELS) + "_" + \
-    str(S1_RESIZE_RATIO) + "_" + str(S2_RESIZE_RATIO) + "_" + "0903_gyu_s2_100_vis"  #! Save Path (특징이 있다면 적어주세요)
+    str(S1_RESIZE_RATIO) + "_" + str(S2_RESIZE_RATIO) + "_" + "0905_gyu_gk20_vis"  #! Save Path (특징이 있다면 적어주세요)
 
+SAVE_DIR = f"./attn_output/0905som_1280"
 #! Argument ==========================================================================================
 
 SEED = 0
@@ -79,14 +80,14 @@ import sys
 sys.setrecursionlimit(10000)  # DeepSpeed logging
 import time
 from copy import deepcopy
-from typing import List
+from typing import List, Tuple
 from math import sqrt
 import matplotlib.pyplot as plt
 import threading
 
 # Third-Party Libraries
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageDraw
 from tqdm import tqdm
 import torch
 from transformers import AutoProcessor, AutoTokenizer, set_seed
@@ -232,6 +233,18 @@ def check_gt_in_selected_crops(top_q_bboxes: List, gt_bbox: List):
         inter_bottom = min(ab, bb)
         return (inter_right > inter_left) and (inter_bottom > inter_top)
     return any(rect_intersects(gt_bbox, bbox) for bbox in top_q_bboxes)
+
+
+def check_gt_center_point_in_selected_crops(top_q_bboxes: List, gt_bbox: List):
+    gt_left, gt_top, gt_right, gt_bottom = gt_bbox
+    gt_center = [(gt_left + gt_right) / 2, (gt_top + gt_bottom) / 2]
+
+    for bbox in top_q_bboxes:
+        is_gt_in_crop = point_in_bbox(gt_center, bbox)
+        
+        if is_gt_in_crop: return True
+
+    return False
 
 def compute_attention_scores(crop_list, per_image_outputs):
     """각 crop의 attention score 계산"""
@@ -538,6 +551,96 @@ def monitor_memory(interval=0.1):
         time_log.append(now)
         time.sleep(interval)
 
+def apply_som(crop_list: List, thumbnail_resize_ratio: float, vis_dir=None):
+
+
+    def _color_for_id(idx: int) -> Tuple[int, int, int]:
+        """
+        crop id(>0)를 안정적으로 색상에 매핑.
+        필요한 만큼 순환 사용.
+        """
+        palette = [
+            (230, 25, 75),   # red
+            (60, 180, 75),   # green
+            (0, 130, 200),   # blue
+            (245, 130, 48),  # orange
+            (145, 30, 180),  # purple
+            (70, 240, 240),  # cyan
+        ]
+        # id는 1부터 시작한다고 가정 (0은 썸네일)
+        return palette[(idx - 1) % len(palette)]
+
+    def _clamp_bbox(b: List, W: int, H: int) -> List:
+        """이미지 경계 안으로 bbox를 정수로 보정"""
+        l = max(0, min(int(round(b[0])), W - 1))
+        t = max(0, min(int(round(b[1])), H - 1))
+        r = max(0, min(int(round(b[2])), W - 1))
+        btm = max(0, min(int(round(b[3])), H - 1))
+        if r < l:
+            l, r = r, l
+        if btm < t:
+            t, btm = btm, t
+        return l, t, r, btm
+
+    # 썸네일에 bbox 그리기
+    # 이때 sub crop있는 거만 그리기
+
+    # subcrop 돌면서 썸네일에 그리기
+    # 
+
+    # sub crop에 bbox 그리기
+
+    thumb_item = next((it for it in crop_list if it.get("id") == 0), None)
+
+     # 썸네일에 bbox 그리기 (sub crop 있는 것만)
+    thumb_img = thumb_item["resized_img"]
+    # 복사해서 덮어쓰고 싶으면 아래 한 줄 활성화:
+    # thumb_img = thumb_img.copy()
+
+    W, H = thumb_img.size
+    draw_thumb = ImageDraw.Draw(thumb_img)
+    thumb_line_w = max(2, int(round(min(W, H) * 0.006)))  # 썸네일에서는 조금 더 두껍게(약 0.6%)
+
+    for it in crop_list:
+        cid = it.get("id")
+        if cid is None or cid == 0:
+            continue  # 썸네일 자신은 스킵
+        bbox = it.get("bbox")
+        if bbox is None:
+            continue
+
+        color = _color_for_id(cid)
+        s = thumbnail_resize_ratio
+        scaled = (bbox[0] * s, bbox[1] * s, bbox[2] * s, bbox[3] * s)
+        l, t, r, btm = _clamp_bbox(scaled, W, H)
+        draw_thumb.rectangle([l, t, r, btm], outline=color, width=thumb_line_w)
+
+    # 수정된 썸네일 반영
+    thumb_item["resized_img"] = thumb_img
+
+    # 각 sub crop 이미지에 동일 색상 테두리 그리기
+    for it in crop_list:
+        cid = it.get("id")
+        if cid is None or cid == 0 or it.get("img") is None:
+            continue
+        subimg = it["resized_img"]
+        # 복사해서 덮어쓰고 싶으면 아래 한 줄 활성화:
+        # subimg = subimg.copy()
+        w, h = subimg.size
+        crop_line_w = max(2, int(round(min(w, h) * 0.015)))  # 약 1.5%
+        draw = ImageDraw.Draw(subimg)
+        draw.rectangle([0, 0, w - 1, h - 1], outline=_color_for_id(cid), width=crop_line_w)
+        it["resized_img"] = subimg
+
+    if vis_dir is not None:
+        os.makedirs(vis_dir, exist_ok=True)
+        for c in crop_list:
+            c['resized_img'].save(f"{vis_dir}/crop_{c['id']}.png")
+        
+
+
+    return crop_list
+
 #! ================================================================================================
 
 if __name__ == '__main__':
@@ -710,6 +813,12 @@ if __name__ == '__main__':
 
             s1_msgs = create_guiactor_msgs(crop_list=s0_crop_list, instruction=instruction)
 
+            s0_crop_list = apply_som(
+                crop_list=s0_crop_list, 
+                thumbnail_resize_ratio=THUMBNAIL_RESIZE_RATIO, 
+                vis_dir=s1_dir + "/som"
+                )
+            
             s1_top_q_crop_ids, s1_top_q_bboxes, s0_crop_list_out, should_exit_early, early_exit_success = run_selection_pass_with_guiactor(
                 msgs=s1_msgs,
                 crop_list=s0_crop_list,
@@ -738,8 +847,9 @@ if __name__ == '__main__':
                 stage1_success = False  # Early exit이므로 stage1 성공 여부 미정의
 
             else:  # GT가 안에 들어가는지 체크
-                s1_hit = "✅" if check_gt_in_selected_crops(s1_top_q_bboxes, scaled_bbox) else "❌"
-                stage1_success = check_gt_in_selected_crops(s1_top_q_bboxes, scaled_bbox)
+                # s1_hit = "✅" if check_gt_in_selected_crops(s1_top_q_bboxes, scaled_bbox) else "❌"
+                s1_hit = "✅" if check_gt_center_point_in_selected_crops(s1_top_q_bboxes, scaled_bbox) else "❌"
+                stage1_success = check_gt_center_point_in_selected_crops(s1_top_q_bboxes, scaled_bbox)
                 if stage1_success:
                     stage1_success_count += 1
 
@@ -772,6 +882,13 @@ if __name__ == '__main__':
                 if TFOPS_PROFILING:
                     prof.start_profile()
                 s2_inference_start = time.time()
+
+                s2_input_crops = apply_som(
+                    crop_list=s2_resized_crops, 
+                    thumbnail_resize_ratio=THUMBNAIL_RESIZE_RATIO, 
+                    vis_dir=s2_dir + "/som"
+                )
+                
 
                 final_success = run_refinement_pass_with_guiactor(
                     crop_list=s2_input_crops,
