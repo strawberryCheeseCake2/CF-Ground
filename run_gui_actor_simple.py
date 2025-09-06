@@ -6,7 +6,7 @@
 import os
 import argparse
 os.environ["CUDA_DEVICE_ORDER"]="PCI_BUS_ID"
-os.environ["CUDA_VISIBLE_DEVICES"]= "1"  # 몇번 GPU 사용할지 ("0,1", "2" 등)
+os.environ["CUDA_VISIBLE_DEVICES"]= "3"  # 몇번 GPU 사용할지 ("0,1", "2" 등)
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--no_early_exit', action='store_true', help='Disable early exit')
@@ -33,7 +33,7 @@ SELECT_THRESHOLD = 0.7  # score >= tau * max_score 인 모든 crop select
 EARLY_EXIT = False
 EARLY_EXIT_THRE = 0.6  # 1등 attention * thre > 2등 attention이라면 early exit
 
-memo = "original" #! 특징
+memo = "simple" #! 특징
 
 #! Argument ==========================================================================================
 

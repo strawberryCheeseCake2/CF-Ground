@@ -3,10 +3,10 @@
 import os
 import argparse
 os.environ["CUDA_DEVICE_ORDER"]="PCI_BUS_ID"
-os.environ["CUDA_VISIBLE_DEVICES"]= "0"  # 몇번 GPU 사용할지 ("0,1", "2" 등)
+os.environ["CUDA_VISIBLE_DEVICES"]= "1"  # 몇번 GPU 사용할지 ("0,1", "2" 등)
 
 max_memory = {
-    0: "40GiB",
+    0: "70GiB",
     # 1: "75GiB",
     # 2: "75GiB",
     "cpu": "120GiB",  # 남는 건 CPU 오프로딩xs

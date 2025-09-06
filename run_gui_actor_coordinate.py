@@ -1,6 +1,5 @@
-# run_gui_actor.py
-# import setproctitle
-# setproctitle.setproctitle('CF_ground_gui_actor')
+# run_gui_actor_coordinate.py
+# 좌표를 주는 방식
 
 
 import os
@@ -33,7 +32,7 @@ SELECT_THRESHOLD = 0.7  # score >= tau * max_score 인 모든 crop select
 EARLY_EXIT = False
 EARLY_EXIT_THRE = 0.6  # 1등 attention * thre > 2등 attention이라면 early exit
 
-memo = "original" #! 특징
+memo = "coordinate" #! 특징
 
 #! Argument ==========================================================================================
 
@@ -61,7 +60,6 @@ is_ee = "ee" if EARLY_EXIT else "not_ee"
 SAVE_DIR = f"./attn_output/" + is_ee + "_" + memo
 
 #! ==================================================================================================
-
 # Standard Library
 import json
 import re
@@ -139,15 +137,20 @@ def warm_up_model(model, tokenizer, processor):
     print("✅ Warm-up complete!")
 
 
-def create_guiactor_msgs(crop_list, instruction):
+def create_guiactor_msgs(crop_list, instruction, coordinate_info=None):
     user_content = []
     for crop in crop_list:
         img = crop["resized_img"]
         user_content.append({"type": "image", "image": img})
 
+    # instruction에 좌표 정보 추가
+    final_instruction = instruction
+    if coordinate_info:
+        final_instruction += f"\n\nCoordinate Information: {coordinate_info}"
+
     user_content.append({
         "type": "text",
-        "text": instruction,
+        "text": final_instruction,
     })
     conversation = [
         {
@@ -160,7 +163,8 @@ def create_guiactor_msgs(crop_list, instruction):
                         "your task is to locate the screen element that corresponds to the instruction. "
                         "You should output a PyAutoGUI action that performs a click on the correct position. "
                         "To indicate the click location, we will use some special tokens, which is used to refer to a visual patch later. "
-                        "For example, you can output: pyautogui.click(<your_special_token_here>)."
+                        "For example, you can output: pyautogui.click(<your_special_token_here>). "
+                        "When coordinate information is provided, use it to understand which regions of the thumbnail correspond to the selected crop areas."
                     ),
                 }
             ]
@@ -171,6 +175,57 @@ def create_guiactor_msgs(crop_list, instruction):
         },
     ]
     return conversation
+
+def calculate_coordinate_info_for_crops(crop_list, original_image_size, thumbnail_resize_ratio):
+    """
+    썸네일에서 선택된 crop들의 좌표 범위를 계산하여 coordinate_info 문자열 생성
+    
+    Args:
+        crop_list: stage2에 사용될 crop 리스트 (썸네일 포함)
+        original_image_size: 원본 이미지 크기 (width, height)
+        thumbnail_resize_ratio: 썸네일 리사이즈 비율
+    
+    Returns:
+        coordinate_info: 좌표 정보를 담은 문자열
+    """
+    orig_w, orig_h = original_image_size
+    
+    # 썸네일 크기 계산
+    thumbnail_w = int(orig_w * thumbnail_resize_ratio)
+    thumbnail_h = int(orig_h * thumbnail_resize_ratio)
+    
+    # 썸네일이 아닌 crop들의 bbox 정보 수집
+    selected_crops = [crop for crop in crop_list if crop.get("id") != 0]
+    
+    if not selected_crops:
+        return "No specific regions selected."
+    
+    coordinate_info_parts = []
+    coordinate_info_parts.append(f"The first image is a thumbnail (resized to {thumbnail_w}x{thumbnail_h}) showing the entire screen.")
+    coordinate_info_parts.append("The subsequent images show detailed crops from the following regions of the thumbnail:")
+    
+    for i, crop in enumerate(selected_crops, 1):
+        bbox = crop.get("bbox")
+        if bbox:
+            left, top, right, bottom = bbox
+            
+            # 썸네일에서의 좌표로 변환
+            thumb_left = int(left * thumbnail_resize_ratio)
+            thumb_top = int(top * thumbnail_resize_ratio)
+            thumb_right = int(right * thumbnail_resize_ratio)
+            thumb_bottom = int(bottom * thumbnail_resize_ratio)
+            
+            # 원본 크기 정보
+            width_orig = right - left
+            height_orig = bottom - top
+            
+            coordinate_info_parts.append(
+                f"Image {i+1} corresponds to the region at thumbnail coordinates "
+                f"({thumb_left}, {thumb_top}) to ({thumb_right}, {thumb_bottom}), "
+                f"which represents a {width_orig}x{height_orig} area in the original screen."
+            )
+    
+    return " ".join(coordinate_info_parts)
 
 def resize_crop_list(crop_list: List, ratio: float):
     stage_crop_list = []
@@ -476,7 +531,15 @@ def run_refinement_pass_with_guiactor(crop_list: List, instruction: str, origina
     
     # Stage 2 용 리사이즈
     s2_resized_crop_list = resize_crop_list(crop_list=crop_list, ratio=S2_RESIZE_RATIO)
-    s2_msgs = create_guiactor_msgs(crop_list=s2_resized_crop_list, instruction=instruction)
+    
+    # 좌표 정보 계산
+    coordinate_info = calculate_coordinate_info_for_crops(
+        crop_list=s2_resized_crop_list,
+        original_image_size=original_image.size,
+        thumbnail_resize_ratio=THUMBNAIL_RESIZE_RATIO
+    )
+    
+    s2_msgs = create_guiactor_msgs(crop_list=s2_resized_crop_list, instruction=instruction, coordinate_info=coordinate_info)
 
     # Inference
     pred = multi_image_inference(s2_msgs, model, tokenizer, processor, use_placeholder=True, topk=3)
@@ -757,7 +820,7 @@ if __name__ == '__main__':
 
                 # Calculate Stage 2 FLOPs
                 s2_resized_crops = resize_crop_list(crop_list=s2_input_crops, ratio=S2_RESIZE_RATIO)
-                s2_msgs = create_guiactor_msgs(crop_list=s2_resized_crops, instruction=instruction)
+                # s2_msgs는 run_refinement_pass_with_guiactor 내에서 coordinate_info와 함께 생성됨
 
                 if TFOPS_PROFILING:
                     prof.start_profile()
