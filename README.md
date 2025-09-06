@@ -27,7 +27,7 @@ pip install -r requirements_gui_agent.txt
 pip install -r requirements_gui_agent_mac.txt
 ```
 
-## :minidisc: Data Download
+## :minidisc: ScreenSpot_v2 Dataset Download
 
 ```bash
 cd data
@@ -36,4 +36,6 @@ wget https://huggingface.co/datasets/OS-Copilot/ScreenSpot-v2/resolve/main/scree
 wget https://huggingface.co/datasets/OS-Copilot/ScreenSpot-v2/resolve/main/screenspot_desktop_v2.json
 wget https://huggingface.co/datasets/OS-Copilot/ScreenSpot-v2/resolve/main/screenspotv2_image.zip
 unzip screenspotv2_image.zip
+rm screenspotv2_image.zip
+cd ..
 ```
