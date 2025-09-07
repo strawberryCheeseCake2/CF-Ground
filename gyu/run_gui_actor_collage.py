@@ -3,7 +3,7 @@
 import os
 import argparse
 os.environ["CUDA_DEVICE_ORDER"]="PCI_BUS_ID"
-os.environ["CUDA_VISIBLE_DEVICES"]= "2"  # 몇번 GPU 사용할지 ("0,1", "2" 등)
+os.environ["CUDA_VISIBLE_DEVICES"]= "0"  # 몇번 GPU 사용할지 ("0,1", "2" 등)
 
 max_memory = {
     0: "70GiB",
@@ -34,17 +34,17 @@ SELECT_THRESHOLD = 0.7  # score >= tau * max_score 인 모든 crop select
 # EARLY_EXIT 설정: --no_early_exit이면 False, 기본값 True
 
 EARLY_EXIT = False
-EARLY_EXIT_THRE = 0.6  # 1등 attention * thre > 2등 attention이라면 early exit
+EARLY_EXIT_THRE = 0.7  # 1등 attention * thre > 2등 attention이라면 early exit # 다른 결과 다 0.6으로 한듯
 
-SET_OF_MARK = False
-COLLAGE = True
+SET_OF_MARK = True
+COLLAGE = False
 
 is_ee = "ee" if EARLY_EXIT else "not_ee"
 SAVE_DIR = f"./attn_output/" + is_ee + "_" + str(MAX_PIXELS) + "_" + \
     str(S1_RESIZE_RATIO) + "_" + str(S2_RESIZE_RATIO) + "_" + "0905_gyu_gk20_vis"  #! Save Path (특징이 있다면 적어주세요)
 
 # SAVE_DIR = f"gyu/attn_output/0907_collage_nosom"
-SAVE_DIR = f"gyu/attn_output/0907_collage_premp"
+SAVE_DIR = f"gyu/attn_output/0907_onlysom"
 #! Argument ==========================================================================================
 
 SEED = 0
@@ -851,8 +851,8 @@ if __name__ == '__main__':
     #     low_cpu_mem_usage=False
     # )
     tokenizer = AutoTokenizer.from_pretrained(MLLM_PATH)
-    # processor = AutoProcessor.from_pretrained(MLLM_PATH, max_pixels=MAX_PIXELS)
-    processor = AutoProcessor.from_pretrained(MLLM_PATH)
+    processor = AutoProcessor.from_pretrained(MLLM_PATH, max_pixels=MAX_PIXELS)
+    # processor = AutoProcessor.from_pretrained(MLLM_PATH)
 
     if TFOPS_PROFILING:
         prof = FlopsProfiler(model)
@@ -935,17 +935,17 @@ if __name__ == '__main__':
             orig_w, orig_h = original_image.size
             
             # 이미지 리사이즈 처리
-            if MAX_PIXELS is not None and orig_w * orig_h > MAX_PIXELS:
-                resized_image, w_resized, h_resized = resize_image(original_image)
-                # bbox도 리사이즈 비율에 맞춰 스케일링
-                resize_ratio = (w_resized * h_resized) ** 0.5 / (orig_w * orig_h) ** 0.5
-                scaled_bbox = [int(coord * resize_ratio) for coord in original_bbox]
-            else:
+            # if MAX_PIXELS is not None and orig_w * orig_h > MAX_PIXELS:
+            #     resized_image, w_resized, h_resized = resize_image(original_image)
+            #     # bbox도 리사이즈 비율에 맞춰 스케일링
+            #     resize_ratio = (w_resized * h_resized) ** 0.5 / (orig_w * orig_h) ** 0.5
+            #     scaled_bbox = [int(coord * resize_ratio) for coord in original_bbox]
+            # else:
                 # 리사이즈가 필요없는 경우 원본 그대로 사용
-                resized_image = original_image
-                w_resized, h_resized = orig_w, orig_h
-                resize_ratio = 1.0
-                scaled_bbox = original_bbox
+            resized_image = original_image
+            w_resized, h_resized = orig_w, orig_h
+            resize_ratio = 1.0
+            scaled_bbox = original_bbox
                     
             # data_source 정보 추출 (없으면 "unknown"으로 기본값 설정)
             data_source = item.get("data_source", "unknown")

@@ -34,7 +34,7 @@ EARLY_EXIT_THRE = 0.6  # 1등 attention * thre > 2등 attention이라면 early e
 CROP_EDGE_THRESHOLD = 50  # 끝부분으로 볼 pixel 거리 (attention 고점이 이 거리 내에 있으면 확장 고려)
 CROP_EXTENSION_PIXELS = 100  # 확장할 pixel 수
 
-memo = "simple extension 50 100" #! 특징
+memo = "extension + collage" #! 특징
 
 #! Argument ==========================================================================================
 
@@ -46,16 +46,16 @@ SCREENSPOT_IMGS = "./data/screenspotv2_image"  # input image 경로
 SCREENSPOT_JSON = "./data"  # json파일 경로
 TASKS = ["mobile", "web", "desktop"]
 SAMPLE_RANGE = slice(None)  #! 샘플 범위 지정 (3번 샘플이면 3,4 / 5~9번 샘플이면 5,10 / 전체 사용이면 None)
-# SAMPLE_RANGE = slice(0, 3)
+# SAMPLE_RANGE = slice(484,501)
 
 # Visualize & Logging
-STAGE0_VIS = False
-STAGE1_VIS = False
-STAGE2_VIS = False
+STAGE0_VIS = True
+STAGE1_VIS = True
+STAGE2_VIS = True
 ITER_LOG = True  # csv, md
 TFOPS_PROFILING = True
 MEMORY_EVAL = True
-MEMORY_VIS = False
+MEMORY_VIS = True
 
 # Save Path
 is_ee = "ee" if EARLY_EXIT else "not_ee"
@@ -175,27 +175,6 @@ def create_vanilla_conversation(image, instruction):
     ]
     return conversation
 
-def run_vanilla_inference(image, instruction, gt_bbox):
-    """전체 이미지에 대한 vanilla inference 수행"""
-    conversation = create_vanilla_conversation(image, instruction)
-    
-    try:
-        pred = inference(conversation, model, tokenizer, processor, use_placeholder=True, topk=3)
-        
-        # 최고 점수 포인트 추출
-        if pred["topk_points"] and len(pred["topk_points"]) > 0:
-            px, py = pred["topk_points"][0]
-            w, h = image.size
-            corrected_point = [px * w, py * h]
-            is_success = point_in_bbox(corrected_point, gt_bbox)
-            return is_success
-        else:
-            return False
-            
-    except Exception as e:
-        print(f"Vanilla inference error: {e}")
-        return False
-
 def create_guiactor_msgs(crop_list, instruction):
     user_content = []
     for crop in crop_list:
@@ -290,19 +269,6 @@ def check_gt_in_selected_y_ranges(y_ranges: List, gt_bbox: List, image_width: in
             return True
     
     return False
-
-def check_gt_in_selected_crops(top_q_bboxes: List, gt_bbox: List):
-    def rect_intersects(a, b):
-        # a, b: [left, top, right, bottom]
-        al, at, ar, ab = a
-        bl, bt, br, bb = b
-        # 교집합 영역 계산
-        inter_left = max(al, bl)
-        inter_top = max(at, bt)
-        inter_right = min(ar, br)
-        inter_bottom = min(ab, bb)
-        return (inter_right > inter_left) and (inter_bottom > inter_top)
-    return any(rect_intersects(gt_bbox, bbox) for bbox in top_q_bboxes)
 
 def compute_attention_scores(crop_list, per_image_outputs):
     """각 crop의 attention score 계산"""
@@ -538,6 +504,8 @@ def extend_y_ranges_with_attention(y_ranges, attention_points, original_height):
     for y_top, y_bottom in y_ranges:
         new_top = y_top
         new_bottom = y_bottom
+        extended_upward = False
+        extended_downward = False
         
         # 이 범위 내의 attention 고점들 찾기
         for point in attention_points:
@@ -545,17 +513,19 @@ def extend_y_ranges_with_attention(y_ranges, attention_points, original_height):
             
             # 이 포인트가 현재 범위에 속하는지 확인
             if y_top <= point_y <= y_bottom:
-                # 위쪽 경계 근처인지 확인
-                if point_y - y_top <= CROP_EDGE_THRESHOLD:
+                # 위쪽 경계 근처인지 확인 (아직 확장하지 않았을 때만)
+                if not extended_upward and point_y - y_top <= CROP_EDGE_THRESHOLD:
                     if y_top > 0:  # 확장 가능한 경우
                         new_top = max(0, y_top - CROP_EXTENSION_PIXELS)
                         print(f"🔄 Y-range extended upward: {y_top} -> {new_top} (attention at {point_y:.0f})")
+                        extended_upward = True
                 
-                # 아래쪽 경계 근처인지 확인  
-                if y_bottom - point_y <= CROP_EDGE_THRESHOLD:
+                # 아래쪽 경계 근처인지 확인 (아직 확장하지 않았을 때만)
+                if not extended_downward and y_bottom - point_y <= CROP_EDGE_THRESHOLD:
                     if y_bottom < original_height:  # 확장 가능한 경우
                         new_bottom = min(original_height, y_bottom + CROP_EXTENSION_PIXELS)
                         print(f"🔄 Y-range extended downward: {y_bottom} -> {new_bottom} (attention at {point_y:.0f})")
+                        extended_downward = True
         
         extended_ranges.append((int(new_top), int(new_bottom)))
     
@@ -563,7 +533,7 @@ def extend_y_ranges_with_attention(y_ranges, attention_points, original_height):
 
 def create_stage2_crops_from_y_ranges(y_ranges, original_image):
     """
-    Y 범위들로부터 Stage2용 crop들을 생성
+    Y 범위들로부터 Stage2용 crop들을 생성 (크롭된 이미지들을 이어붙임)
     """
     if not y_ranges:
         return []
@@ -578,16 +548,38 @@ def create_stage2_crops_from_y_ranges(y_ranges, original_image):
         "bbox": [0, 0, orig_w, orig_h]
     })
     
-    # Y 범위별로 crop 생성
-    for i, (y_top, y_bottom) in enumerate(y_ranges):
-        bbox = [0, y_top, orig_w, y_bottom]
-        crop_img = original_image.crop((0, y_top, orig_w, y_bottom))
+    # Y 범위들에서 각각 크롭을 추출하고 세로로 이어붙이기
+    if y_ranges:
+        crop_images = []
+        total_height = 0
         
-        s2_crops.append({
-            "img": crop_img,
-            "id": i + 1,
-            "bbox": bbox
-        })
+        # 각 Y 범위에서 크롭 추출
+        for y_top, y_bottom in y_ranges:
+            crop_img = original_image.crop((0, y_top, orig_w, y_bottom))
+            crop_images.append(crop_img)
+            total_height += (y_bottom - y_top)
+        
+        # 크롭들을 세로로 이어붙이기
+        if crop_images:
+            # 새 이미지 생성 (가로는 원본과 같고, 세로는 모든 크롭 높이의 합)
+            collage_img = Image.new('RGB', (orig_w, total_height))
+            
+            current_y = 0
+            for crop_img in crop_images:
+                collage_img.paste(crop_img, (0, current_y))
+                current_y += crop_img.height
+            
+            # 합쳐진 이미지의 bbox는 전체 범위로 설정 (좌표 변환용)
+            min_y = min(y_top for y_top, y_bottom in y_ranges)
+            max_y = max(y_bottom for y_top, y_bottom in y_ranges)
+            
+            s2_crops.append({
+                "img": collage_img,
+                "id": 1,
+                "bbox": [0, min_y, orig_w, max_y],  # 원본 이미지에서의 좌표
+                "y_ranges": y_ranges,  # 좌표 변환을 위해 원본 범위 정보 저장
+                "is_collage": True  # 합쳐진 이미지임을 표시
+            })
     
     return s2_crops
 
@@ -692,13 +684,7 @@ def run_selection_pass_with_guiactor(msgs, crop_list, gt_bbox: List, attn_vis_di
             selected_y_ranges = extend_y_ranges_with_attention(initial_y_ranges, attention_points, orig_h)
             use_vanilla = False
     
-    # 시각화 (필요시)
-    if STAGE1_VIS and EARLY_EXIT and should_exit_early:
-        _visualize_early_exit_results(crop_list, pred, corrected_top_point, gt_bbox, attn_vis_dir, instruction, img_path)
-    elif STAGE1_VIS and not should_exit_early:
-        _visualize_stage1_results(crop_list, pred, attn_vis_dir, instruction)
-    
-    return selected_y_ranges, should_exit_early, early_exit_success, use_vanilla, num_selected_crops
+    return selected_y_ranges, should_exit_early, early_exit_success, use_vanilla, num_selected_crops, pred, crop_list, corrected_top_point if EARLY_EXIT and should_exit_early else None
 
 def denormalize_crop_point(point_in_crop, crop_size, crop_bbox):
     crop_w, crop_h = crop_size
@@ -707,6 +693,37 @@ def denormalize_crop_point(point_in_crop, crop_size, crop_bbox):
     corrected_point = [scaled_point[0] + crop_bbox[0], scaled_point[1] + crop_bbox[1]] 
 
     return corrected_point
+
+def denormalize_collage_point(point_in_collage, collage_crop, original_image_size):
+    """
+    합쳐진 이미지(collage)에서의 정규화된 좌표를 원본 이미지 좌표로 변환
+    """
+    collage_w, collage_h = collage_crop["img"].size
+    orig_w, orig_h = original_image_size
+    y_ranges = collage_crop["y_ranges"]
+    
+    # collage 내에서의 픽셀 좌표
+    collage_x = point_in_collage[0] * collage_w
+    collage_y = point_in_collage[1] * collage_h
+    
+    # 어느 Y 범위에 속하는지 찾기
+    current_y = 0
+    for y_top, y_bottom in y_ranges:
+        range_height = y_bottom - y_top
+        
+        if current_y <= collage_y < current_y + range_height:
+            # 이 범위 내에 있음
+            relative_y = collage_y - current_y  # 해당 범위 내에서의 상대 Y 좌표
+            original_y = y_top + relative_y     # 원본 이미지에서의 절대 Y 좌표
+            original_x = collage_x              # X는 그대로
+            
+            return [original_x, original_y]
+        
+        current_y += range_height
+    
+    # 마지막 범위를 벗어난 경우 (예외 처리)
+    last_y_top, last_y_bottom = y_ranges[-1]
+    return [collage_x, last_y_bottom]
 
 def find_best_crop_point(crop_list, per_image_outputs):
     """가장 높은 점수의 crop과 point 찾기"""
@@ -736,6 +753,7 @@ def run_refinement_pass_with_guiactor(crop_list: List, instruction: str, origina
     
     # Stage 2 용 리사이즈
     s2_resized_crop_list = resize_crop_list(crop_list=crop_list, ratio=S2_RESIZE_RATIO)
+
     s2_msgs = create_guiactor_msgs(crop_list=s2_resized_crop_list, instruction=instruction)
 
     # Inference
@@ -752,22 +770,27 @@ def run_refinement_pass_with_guiactor(crop_list: List, instruction: str, origina
     top_crop = next((c for c in crop_list if c['id'] == top_crop_id), None)
     if top_crop is None:
         return False
-        
-    top_crop_bbox = top_crop["bbox"]
     
-    # 좌표 보정 및 성공 여부 판단
-    corrected_point = denormalize_crop_point(
-        point_in_crop=top_point, 
-        crop_size=top_crop['img'].size, 
-        crop_bbox=top_crop_bbox
-    )
+    # 좌표 보정 - collage인지 일반 crop인지 확인
+    if top_crop.get("is_collage", False):
+        # 합쳐진 이미지(collage)인 경우
+        corrected_point = denormalize_collage_point(
+            point_in_collage=top_point,
+            collage_crop=top_crop,
+            original_image_size=original_image.size
+        )
+    else:
+        # 일반 crop인 경우
+        top_crop_bbox = top_crop["bbox"]
+        corrected_point = denormalize_crop_point(
+            point_in_crop=top_point, 
+            crop_size=top_crop['img'].size, 
+            crop_bbox=top_crop_bbox
+        )
+    
     is_success = point_in_bbox(corrected_point, gt_bbox)
-
-    # 시각화 (필요시)
-    if STAGE2_VIS:
-        _visualize_stage2_results(save_dir, s2_resized_crop_list, pred, gt_bbox, corrected_point, instruction, img_path)
         
-    return is_success
+    return is_success, pred, s2_resized_crop_list, corrected_point
 
 def point_in_bbox(point, bbox):
     """
@@ -942,11 +965,6 @@ if __name__ == '__main__':
             seg_end = time.time()
             seg_time = seg_end - seg_start
 
-            if STAGE0_VIS and inst_dir:
-                all_crops_bboxes = [crop["bbox"] for crop in s0_crop_list]
-                visualize_crop(save_dir=inst_dir, gt_bbox=scaled_bbox, top_q_bboxes=all_crops_bboxes,
-                                instruction=instruction, filename="s1_all_crop.png", img_path=img_path, click_point=None)
-
             #! ==================================================================
             #! Stage 1 | Find Top Q + Inference
             #! ==================================================================
@@ -960,7 +978,7 @@ if __name__ == '__main__':
 
             s1_msgs = create_guiactor_msgs(crop_list=s0_crop_list, instruction=instruction)
 
-            selected_y_ranges, should_exit_early, early_exit_success, use_vanilla, num_selected_crops = run_selection_pass_with_guiactor(
+            selected_y_ranges, should_exit_early, early_exit_success, use_vanilla, num_selected_crops, s1_pred, s1_crop_list, s1_corrected_top_point = run_selection_pass_with_guiactor(
                 msgs=s1_msgs,
                 crop_list=s0_crop_list,
                 gt_bbox=scaled_bbox,  # 스케일된 bbox 사용
@@ -1008,17 +1026,29 @@ if __name__ == '__main__':
             
             # Early Exit
             s2_tflops = 0.0
+            s2_pred = s2_resized_crop_list = s2_corrected_point = None  # 시각화용 변수 초기화
             if should_exit_early:
                 final_success = early_exit_success
                 s2_time = 0.0
                 s2_tflops = 0.0
             elif use_vanilla:
-                # Vanilla inference 사용 (모든 크롭 선택됨)
+                # Vanilla inference 사용 (모든 크롭 선택됨) - 전체 이미지로 단일 inference
                 if TFOPS_PROFILING:
                     prof.start_profile()
                 s2_inference_start = time.time()
                 
-                final_success = run_vanilla_inference(resized_image, instruction, scaled_bbox)
+                # 단일 이미지 conversation 생성 및 inference
+                vanilla_conversation = create_vanilla_conversation(resized_image, instruction)
+                pred = inference(vanilla_conversation, model, tokenizer, processor, use_placeholder=True, topk=3)
+                
+                # 최고 점수 위치 찾기
+                if pred["topk_points"] and len(pred["topk_points"]) > 0:
+                    top_point = pred["topk_points"][0]
+                    w, h = resized_image.size
+                    corrected_point = [top_point[0] * w, top_point[1] * h]
+                    final_success = point_in_bbox(corrected_point, scaled_bbox)
+                else:
+                    final_success = False
                 
                 s2_inference_end = time.time()
                 s2_time = s2_inference_end - s2_inference_start
@@ -1026,19 +1056,18 @@ if __name__ == '__main__':
                     prof.stop_profile()
                     s2_tflops = prof.get_total_flops()
                     s2_tflops /= 1e12
+                
+                # 시각화용 변수 초기화 (vanilla는 시각화 없음)
+                s2_pred = s2_resized_crop_list = s2_corrected_point = None
             else:
-                # Y 범위들로부터 Stage2용 crop 생성
+                # Y 범위들로부터 Stage2용 crop 생성 (합쳐진 형태)
                 s2_input_crops = create_stage2_crops_from_y_ranges(selected_y_ranges, resized_image)
-
-                # Calculate Stage 2 FLOPs
-                s2_resized_crops = resize_crop_list(crop_list=s2_input_crops, ratio=S2_RESIZE_RATIO)
-                s2_msgs = create_guiactor_msgs(crop_list=s2_resized_crops, instruction=instruction)
 
                 if TFOPS_PROFILING:
                     prof.start_profile()
                 s2_inference_start = time.time()
 
-                final_success = run_refinement_pass_with_guiactor(
+                final_success, s2_pred, s2_resized_crop_list, s2_corrected_point = run_refinement_pass_with_guiactor(
                     crop_list=s2_input_crops,
                     instruction=instruction,
                     original_image=resized_image,
@@ -1068,11 +1097,32 @@ if __name__ == '__main__':
                 total_flops_this = s1_tflops + (s2_tflops if not should_exit_early else 0)
                 total_flops += total_flops_this
 
+            #! ==================================================================
+            #! [Visualization - After Time Measurement]
+            #! ==================================================================
+            
+            # Stage0 시각화 (시간 측정 외부)
+            if STAGE0_VIS and inst_dir:
+                all_crops_bboxes = [crop["bbox"] for crop in s0_crop_list]
+                visualize_crop(save_dir=inst_dir, gt_bbox=scaled_bbox, top_q_bboxes=all_crops_bboxes,
+                                instruction=instruction, filename="s1_all_crop.png", img_path=img_path, click_point=None)
+            
+            # Stage1 시각화 (시간 측정 외부)
+            if STAGE1_VIS and s1_pred is not None:
+                if EARLY_EXIT and should_exit_early and s1_corrected_top_point is not None:
+                    _visualize_early_exit_results(s1_crop_list, s1_pred, s1_corrected_top_point, scaled_bbox, s1_dir or "", instruction, img_path)
+                elif not should_exit_early:
+                    _visualize_stage1_results(s1_crop_list, s1_pred, s1_dir or "", instruction)
+            
+            # Stage2 시각화 (시간 측정 외부)
+            if STAGE2_VIS and not should_exit_early and not use_vanilla and s2_pred is not None:
+                _visualize_stage2_results(s2_dir or "", s2_resized_crop_list, s2_pred, scaled_bbox, s2_corrected_point, instruction, img_path)
+
             if len(s0_crop_list) != 2 and not should_exit_early:
                 if use_vanilla:
                     print(f"✂️  Crops : {len(s0_crop_list)-1} | 🌐 Vanilla Inference (All {num_selected_crops} crops selected)")
                 else:
-                    print(f"✂️  Crops : {len(s0_crop_list)-1} | Select Crops : {num_selected_crops} → Y-ranges : {len(selected_y_ranges)}")
+                    print(f"✂️  Crops : {len(s0_crop_list)-1} | Select Crops : {num_selected_crops} → Collaged into 1 image")
             print(f"🕖 Times - Seg: {seg_time:.2f}s | S1: {s1_time:.2f}s | S2: {s2_time:.2f}s | Total: {total_time:.2f}s")
             if TFOPS_PROFILING:
                 print(f"🔥 FLOPs - S1: {s1_tflops:.2f} | S2: {s2_tflops:.2f} | Total: {total_flops_this:.2f} TFLOPs")
