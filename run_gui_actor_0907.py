@@ -3,7 +3,7 @@
 import os
 import argparse
 os.environ["CUDA_DEVICE_ORDER"]="PCI_BUS_ID"
-os.environ["CUDA_VISIBLE_DEVICES"]= "1"  # 몇번 GPU 사용할지 ("0,1", "2" 등)
+os.environ["CUDA_VISIBLE_DEVICES"]= "0"  # 몇번 GPU 사용할지 ("0,1", "2" 등)
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--no_early_exit', action='store_true', help='Disable early exit')
@@ -27,7 +27,7 @@ SELECT_THRESHOLD = 0.7  # score >= tau * max_score 인 모든 crop select
 
 # EARLY_EXIT 설정: --no_early_exit이면 False, 기본값 True
 # EARLY_EXIT = False if args.no_early_exit else True
-EARLY_EXIT = False
+EARLY_EXIT = True
 EARLY_EXIT_THRE = 0.6  # 1등 attention * thre > 2등 attention이라면 early exit
 
 # Crop Extension 하이퍼파라미터
@@ -49,17 +49,16 @@ SAMPLE_RANGE = slice(None)  #! 샘플 범위 지정 (3번 샘플이면 3,4 / 5~9
 # SAMPLE_RANGE = slice(484,501)
 
 # Visualize & Logging
-STAGE0_VIS = True
-STAGE1_VIS = True
-STAGE2_VIS = True
-ITER_LOG = True  # csv, md
+STAGE0_VIS = False
+STAGE1_VIS = False
+STAGE2_VIS = False
 TFOPS_PROFILING = True
 MEMORY_EVAL = True
-MEMORY_VIS = True
+MEMORY_VIS = False
 
 # Save Path
-is_ee = "ee" if EARLY_EXIT else "not_ee"
-SAVE_DIR = f"./attn_output/" + is_ee + "_" + memo
+ee_thre = "(" + str(EARLY_EXIT_THRE) + " ee)" if EARLY_EXIT else "(not ee)"
+SAVE_DIR = f"./attn_output/" + memo + " " + ee_thre
 
 #! ==================================================================================================
 
@@ -860,7 +859,7 @@ if __name__ == '__main__':
                 "total_time", "total_flops_tflops", "peak_memory_gb", "acc_uptonow", 
                 "filename", "instruction"
             ],
-            write_md=True, use_fsync=True, use_lock=True
+            write_md=False, use_fsync=True, use_lock=True
         )
         task_res = dict()
         dataset = "screenspot_" + task + "_v2.json"
