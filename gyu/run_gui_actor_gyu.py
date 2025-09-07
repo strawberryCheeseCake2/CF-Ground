@@ -1,12 +1,16 @@
 # run_gui_actor.py
-# import setproctitle
-# setproctitle.setproctitle('CF_ground_gui_actor')
-
 
 import os
 import argparse
 os.environ["CUDA_DEVICE_ORDER"]="PCI_BUS_ID"
-os.environ["CUDA_VISIBLE_DEVICES"]= "3"  # 몇번 GPU 사용할지 ("0,1", "2" 등)
+os.environ["CUDA_VISIBLE_DEVICES"]= "2"  # 몇번 GPU 사용할지 ("0,1", "2" 등)
+
+max_memory = {
+    0: "70GiB",
+    # 1: "75GiB",
+    # 2: "75GiB",
+    "cpu": "120GiB",  # 남는 건 CPU 오프로딩xs
+}
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--no_early_exit', action='store_true', help='Disable early exit')
@@ -29,13 +33,17 @@ THUMBNAIL_RESIZE_RATIO = 0.10  # Thumbnail resize ratio
 SELECT_THRESHOLD = 0.7  # score >= tau * max_score 인 모든 crop select
 # EARLY_EXIT 설정: --no_early_exit이면 False, 기본값 True
 
-EARLY_EXIT = False if args.no_early_exit else True
+EARLY_EXIT = False
 EARLY_EXIT_THRE = 0.6  # 1등 attention * thre > 2등 attention이라면 early exit
+
+SET_OF_MARK = True
+COLLAGE = True
 
 is_ee = "ee" if EARLY_EXIT else "not_ee"
 SAVE_DIR = f"./attn_output/" + is_ee + "_" + str(MAX_PIXELS) + "_" + \
-    str(S1_RESIZE_RATIO) + "_" + str(S2_RESIZE_RATIO) + "_" + "only_one"  #! Save Path (특징이 있다면 적어주세요)
+    str(S1_RESIZE_RATIO) + "_" + str(S2_RESIZE_RATIO) + "_" + "0905_gyu_gk20_vis"  #! Save Path (특징이 있다면 적어주세요)
 
+SAVE_DIR = f"./attn_output/0905som_1280"
 #! Argument ==========================================================================================
 
 SEED = 0
@@ -45,17 +53,26 @@ MLLM_PATH = "microsoft/GUI-Actor-3B-Qwen2.5-VL"
 SCREENSPOT_IMGS = "./data/screenspotv2_image"  # input image 경로
 SCREENSPOT_JSON = "./data"  # json파일 경로
 TASKS = ["mobile", "web", "desktop"]
-SAMPLE_RANGE = slice(None)  #! 샘플 범위 지정 (3번 샘플이면 3,4 / 5~9번 샘플이면 5,10 / 전체 사용이면 None)
+# TASKS = ["web",]
+SAMPLE_RANGE = slice(0,1)  #! 샘플 범위 지정 (3번 샘플이면 3,4 / 5~9번 샘플이면 5,10 / 전체 사용이면 None)
 # SAMPLE_RANGE = slice(0, 3)
 
 # Visualize & Logging
-STAGE0_VIS = False
-STAGE1_VIS = False
-STAGE2_VIS = False
+STAGE0_VIS = True
+STAGE1_VIS = True
+STAGE2_VIS = True
 ITER_LOG = True  # csv, md
 TFOPS_PROFILING = True
 MEMORY_EVAL = True
-MEMORY_VIS = False
+MEMORY_VIS = True
+
+# Question
+# QUESTION_TEMPLATE="""Where should you tap to {task_prompt}?"""
+QUESTION_TEMPLATE="""
+You are an assistant trained to navigate the android phone. Given a
+task instruction, a screen observation, guess where should you tap.
+# Intruction
+{task_prompt}"""
 
 #! ==================================================================================================
 
@@ -63,21 +80,22 @@ MEMORY_VIS = False
 import json
 import re
 import sys
-sys.setrecursionlimit(3000)  # DeepSpeed logging
+sys.path.append(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+)
+sys.setrecursionlimit(10000)  # DeepSpeed logging
 import time
 from copy import deepcopy
-from typing import List
+from typing import List, Tuple
 from math import sqrt
 import matplotlib.pyplot as plt
 import threading
 
 # Third-Party Libraries
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageDraw
 from tqdm import tqdm
 import torch
-import matplotlib.pyplot as plt
-import matplotlib.patches as patches
 from transformers import AutoProcessor, AutoTokenizer, set_seed
 if TFOPS_PROFILING:
     from deepspeed.profiling.flops_profiler import FlopsProfiler
@@ -87,7 +105,6 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from iter_logger import init_iter_logger, append_iter_log  # log csv 기록 파일
 from gui_actor.modeling_qwen25vl import Qwen2_5_VLForConditionalGenerationWithPointer
 from gui_actor.multi_image_inference import multi_image_inference
-from gui_actor.inference import inference
 from visualize_util import get_highest_attention_patch_bbox, _visualize_early_exit_results, _visualize_stage1_results, _visualize_stage2_results, visualize_crop
 from crop import crop_img  #! 어떤 crop 파일 사용?
 
@@ -222,6 +239,18 @@ def check_gt_in_selected_crops(top_q_bboxes: List, gt_bbox: List):
         inter_bottom = min(ab, bb)
         return (inter_right > inter_left) and (inter_bottom > inter_top)
     return any(rect_intersects(gt_bbox, bbox) for bbox in top_q_bboxes)
+
+
+def check_gt_center_point_in_selected_crops(top_q_bboxes: List, gt_bbox: List):
+    gt_left, gt_top, gt_right, gt_bottom = gt_bbox
+    gt_center = [(gt_left + gt_right) / 2, (gt_top + gt_bottom) / 2]
+
+    for bbox in top_q_bboxes:
+        is_gt_in_crop = point_in_bbox(gt_center, bbox)
+        
+        if is_gt_in_crop: return True
+
+    return False
 
 def compute_attention_scores(crop_list, per_image_outputs):
     """각 crop의 attention score 계산"""
@@ -423,15 +452,14 @@ def run_selection_pass_with_guiactor(msgs, crop_list, gt_bbox: List, attn_vis_di
         top_point, top_crop_id = find_top_crop_for_early_exit(crop_list, per_image_outputs)
         should_exit_early, early_exit_success, corrected_top_point = check_early_exit_condition(
             top_point, top_crop_id, crop_list, per_image_outputs, gt_bbox, original_image
-        )
-    
+        )    # Early Exit하면 select_crop 스킵
     if should_exit_early:
-        selected_crop_ids = []  # Early exit시에는 Stage2 진행하지 않음
+        top_q_crop_ids = []
         top_q_bboxes = []
     else:
-        # Select crop: score >= tau * max_score인 crops 선택 (기존 run_gui_actor 방식)
-        selected_crop_ids = select_crop(crop_list, tau=SELECT_THRESHOLD)
-        top_q_bboxes = [crop["bbox"] for crop in crop_list if crop.get("id") in selected_crop_ids]
+        # Select crop: score >= tau * max_score인 crops 선택
+        top_q_crop_ids = select_crop(crop_list, tau=SELECT_THRESHOLD)
+        top_q_bboxes = [crop["bbox"] for crop in crop_list if crop.get("id") in top_q_crop_ids]
     
     # 시각화 (필요시)
     if STAGE1_VIS and EARLY_EXIT and should_exit_early:
@@ -439,7 +467,7 @@ def run_selection_pass_with_guiactor(msgs, crop_list, gt_bbox: List, attn_vis_di
     elif STAGE1_VIS and not should_exit_early:
         _visualize_stage1_results(crop_list, pred, attn_vis_dir, instruction)
     
-    return selected_crop_ids, top_q_bboxes, crop_list, should_exit_early, early_exit_success
+    return top_q_crop_ids, top_q_bboxes, crop_list, should_exit_early, early_exit_success
 
 def denormalize_crop_point(point_in_crop, crop_size, crop_bbox):
     crop_w, crop_h = crop_size
@@ -472,107 +500,41 @@ def find_best_crop_point(crop_list, per_image_outputs):
     
     return top_point, top_crop_id
 
-def run_refinement_pass_with_guiactor(selected_crop_ids, crop_list, instruction: str, original_image: Image, save_dir: str, gt_bbox: List, img_path: str):
-    """Stage 2: 선택된 crop들로 개별 inference 수행하여 가장 좋은 결과 선택"""
+def run_refinement_pass_with_guiactor(crop_list: List, instruction: str, original_image: Image, save_dir: str, gt_bbox: List, img_path: str):
+    """Stage 2: 선택된 crop들로 최종 grounding 수행"""
     
-    if not selected_crop_ids:
+    # Stage 2 용 리사이즈
+    s2_resized_crop_list = resize_crop_list(crop_list=crop_list, ratio=S2_RESIZE_RATIO)
+    s2_msgs = create_guiactor_msgs(crop_list=s2_resized_crop_list, instruction=instruction)
+
+    # Inference
+    pred = multi_image_inference(s2_msgs, model, tokenizer, processor, use_placeholder=True, topk=3)
+    per_image_outputs = pred["per_image"]
+    
+    # 최고 점수 crop 찾기
+    top_point, top_crop_id = find_best_crop_point(s2_resized_crop_list, per_image_outputs)
+    
+    if top_point is None:
         return False
     
-    # 선택된 crop들만 필터링
-    selected_crops = [crop for crop in crop_list if crop.get("id") in selected_crop_ids]
-    
-    best_score = -1
-    best_point = None
-    best_crop = None
-    best_pred = None
-    
-    # 각 crop에 대해 개별 inference 수행
-    for crop in selected_crops:
-        # 단일 이미지 conversation 생성 (리사이즈 없음)
-        conversation = [
-            {
-                "role": "system",
-                "content": [
-                    {
-                        "type": "text",
-                        "text": (
-                            "You are a GUI agent. Given a screenshot of the current GUI and a human instruction, "
-                            "your task is to locate the screen element that corresponds to the instruction. "
-                            "You should output a PyAutoGUI action that performs a click on the correct position. "
-                            "To indicate the click location, we will use some special tokens, which is used to refer to a visual patch later. "
-                            "For example, you can output: pyautogui.click(<your_special_token_here>)."
-                        ),
-                    }
-                ]
-            },
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "image",
-                        "image": crop["img"], # 원본 crop 이미지 사용 (리사이즈 없음)
-                    },
-                    {
-                        "type": "text",
-                        "text": instruction
-                    },
-                ],
-            },
-        ]
-
-        # Single image inference 수행
-        pred = inference(conversation, model, tokenizer, processor, use_placeholder=True, topk=3)
+    # 원본 crop에서 bbox 정보 가져오기
+    top_crop = next((c for c in crop_list if c['id'] == top_crop_id), None)
+    if top_crop is None:
+        return False
         
-        # attention score에서 최고 점수 계산
-        if pred.get("attn_scores") and len(pred["attn_scores"]) > 0:
-            crop_att_scores_np = np.array(pred["attn_scores"][0])
-            crop_top_score = np.max(crop_att_scores_np)
-            
-            # 현재 crop이 지금까지 중 가장 좋은 점수인지 확인
-            if crop_top_score > best_score:
-                best_score = crop_top_score
-                best_crop = crop
-                best_pred = pred
-                if pred.get("topk_points") and len(pred["topk_points"]) > 0:
-                    best_point = pred["topk_points"][0]  # 정규화된 좌표 (0~1)
+    top_crop_bbox = top_crop["bbox"]
     
-    # 가장 좋은 crop이 없으면 실패
-    if best_crop is None or best_point is None:
-        return False
-    
-    # 간단한 좌표 변환: crop 위치 + denormalized point
-    crop_bbox = best_crop["bbox"]  # [left, top, right, bottom] 이미 저장된 crop 위치
-    crop_w = crop_bbox[2] - crop_bbox[0]  # crop width
-    crop_h = crop_bbox[3] - crop_bbox[1]  # crop height
-    
-    # 1. Denormalize: 정규화된 좌표를 crop 크기로 변환
-    denorm_x = best_point[0] * crop_w
-    denorm_y = best_point[1] * crop_h
-    
-    # 2. 저장된 crop 위치로 +: crop의 시작점을 더해서 최종 좌표 계산
-    final_x = crop_bbox[0] + denorm_x
-    final_y = crop_bbox[1] + denorm_y
-    
-    # 3. GT와 비교 (GT는 그대로 사용)
-    is_success = (gt_bbox[0] <= final_x <= gt_bbox[2]) and (gt_bbox[1] <= final_y <= gt_bbox[3])
+    # 좌표 보정 및 성공 여부 판단
+    corrected_point = denormalize_crop_point(
+        point_in_crop=top_point, 
+        crop_size=top_crop['img'].size, 
+        crop_bbox=top_crop_bbox
+    )
+    is_success = point_in_bbox(corrected_point, gt_bbox)
 
-    # 시각화 (필요시) - 픽셀 좌표 사용
+    # 시각화 (필요시)
     if STAGE2_VIS:
-        corrected_point = [final_x, final_y]
-
-        # 시각화를 위한 더미 crop_list 생성 (기존 함수 호환성 위해)
-        dummy_crop_list = [{"resized_img": best_crop["img"], "id": best_crop["id"], "bbox": crop_bbox}]
-        dummy_per_image_outputs = [{
-            "index": 0,
-            "n_width": best_pred.get("n_width", 1),
-            "n_height": best_pred.get("n_height", 1), 
-            "attn_scores": best_pred.get("attn_scores", [[0]]),
-            "topk_points": best_pred.get("topk_points", []),
-            "topk_values": best_pred.get("topk_values", []),
-            "topk_points_all": best_pred.get("topk_points_all", [])
-        }]
-        dummy_pred = {"per_image": dummy_per_image_outputs}
-        _visualize_stage2_results(save_dir, dummy_crop_list, dummy_pred, gt_bbox, corrected_point, instruction, img_path)
+        _visualize_stage2_results(save_dir, s2_resized_crop_list, pred, gt_bbox, corrected_point, instruction, img_path)
         
     return is_success
 
@@ -595,6 +557,102 @@ def monitor_memory(interval=0.1):
         time_log.append(now)
         time.sleep(interval)
 
+def apply_som(crop_list: List, thumbnail_resize_ratio: float, vis_dir=None):
+
+
+    def _color_for_id(idx: int) -> Tuple[int, int, int]:
+        """
+        crop id(>0)를 안정적으로 색상에 매핑.
+        필요한 만큼 순환 사용.
+        """
+        palette = [
+            (230, 25, 75),   # red
+            (60, 180, 75),   # green
+            (0, 130, 200),   # blue
+            (245, 130, 48),  # orange
+            (145, 30, 180),  # purple
+            (70, 240, 240),  # cyan
+        ]
+        # id는 1부터 시작한다고 가정 (0은 썸네일)
+        return palette[(idx - 1) % len(palette)]
+
+    def _clamp_bbox(b: List, W: int, H: int) -> List:
+        """이미지 경계 안으로 bbox를 정수로 보정"""
+        l = max(0, min(int(round(b[0])), W - 1))
+        t = max(0, min(int(round(b[1])), H - 1))
+        r = max(0, min(int(round(b[2])), W - 1))
+        btm = max(0, min(int(round(b[3])), H - 1))
+        if r < l:
+            l, r = r, l
+        if btm < t:
+            t, btm = btm, t
+        return l, t, r, btm
+
+    # 썸네일에 bbox 그리기
+    # 이때 sub crop있는 거만 그리기
+
+    # subcrop 돌면서 썸네일에 그리기
+    # 
+
+    # sub crop에 bbox 그리기
+
+    thumb_item = next((it for it in crop_list if it.get("id") == 0), None)
+
+     # 썸네일에 bbox 그리기 (sub crop 있는 것만)
+    thumb_img = thumb_item["resized_img"]
+    # 복사해서 덮어쓰고 싶으면 아래 한 줄 활성화:
+    # thumb_img = thumb_img.copy()
+
+    W, H = thumb_img.size
+    draw_thumb = ImageDraw.Draw(thumb_img)
+    thumb_line_w = max(2, int(round(min(W, H) * 0.006)))  # 썸네일에서는 조금 더 두껍게(약 0.6%)
+
+    for it in crop_list:
+        cid = it.get("id")
+        if cid is None or cid == 0:
+            continue  # 썸네일 자신은 스킵
+        bbox = it.get("bbox")
+        if bbox is None:
+            continue
+
+        color = _color_for_id(cid)
+        s = thumbnail_resize_ratio
+        scaled = (bbox[0] * s, bbox[1] * s, bbox[2] * s, bbox[3] * s)
+        l, t, r, btm = _clamp_bbox(scaled, W, H)
+        draw_thumb.rectangle([l, t, r, btm], outline=color, width=thumb_line_w)
+
+    # 수정된 썸네일 반영
+    thumb_item["resized_img"] = thumb_img
+
+    # 각 sub crop 이미지에 동일 색상 테두리 그리기
+    for it in crop_list:
+        cid = it.get("id")
+        if cid is None or cid == 0 or it.get("img") is None:
+            continue
+        subimg = it["resized_img"]
+        # 복사해서 덮어쓰고 싶으면 아래 한 줄 활성화:
+        # subimg = subimg.copy()
+        w, h = subimg.size
+        crop_line_w = max(2, int(round(min(w, h) * 0.015)))  # 약 1.5%
+        draw = ImageDraw.Draw(subimg)
+        draw.rectangle([0, 0, w - 1, h - 1], outline=_color_for_id(cid), width=crop_line_w)
+        it["resized_img"] = subimg
+
+    if vis_dir is not None:
+        os.makedirs(vis_dir, exist_ok=True)
+        for c in crop_list:
+            c['resized_img'].save(f"{vis_dir}/crop_{c['id']}.png")
+        
+
+
+    return crop_list
+
+
+def apply_collage(crop_list: List ):
+    # 이미지를 합치기
+    # 
+    return
+
 #! ================================================================================================
 
 if __name__ == '__main__':
@@ -605,7 +663,7 @@ if __name__ == '__main__':
     model = Qwen2_5_VLForConditionalGenerationWithPointer.from_pretrained(
         MLLM_PATH, torch_dtype="auto", attn_implementation=ATTN_IMPL,
         device_map="balanced",  # NVIDIA GPU
-        # max_memory=max_memory, 
+        max_memory=max_memory, 
         low_cpu_mem_usage=True
     )
     # Model Import (Mac)
@@ -705,7 +763,7 @@ if __name__ == '__main__':
             #     resize_ratio = (w_resized * h_resized) ** 0.5 / (orig_w * orig_h) ** 0.5
             #     scaled_bbox = [int(coord * resize_ratio) for coord in original_bbox]
             # else:
-            # 리사이즈 X
+                # 리사이즈가 필요없는 경우 원본 그대로 사용
             resized_image = original_image
             w_resized, h_resized = orig_w, orig_h
             resize_ratio = 1.0
@@ -735,7 +793,7 @@ if __name__ == '__main__':
             seg_start = time.time()
 
             # resize 하지 않은 원본의 화질을 기준으로 crop 횟수 정하기
-            if orig_h < 960:  # 저화질이나 가로화면 -> 2등분
+            if orig_h < 1000:  # 저화질이나 가로화면 -> 2등분
                 h_cuts = 1
                 h_tolerance = 0.20
             elif orig_h < 1440:  # 중간화질 -> 3등분
@@ -766,8 +824,16 @@ if __name__ == '__main__':
             s1_start = time.time()
 
             s1_msgs = create_guiactor_msgs(crop_list=s0_crop_list, instruction=instruction)
+            
 
-            selected_crop_ids, s1_top_q_bboxes, s0_crop_list_out, should_exit_early, early_exit_success = run_selection_pass_with_guiactor(
+            if SET_OF_MARK:
+                s0_crop_list = apply_som(
+                    crop_list=s0_crop_list, 
+                    thumbnail_resize_ratio=THUMBNAIL_RESIZE_RATIO, 
+                    vis_dir=s1_dir + "/som"
+                    )
+            
+            s1_top_q_crop_ids, s1_top_q_bboxes, s0_crop_list_out, should_exit_early, early_exit_success = run_selection_pass_with_guiactor(
                 msgs=s1_msgs,
                 crop_list=s0_crop_list,
                 gt_bbox=scaled_bbox,  # 스케일된 bbox 사용
@@ -795,8 +861,9 @@ if __name__ == '__main__':
                 stage1_success = False  # Early exit이므로 stage1 성공 여부 미정의
 
             else:  # GT가 안에 들어가는지 체크
-                s1_hit = "✅" if check_gt_in_selected_crops(s1_top_q_bboxes, scaled_bbox) else "❌"
-                stage1_success = check_gt_in_selected_crops(s1_top_q_bboxes, scaled_bbox)
+                # s1_hit = "✅" if check_gt_in_selected_crops(s1_top_q_bboxes, scaled_bbox) else "❌"
+                s1_hit = "✅" if check_gt_center_point_in_selected_crops(s1_top_q_bboxes, scaled_bbox) else "❌"
+                stage1_success = check_gt_center_point_in_selected_crops(s1_top_q_bboxes, scaled_bbox)
                 if stage1_success:
                     stage1_success_count += 1
 
@@ -814,17 +881,38 @@ if __name__ == '__main__':
                 s2_time = 0.0
                 s2_tflops = 0.0
             else:
-                # Stage2: 선택된 crop들로 각각 개별 inference 수행
+                original_crop_map = {c['id']: c for c in crop_list}
+                s2_input_crop_ids = set()
+                if 0 in original_crop_map:
+                    s2_input_crop_ids.add(0)
+                for crop_id in s1_top_q_crop_ids:
+                    s2_input_crop_ids.add(crop_id)
+                s2_input_crops = [original_crop_map[cid] for cid in s2_input_crop_ids if cid in original_crop_map]
+
+                # Calculate Stage 2 FLOPs
+                s2_resized_crops = resize_crop_list(crop_list=s2_input_crops, ratio=S2_RESIZE_RATIO)
+                s2_msgs = create_guiactor_msgs(crop_list=s2_resized_crops, instruction=instruction)
+
                 if TFOPS_PROFILING:
                     prof.start_profile()
                 s2_inference_start = time.time()
 
+
+                if SET_OF_MARK:
+                    s2_input_crops = apply_som(
+                        crop_list=s2_resized_crops, 
+                        thumbnail_resize_ratio=THUMBNAIL_RESIZE_RATIO, 
+                        vis_dir=s2_dir + "/som"
+                    )
+                
+
+                
+
                 final_success = run_refinement_pass_with_guiactor(
-                    selected_crop_ids=selected_crop_ids,
-                    crop_list=crop_list,  # 원본 crop_list 사용
+                    crop_list=s2_input_crops,
                     instruction=instruction,
                     original_image=resized_image,
-                    save_dir=s2_dir if s2_dir else save_dir,  # s2_dir이 None이면 기본 save_dir 사용
+                    save_dir=s2_dir or "",
                     gt_bbox=scaled_bbox,  # 스케일된 bbox 사용
                     img_path=img_path
                 )
@@ -851,8 +939,7 @@ if __name__ == '__main__':
                 total_flops += total_flops_this
 
             if len(s0_crop_list) != 2 and not should_exit_early:
-                selected_crop_info = f"Selected: {len(selected_crop_ids)} crops"
-                print(f"✂️  Crops : {len(s0_crop_list_out)-1} | {selected_crop_info}")
+                print(f"✂️  Crops : {len(s0_crop_list_out)-1} | Select Crops : {len(s1_top_q_crop_ids)}")
             print(f"🕖 Times - Seg: {seg_time:.2f}s | S1: {s1_time:.2f}s | S2: {s2_time:.2f}s | Total: {total_time:.2f}s")
             if TFOPS_PROFILING:
                 print(f"🔥 FLOPs - S1: {s1_tflops:.2f} | S2: {s2_tflops:.2f} | Total: {total_flops_this:.2f} TFLOPs")
@@ -932,7 +1019,7 @@ if __name__ == '__main__':
                 crop_time=f"{seg_time:.3f}",
                 num_crop=len(s0_crop_list)-1,
                 early_exit="☑️" if should_exit_early else "🫥",
-                num_selected_crop=len(selected_crop_ids) if not should_exit_early else 0,
+                num_selected_crop=len(s1_top_q_crop_ids) if not should_exit_early else 0,
                 s1_time=f"{s1_time:.3f}",
                 s1_tflops=f"{s1_tflops:.2f}",
                 s1_hit=s1_hit,

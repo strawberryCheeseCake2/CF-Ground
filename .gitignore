@@ -5,6 +5,7 @@ __pycache__/
 attn_output/
 crop_test/
 _gpu_usage/
+gyu/attn_output/
 
 # conda env
 env_zonui/
