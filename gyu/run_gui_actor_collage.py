@@ -55,8 +55,8 @@ SCREENSPOT_IMGS = "./data/screenspotv2_image"  # input image 경로
 SCREENSPOT_JSON = "./data"  # json파일 경로
 # TASKS = ["web", "desktop"]
 TASKS = ["web", "desktop", "mobile"]
-SAMPLE_RANGE = slice(160,162)  #! 샘플 범위 지정 (3번 샘플이면 3,4 / 5~9번 샘플이면 5,10 / 전체 사용이면 None)
-# SAMPLE_RANGE = slice(None)
+# SAMPLE_RANGE = slice(160,162)  #! 샘플 범위 지정 (3번 샘플이면 3,4 / 5~9번 샘플이면 5,10 / 전체 사용이면 None)
+SAMPLE_RANGE = slice(None)
 
 # Visualize & Logging
 STAGE0_VIS = True
@@ -851,7 +851,8 @@ if __name__ == '__main__':
     #     low_cpu_mem_usage=False
     # )
     tokenizer = AutoTokenizer.from_pretrained(MLLM_PATH)
-    processor = AutoProcessor.from_pretrained(MLLM_PATH, max_pixels=MAX_PIXELS)
+    # processor = AutoProcessor.from_pretrained(MLLM_PATH, max_pixels=MAX_PIXELS)
+    processor = AutoProcessor.from_pretrained(MLLM_PATH)
 
     if TFOPS_PROFILING:
         prof = FlopsProfiler(model)
