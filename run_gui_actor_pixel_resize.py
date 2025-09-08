@@ -3,7 +3,7 @@
 import os
 import argparse
 os.environ["CUDA_DEVICE_ORDER"]="PCI_BUS_ID"
-os.environ["CUDA_VISIBLE_DEVICES"]= "0"  # 몇번 GPU 사용할지 ("0,1", "2" 등)
+os.environ["CUDA_VISIBLE_DEVICES"]= "1"  # 몇번 GPU 사용할지 ("0,1", "2" 등)
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--no_early_exit', action='store_true', help='Disable early exit')
@@ -19,10 +19,10 @@ ATTN_IMPL = "eager"  # attention implement "eager" "sdpa" "flash" "efficient"
 # MAX_PIXELS = 1280 * 28 * 28
 MAX_PIXELS = 3211264
 # MAX_PIXELS = args.max_pixels if args.max_pixels else None
-S1_RESIZE_MIN_RATIO = 0.20  # Stage 1 crop resize ratio
+S1_RESIZE_MIN_RATIO = 0.25  # Stage 1 crop resize ratio
 # S1_RESIZE_MAX_PIXEL = 3870400 * S1_RESIZE_MIN_RATIO * S1_RESIZE_MIN_RATIO  # iPad
-S1_RESIZE_MAX_PIXEL = 5040000 * S1_RESIZE_MIN_RATIO * S1_RESIZE_MIN_RATIO  # Mac
-S1_RESIZE_MAX_RATIO = 0.50
+S1_RESIZE_MAX_PIXEL = 5184000 * S1_RESIZE_MIN_RATIO * S1_RESIZE_MIN_RATIO  # Mac
+S1_RESIZE_MAX_RATIO = 0.60
 S2_RESIZE_RATIO = 1.00  # Stage 2 crop resize ratio
 THUMBNAIL_RESIZE_RATIO = 0.10  # Thumbnail resize ratio
 
@@ -47,7 +47,7 @@ SEED = 0
 MLLM_PATH = "microsoft/GUI-Actor-3B-Qwen2.5-VL"
 SCREENSPOT_IMGS = "./data/screenspotv2_image"  # input image 경로
 SCREENSPOT_JSON = "./data"  # json파일 경로
-TASKS = ["mobile", "web", "desktop"]
+TASKS = ["desktop", "mobile", "web"]
 SAMPLE_RANGE = slice(None)  #! 샘플 범위 지정 (3번 샘플이면 3,4 / 5~9번 샘플이면 5,10 / 전체 사용이면 None)
 # SAMPLE_RANGE = slice(484,501)
 
