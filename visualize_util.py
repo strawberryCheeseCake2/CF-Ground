@@ -3,12 +3,6 @@ import numpy as np
 from PIL import Image, ImageFont, ImageDraw
 import torch
 import matplotlib.pyplot as plt
-import matplotlib.patches as patches
-import matplotlib.patheffects as pe
-from matplotlib.lines import Line2D
-from pathlib import Path
-from qwen_vl_utils import process_vision_info
-
 
 @torch.inference_mode()
 def get_attn_map(image: Image.Image, attn_scores: list, n_width: int, n_height: int) -> Image.Image:
@@ -48,38 +42,9 @@ def get_attn_map(image: Image.Image, attn_scores: list, n_width: int, n_height: 
     
     return blended_image
 
-
-@torch.inference_mode()
-def draw_point(image: Image.Image, point: tuple, radius=10, color=(255, 0, 0)) -> Image.Image:
-    """
-    이미지 위의 특정 좌표에 원을 그립니다.
-
-    Args:
-        image (Image.Image): PIL 이미지.
-        point (tuple): (x, y) 좌표 (0~1 사이의 정규화된 값).
-        radius (int): 원의 반지름.
-        color (tuple): 원의 색상 (R, G, B).
-
-    Returns:
-        Image.Image: 원이 그려진 PIL 이미지.
-    """
-    w, h = image.size
-    # 정규화된 좌표를 실제 픽셀 좌표로 변환
-    abs_x, abs_y = int(point[0] * w), int(point[1] * h)
-
-    draw = ImageDraw.Draw(image)
-    # 원의 외곽선 그리기
-    draw.ellipse(
-        [(abs_x - radius, abs_y - radius), (abs_x + radius, abs_y + radius)],
-        outline=color,
-        width=3  # 선 두께
-    )
-    return image
-
 # -----------------------------------------
 # 메인 시각화 함수
 # -----------------------------------------
-
 
 @torch.inference_mode()
 def draw_top_patch_attentions(image: Image.Image, attn_scores: np.ndarray, n_width: int, n_height: int, top_k: int = 3) -> Image.Image:
@@ -134,408 +99,157 @@ def draw_top_patch_attentions(image: Image.Image, attn_scores: np.ndarray, n_wid
         
     return image
 
-
-def visualize_results(crop_list: list, prediction_results: dict, instruction: str, save_path: str):
-    """
-    추론 결과를 받아 어텐션 맵, Top-3 어텐션 값, Top-1 예측 지점, 그리고
-    각 이미지의 어텐션 총합을 시각화합니다.
-    """
-    per_image_outputs = prediction_results.get('per_image', [])
+def visualize_stage1_attention_crops(s1_pred, resized_image, crop_list, original_image, save_dir, instruction, gt_bbox=None):
+    """Stage 1 attention 맵과 생성된 crop들을 시각화"""
     
-    if not per_image_outputs:
-        print("시각화할 결과가 없습니다.")
-        return
-
-    num_images = len(per_image_outputs)
-    fig, axes = plt.subplots(1, num_images, figsize=(8 * num_images, 8))
-    if num_images == 1:
-        axes = [axes]
+    # 1. Attention 맵 생성
+    if 'attn_scores' in s1_pred and s1_pred['attn_scores']:
+        attn_scores = np.array(s1_pred['attn_scores'][0])
+        n_width = s1_pred['n_width']
+        n_height = s1_pred['n_height']
         
-    fig.suptitle(f"Instruction: {instruction}", fontsize=16)
-
-    for result in per_image_outputs:
-        idx = result['index']
-        # original_image = original_images[idx]
-        original_image = crop_list[idx]['resized_img']
-        
-        # 1. 어텐션 맵 생성
+        # 리사이즈된 이미지에 attention 맵 오버레이
         blended_img = get_attn_map(
-            image=original_image,
-            attn_scores=result['attn_scores'][0],
-            n_width=result['n_width'],
-            n_height=result['n_height']
+            image=resized_image,
+            attn_scores=attn_scores,
+            n_width=n_width,
+            n_height=n_height
         )
         
-        # 2. Top-3 어텐션 값 텍스트로 그리기
-        attn_scores_np = np.array(result['attn_scores'][0])
-        img_with_attns = draw_top_patch_attentions(
-            blended_img,
-            attn_scores_np,
-            result['n_width'],
-            result['n_height'],
-            top_k=3
-        )
+        # 리사이즈 비율 계산
+        resize_ratio = s1_pred.get('resize_ratio', 1.0)
+        resized_w, resized_h = resized_image.size
+        orig_w, orig_h = original_image.size
         
-        # 3. Top-1 예측 지점 그리기
-        if result['topk_points']:
-            top_point = result['topk_points'][0]
-            final_img = draw_point(img_with_attns, top_point, color=(0, 255, 0)) # 초록색 원
-        else:
-            final_img = img_with_attns
-
-        # 어텐션 스코어 총합 계산
-        total_attention_score = np.sum(attn_scores_np)
+        draw = ImageDraw.Draw(blended_img)
+        
+        # 2. GT 박스를 초록색으로 그리기 (리사이즈된 좌표계로 변환)
+        if gt_bbox is not None:
+            gt_left, gt_top, gt_right, gt_bottom = gt_bbox
+            # 원본 좌표를 리사이즈된 좌표로 변환
+            scaled_gt_left = int(gt_left * resize_ratio)
+            scaled_gt_top = int(gt_top * resize_ratio)
+            scaled_gt_right = int(gt_right * resize_ratio)
+            scaled_gt_bottom = int(gt_bottom * resize_ratio)
             
-        # 4. 결과 이미지 표시
-        ax = axes[idx]
-        ax.imshow(final_img)
-        # 제목에 이미지 번호와 어텐션 총합을 함께 표시
-        ax.set_title(f"Image {idx+1}\nTotal Attention: {total_attention_score:.4f}", fontsize=12)
-        ax.axis('off')
-
-    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
-    # plt.show() # 화면에 표시
-    plt.savefig(save_path) # 파일로 저장
-    # print(f"결과가 '{save_path}'에 저장되었습니다.")
-
-
-def get_highest_attention_patch_bbox(image_result: dict) -> list:
-    """
-    per_image 결과에서 어텐션 스코어가 가장 높은 패치를 찾아 
-    해당 패치의 정규화된 바운딩 박스 좌표를 반환합니다.
-
-    Args:
-        image_result (dict): prediction_results['per_image'] 리스트의 단일 아이템.
-
-    Returns:
-        list: [left, top, right, bottom] 형태의 정규화된 좌표 리스트.
-    """
-    # 1. 입력 데이터 추출
-    attn_scores = np.array(image_result['attn_scores'][0])
-    n_width = image_result['n_width']
-    n_height = image_result['n_height']
-
-    # 2. 어텐션 스코어가 가장 높은 패치의 1차원 인덱스 찾기
-    highest_score_idx = np.argmax(attn_scores)
-
-    # 3. 1차원 인덱스를 2차원 패치 그리드 좌표 (patch_x, patch_y)로 변환
-    # (patch_x는 가로 인덱스, patch_y는 세로 인덱스)
-    patch_y = highest_score_idx // n_width
-    patch_x = highest_score_idx % n_width
-
-    # 4. 패치 그리드 좌표를 정규화된 바운딩 박스 좌표로 계산
-    # 각 패치의 정규화된 너비와 높이
-    patch_norm_width = 1.0 / n_width
-    patch_norm_height = 1.0 / n_height
+            # 이미지 범위 내로 클리핑
+            scaled_gt_left = max(0, min(scaled_gt_left, resized_w))
+            scaled_gt_top = max(0, min(scaled_gt_top, resized_h))
+            scaled_gt_right = max(0, min(scaled_gt_right, resized_w))
+            scaled_gt_bottom = max(0, min(scaled_gt_bottom, resized_h))
+            
+            draw.rectangle([scaled_gt_left, scaled_gt_top, scaled_gt_right, scaled_gt_bottom], 
+                         outline="green", width=4)
+            
+            # GT 라벨 추가
+            try:
+                font = ImageFont.truetype("arial.ttf", 16)
+            except IOError:
+                font = ImageFont.load_default()
+            
+            draw.text((scaled_gt_left + 5, scaled_gt_top - 20), "GT", fill="green", font=font)
+        
+        # 3. Crop 박스들을 빨간색으로 그리기 (원본 좌표를 리사이즈된 좌표로 변환)
+        for crop in crop_list:
+            # 원본 좌표를 리사이즈된 좌표로 변환
+            bbox = crop["bbox"]
+            left, top, right, bottom = bbox
+            
+            scaled_left = int(left * resize_ratio)
+            scaled_top = int(top * resize_ratio)
+            scaled_right = int(right * resize_ratio)
+            scaled_bottom = int(bottom * resize_ratio)
+            
+            # 이미지 범위 내로 클리핑
+            scaled_left = max(0, min(scaled_left, resized_w))
+            scaled_top = max(0, min(scaled_top, resized_h))
+            scaled_right = max(0, min(scaled_right, resized_w))
+            scaled_bottom = max(0, min(scaled_bottom, resized_h))
+            
+            # 유효한 크기인지 확인
+            if scaled_right > scaled_left and scaled_bottom > scaled_top:
+                draw.rectangle([scaled_left, scaled_top, scaled_right, scaled_bottom], 
+                             outline="red", width=3)
+                
+                # crop 번호 표시
+                crop_id = crop.get("id", "?")
+                try:
+                    font = ImageFont.truetype("arial.ttf", 16)
+                except IOError:
+                    font = ImageFont.load_default()
+                
+                text = f"C{crop_id}"
+                text_x, text_y = scaled_left + 5, scaled_top + 5
+                draw.text((text_x, text_y), text, fill="red", font=font)
+        
+        # 4. 결과 저장
+        os.makedirs(save_dir, exist_ok=True)
+        save_path = os.path.join(save_dir, "s1_attention_crops.png")
+        blended_img.save(save_path)
+        # print(f"🌄 Stage 1 visualization : {save_path}")
     
-    # 바운딩 박스 계산
-    left = patch_x * patch_norm_width
-    top = patch_y * patch_norm_height
-    right = (patch_x + 1) * patch_norm_width
-    bottom = (patch_y + 1) * patch_norm_height
-    
-    return [left, top, right, bottom]
-
-
-def visualize_crop(save_dir, gt_bbox, top_q_bboxes, instruction, filename, img_path, click_point=None):
-    """Visualize ground truth and selected crop on the image"""
-    result_img = Image.open(img_path)
-
-    draw = ImageDraw.Draw(result_img)
-    # Draw ground truth bbox in green
-    draw.rectangle(gt_bbox, outline="green", width=2)
-
-    font = None
-    try:
-        font = ImageFont.truetype("DejaVuSans-Bold.ttf", 20)
-    except IOError:
-        font = ImageFont.load_default()
-
-    for bbox in top_q_bboxes:
-        draw.rectangle(bbox, outline="red", width=2)
-        text_to_draw = f"{instruction}"
-        crop_left, crop_top, crop_right, crop_bottom = bbox
-        inst_position = (crop_left, crop_top)
-        draw.text(inst_position, text_to_draw, fill="red", font=font)
-
-    # Draw click point as an orange circle
-    if click_point is not None:
-        click_x, click_y = click_point[0], click_point[1]
-        radius = 13
-        draw.ellipse((click_x - radius, click_y - radius, click_x + radius, click_y + radius), outline="purple", width=3)
-
-    # Ensure the save directory exists
-    os.makedirs(save_dir, exist_ok=True)
-    # Save the result image
-    result_path = os.path.join(save_dir, filename)
-    result_img.save(result_path)
-
-
-def visualize_attn_map(attn_output, msgs, crop_list, attn_vis_dir, processor, agg_start=20, layer_num=31):
-    """Visualize attention maps for crops"""
-    image_inputs, _ = process_vision_info(msgs)
-
-    # grid 크기 뽑아두기
-    img_proc_out = processor.image_processor(images=image_inputs)
-    grid = img_proc_out["image_grid_thw"]
-    # (batch, num_imgs, 3) 혹은 (num_imgs, 3) 형태일 수 있으니 안전하게 뽑기
-    if grid.ndim == 3:
-        grid = grid[0]   # (num_imgs, 3)
-
-    # 최종 token-map 차원: t × (h//2) × (w//2)
-    final_shapes = [
-        (t, h//2, w//2)
-        for t, h, w in grid
-    ]
-
-    num_imgs = len(crop_list)
-    fig, axes = plt.subplots(1, num_imgs, figsize=(5*num_imgs, 5))
-
-    for i, crop in enumerate(crop_list):
-        (st, end) = crop["token_span"] # crop의 토큰 시작, 끝 index 뽑기
-        t, h2, w2 = final_shapes[i]
-        att_maps = []
-
-        # for li in range(L):
-        for li in range(agg_start, layer_num):
-            att = (
-                attn_output.attentions[li]         # (batch, heads, seq_q, seq_k)
-                [0, :, -1, st:end]              # batch=0, 마지막 query 토큰, vision span
-                .mean(dim=0)                 # head 평균
-                .to(torch.float32)           # bfloat16 → float32
-                .cpu()
-                .numpy()
-            )
-            att_map = att.reshape(t, h2, w2).mean(axis=0)  # 시간축 평균
-            att_maps.append(att_map)
-
-        att_avg = np.mean(att_maps, axis=0)  # 32개 레이어 평균
-
-        ax = axes[i] if num_imgs > 1 else axes
-        im = ax.imshow(att_avg, cmap="viridis", interpolation="nearest")
-        ax.set_title(f"crop{crop['id']}")
-        ax.axis("off")
-
-    plt.tight_layout()
-
-    out_dir = Path(attn_vis_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    _save_path = os.path.join(out_dir, "attn_map.png")
-
-    fig.savefig(_save_path, dpi=300, bbox_inches="tight", facecolor="white")
-    plt.close(fig)
-
-
-def upsample_att_map(att_map_low_res: np.ndarray, size):
-    """
-    Pillow를 이용한 bilinear 업샘플 (size=(H, W))
-    입력/출력 모두 float32 유지
-    """
-    h, w = size
-    # 안전장치: 음수/NaN 제거
-    m = np.nan_to_num(att_map_low_res.astype(np.float32), nan=0.0, neginf=0.0, posinf=0.0)
-    if m.size == 0:
-        return np.zeros((h, w), dtype=np.float32)
-    # 값 범위를 일단 0 이상으로 클램프
-    m[m < 0] = 0.0
-    im = Image.fromarray(m)
-    im = im.resize((w, h), resample=Image.BILINEAR)
-    out = np.array(im).astype(np.float32)
-    # scale에 따라 값이 약간 변할 수 있어 0 이상으로 재클램프
-    out[out < 0] = 0.0
-    return out
-
-
-def boxfilter_sum(arr: np.ndarray, r: int):
-    """
-    끝부분 보정 없음(neighbor-sum).
-    (2r+1)x(2r+1) 창과 실제 겹치는 부분의 '합'만 계산.
-    평균 아님. 가장자리는 창이 덜 겹치므로 손해보게 됨.
-    """
-    if r <= 0:
-        return arr.astype(np.float32, copy=True)
-
-    a = arr.astype(np.float32, copy=False)
-    H, W = a.shape
-
-    # 적분영상: 상단/좌측 0 패딩을 한 칸 추가해서 벡터화 계산 용이하게 구성
-    ii = np.pad(a, ((1, 0), (1, 0)), mode='constant').cumsum(axis=0).cumsum(axis=1)
-
-    ys = np.arange(H)[:, None]   # Hx1
-    xs = np.arange(W)[None, :]   # 1xW
-
-    y0 = np.clip(ys - r, 0, H)
-    y1 = np.clip(ys + r + 1, 0, H)
-    x0 = np.clip(xs - r, 0, W)
-    x1 = np.clip(xs + r + 1, 0, W)
-
-    # 적분영상 인덱스는 +1 패딩 고려해서 그대로 사용 가능
-    S = ii[y1, x1] - ii[y0, x1] - ii[y1, x0] + ii[y0, x0]
-    return S
-
-
-def visualize_aggregated_attention(
-        crop_list,
-        original_image, inst_dir, gt_bbox, individual_maps_dir=None,
-        neigh_radius = 20,         #! 이웃합(box filter) 반경 r → (2r+1)^2 창
-        topk_points = 5,           # 상위 점 개수 (보여주기용)
-        min_dist_pix = 200,        # 상위 점 사이 최소 간격 (픽셀)
-        star_marker_size= 8,      # 별 크기 (1등)
-        dot_marker_size = 5,      # 점 크기 (2~5등)
-        text_fontsize= 7          # 점수 텍스트 폰트 크기
-    ):
-    """
-    이웃합 기반 최대점 탐색:
-    - 합성 맵 정규화 후 boxfilter_sum(neigh_radius)로 이웃합 계산
-    - greedy 비최대 억제(NMS)로 상위 topk_points 좌표 선택(간격 min_dist_pix)
-    - 시각화:
-        • s2_result_only: 원본+합성맵+GT 박스만
-        • s2_result_star: top-1은 별(*), top-k 모두는 이웃합 점수 텍스트로 표시
-    - 성공 판정은 top-1 점이 GT 박스 안이면 True
-    """
-
-    os.makedirs(os.path.dirname(inst_dir + "/stage2"), exist_ok=True)
-    if individual_maps_dir:
-        os.makedirs(individual_maps_dir, exist_ok=True)
-
-    # 캔버스 및 합성 맵 준비
-    W, H = original_image.size
-    aggregated_attention_map = np.zeros((H, W), dtype=np.float32)
-
-    # 각 crop의 맵을 원본 좌표계로 업샘플하여 합성
-    for crop in crop_list:
-        if 'bbox' not in crop or 'att_avg_masked' not in crop:
-            continue
-
-        left, top, right, bottom = map(int, crop['bbox'])
-        cw = max(0, right - left)
-        ch = max(0, bottom - top)
-        if cw == 0 or ch == 0:
-            continue
-
-        att_low = crop['att_avg_masked']
-        att_up = upsample_att_map(att_low, size=(ch, cw))
-
-        # 개별 맵 저장(옵션)
-        if individual_maps_dir:
-            indiv = np.zeros((H, W), dtype=np.float32)
-            indiv[top:bottom, left:right] = att_up
-            plt.figure(figsize=(10, 10 * H / W))
-            plt.imshow(original_image, extent=(0, W, H, 0))
-            plt.imshow(indiv, cmap='viridis', alpha=0.6, extent=(0, W, H, 0))
-            plt.axis('off')
-            ttl = f"Crop ID: {crop.get('id','?')}"
-            plt.title(ttl)
-            path = os.path.join(individual_maps_dir, f"individual_attn_crop_{crop.get('id','unk')}.png")
-            plt.savefig(path, dpi=150, bbox_inches='tight', pad_inches=0)
-            plt.close()
-
-        aggregated_attention_map[top:bottom, left:right] += att_up
-
-    # 이웃합 기반 상위 점 선정
-    top_points = []
-    scores = []  # boxfilter_sum으로 얻은 이웃합 값
-
-    if aggregated_attention_map.max() > 0:
-        normalized = aggregated_attention_map / (aggregated_attention_map.max() + 1e-8)
-        smoothed = boxfilter_sum(normalized, neigh_radius)
-
-        # greedy NMS로 상위 K개 점 선택
-        sm = smoothed.copy()
-        Hh, Ww = sm.shape
-
-        for _ in range(int(topk_points)):
-            idx = int(np.argmax(sm))
-            vy, vx = divmod(idx, Ww)
-            best_val = sm[vy, vx]
-            if not np.isfinite(best_val) or best_val <= 0:
-                break
-            # 점 기록
-            top_points.append((int(vx), int(vy)))
-            scores.append(float(best_val))
-            # 정사각형 억제
-            y1 = max(0, vy - min_dist_pix); y2 = min(Hh - 1, vy + min_dist_pix)
-            x1 = max(0, vx - min_dist_pix); x2 = min(Ww - 1, vx + min_dist_pix)
-            sm[y1:y2+1, x1:x2+1] = -np.inf
-
-    # 성공 판정: top-1 기준
-    is_grounding_success = False
-    if len(top_points) > 0:
-        cx, cy = top_points[0]
-        gl, gt, gr, gb = gt_bbox
-        is_grounding_success = (gl <= cx <= gr) and (gt <= cy <= gb)
-        print(f"🎯 Our Grounding: {(cx, cy)} , GT: {gt_bbox}, Neigh_sum: {scores[0]:.2f}")
     else:
-        print("Aggregated attention map empty 또는 peak 없음")
+        print("⚠️ No attention scores found for visualization")
 
-    # 시각화: 공통 바탕
-    fig, ax = plt.subplots(figsize=(10, 10 * H / W))
-    ax.imshow(original_image, extent=(0, W, H, 0))
-    ax.imshow(aggregated_attention_map, cmap='viridis', alpha=0.6, extent=(0, W, H, 0))
 
-    # 그냥 Attention 상태만 저장 -> 가리는거 없이 보이도록.
-    plt.savefig(inst_dir + "/s2_result_only.png", dpi=300, bbox_inches="tight", pad_inches=0)
-
-    # GT 박스(초록)
-    gl, gt, gr, gb = gt_bbox
-    gt_rect = patches.Rectangle((gl, gt), gr - gl, gb - gt, linewidth=3, edgecolor='lime', facecolor='none')
-    ax.add_patch(gt_rect)
-
-    # 범례
-    green_patch = patches.Patch(color='lime', label='Ground Truth BBox')
-    star_legend = Line2D([0], [0], marker='*', color='w', label='NeighSum Top-1', 
-                         markerfacecolor='yellow', markeredgecolor='black', markersize=star_marker_size)
-    ax.legend([green_patch, star_legend], ['Ground Truth BBox', 'NeighSum Top-1'], loc='best')
-
-    ax.axis('off')
-    ax.set_title("Attention (aggregated) + NeighSum Peaks")
-    plt.tight_layout()
-
-    # 시각화: top-1 별표, top-2~5 검정 점, top-k 텍스트 라벨
-    if len(top_points) > 0:
-        # top-1 별표
-        ax.plot(top_points[0][0], top_points[0][1], 'y*',
-                markersize=star_marker_size, markeredgecolor='black')
-
-        # top-2~5 검정 점
-        for i in range(1, min(len(top_points), topk_points)):
-            px, py = top_points[i]
-            ax.plot(px, py, 'o', 
-                    markersize=dot_marker_size, markerfacecolor='black', markeredgecolor='white', markeredgewidth=0.9)
-
-        # top-k 텍스트(모두 표기: 점수만)
-        for (px, py), sc in zip(top_points, scores):
-            label = f"{sc:.3f}"
-            ax.text(px + 10, py - 10, label,
-                    fontsize=text_fontsize, color='white', ha='left', va='top',
-                    path_effects=[pe.withStroke(linewidth=2, foreground='black')])
-
-    plt.savefig(inst_dir + "/s2_result_star.png", dpi=300, bbox_inches="tight", pad_inches=0)
-    plt.close(fig)
-
-    return bool(is_grounding_success)
-
-def _visualize_early_exit_results(crop_list, pred, top_point, gt_bbox, attn_vis_dir, instruction, img_path):
-    """Early Exit 시각화"""
-    s1_att_vis_path = attn_vis_dir + "/output.png"
-    visualize_results(crop_list, pred, instruction=instruction, save_path=s1_att_vis_path)
+def visualize_stage2_merged_attention(s2_pred, merged_img, save_dir, instruction, predicted_point=None):
+    """Stage 2 합쳐진 이미지에 attention 맵과 예측 점을 시각화"""
     
-    # 임시로 빈 리스트로 처리 (Early Exit이므로 crop selection 없음)
-    visualize_crop(save_dir=attn_vis_dir, gt_bbox=gt_bbox, 
-                   top_q_bboxes=[], instruction=instruction, filename="ee_gt_vis.png", img_path=img_path,
-                    click_point=top_point)
-
-
-def _visualize_stage1_results(crop_list, pred, attn_vis_dir, instruction):
-    """일반 Stage1 시각화"""
-    s1_att_vis_path = attn_vis_dir + "/output.png"
-    visualize_results(crop_list, pred, instruction=instruction, save_path=s1_att_vis_path)
-
-
-def _visualize_stage2_results(save_dir, crop_list, pred, gt_bbox, click_point, instruction, img_path):
-    """Stage 2 결과 시각화"""
-    s2_att_vis_path = save_dir + "/output.png"
-    visualize_results(crop_list, pred, instruction=instruction, save_path=s2_att_vis_path)
-    visualize_crop(save_dir=save_dir, gt_bbox=gt_bbox, top_q_bboxes=[], 
-                   instruction=instruction, filename="gt_vis.png", click_point=click_point, img_path=img_path)
+    # 1. Attention 맵 생성
+    if 'attn_scores' in s2_pred and s2_pred['attn_scores']:
+        attn_scores = np.array(s2_pred['attn_scores'][0])
+        n_width = s2_pred['n_width']
+        n_height = s2_pred['n_height']
+        
+        # 합쳐진 이미지에 attention 맵 오버레이
+        blended_img = get_attn_map(
+            image=merged_img,
+            attn_scores=attn_scores,
+            n_width=n_width,
+            n_height=n_height
+        )
+        
+        # 2. 예측 점에 별 표시
+        if predicted_point and s2_pred.get("topk_points"):
+            # 정규화된 좌표를 픽셀 좌표로 변환
+            top_point_normalized = s2_pred["topk_points"][0]
+            
+            draw = ImageDraw.Draw(blended_img)
+            
+            # 별 그리기
+            img_w, img_h = merged_img.size
+            star_x = int(top_point_normalized[0] * img_w)
+            star_y = int(top_point_normalized[1] * img_h)
+            
+            # 별 모양 그리기 (간단한 X 모양)
+            star_size = 20
+            draw.line([star_x - star_size, star_y - star_size, star_x + star_size, star_y + star_size], 
+                     fill="yellow", width=5)
+            draw.line([star_x - star_size, star_y + star_size, star_x + star_size, star_y - star_size], 
+                     fill="yellow", width=5)
+            draw.line([star_x, star_y - star_size, star_x, star_y + star_size], 
+                     fill="yellow", width=5)
+            draw.line([star_x - star_size, star_y, star_x + star_size, star_y], 
+                     fill="yellow", width=5)
+            
+            # 중심점 표시
+            draw.ellipse([star_x - 5, star_y - 5, star_x + 5, star_y + 5], 
+                        fill="red", outline="black", width=2)
+        
+        # 4. Top-5 attention 점수 표시한 결과 저장
+        os.makedirs(save_dir, exist_ok=True)
+        attn_scores_np = np.array(s2_pred['attn_scores'][0])
+        img_with_attns = draw_top_patch_attentions(
+            blended_img.copy(),
+            attn_scores_np,
+            n_width,
+            n_height,
+            top_k=5
+        )
+        
+        save_path = os.path.join(save_dir, "s2_merged_attention.png")
+        img_with_attns.save(save_path)
+        # print(f"🌄 Stage 2 visualization : {save_path}")
+    
+    else:
+        print("⚠️ No attention scores found for Stage 2 visualization")
