@@ -29,7 +29,7 @@ ATTENTION_BOX_SIZE = CROP_HEIGHT  # 고점 주변 무시할 네모 범위 크기
 # 앙상블용 상위 패치 개수
 ENSEMBLE_TOP_PATCHES = 100  # Stage2에서 앙상블에 사용할 상위 패치 개수 (100개여도 충분한듯?)
 
-memo = f"attention_{S1_RESIZE_RATIO:.2f}_ensemble_{ATTENTION_ENSEMBLE_RATIO:.2f}_{CROP_ENSEMBLE_RATIO:.2f}_select_{SELECT_THRESHOLD:.2f}"
+memo = f"resize_{S1_RESIZE_RATIO:.2f}_ensemble_{ATTENTION_ENSEMBLE_RATIO:.2f}_{CROP_ENSEMBLE_RATIO:.2f}_select_{SELECT_THRESHOLD:.2f}"
 
 #! Argument ==========================================================================================
 
