@@ -2,6 +2,7 @@ import os
 import argparse
 
 parser = argparse.ArgumentParser()
+parser.add_argument('--resize', type=float, help='Stage 1 Resize ratio')
 parser.add_argument('gpu', type=int, help='GPU number')
 args = parser.parse_args()
 
@@ -13,23 +14,25 @@ os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu)  # 몇번 GPU 사용할지 ar
 ATTN_IMPL = "eager"  # attention implement "eager" "sdpa" "flash" "efficient"
 
 # Image Resize Ratios
-S1_RESIZE_RATIO = 0.50  #! 모바일은 낮아도 content가 커서 괜찮. 나머지는 pixel대비 content가 작아서 resize를 너무하면안됨
+S1_RESIZE_RATIO = args.resize if args.resize else 0.50  #! 모바일은 낮아도 content가 커서 괜찮. 나머지는 pixel대비 content가 작아서 resize를 너무하면안됨
 
-SELECT_THRESHOLD = 0.50  # score >= tau * max_score 인 모든 crop select
+SELECT_THRESHOLD = 0.50  #! score >= tau * max_score 인 모든 crop select
 
 # Ensemble Hyperparameters
-ATTENTION_ENSEMBLE_RATIO = 0.50  # Stage1 attention 가중치
-CROP_ENSEMBLE_RATIO = 1 - ATTENTION_ENSEMBLE_RATIO  # Stage2 crop 가중치
+STAGE1_ENSEMBLE_RATIO = 0.40  #! Stage1 attention 가중치
+STAGE2_ENSEMBLE_RATIO = 1 - STAGE1_ENSEMBLE_RATIO  # Stage2 crop 가중치
 
-# Attention 기반 크롭핑 하이퍼파라미터
-CROP_WIDTH = 1080  # 크롭할 직사각형 가로 크기
-CROP_HEIGHT = 540  # 크롭할 직사각형 세로 크기
-ATTENTION_BOX_SIZE = CROP_HEIGHT  # 고점 주변 무시할 네모 범위 크기
+# Crop 개수 제한
+MAX_CROPS = 3  # 생성할 수 있는 최대 crop 개수
+
+# Attention 기반 크롭핑 하이퍼파라미터 (14의 배수 = Patch Size 14x14)
+CROP_WIDTH = 1190  # 크롭할 직사각형 가로 크기 (아이폰 전체 가로가 1170px)
+CROP_HEIGHT = 560  # 크롭할 직사각형 세로 크기
 
 # 앙상블용 상위 패치 개수
 ENSEMBLE_TOP_PATCHES = 100  # Stage2에서 앙상블에 사용할 상위 패치 개수 (100개여도 충분한듯?)
 
-memo = f"resize_{S1_RESIZE_RATIO:.2f}_ensemble_{ATTENTION_ENSEMBLE_RATIO:.2f}_{CROP_ENSEMBLE_RATIO:.2f}_select_{SELECT_THRESHOLD:.2f}"
+memo = f"new_resize_{S1_RESIZE_RATIO:.2f}_ensemble_{STAGE1_ENSEMBLE_RATIO:.2f}_{STAGE2_ENSEMBLE_RATIO:.2f}_select_{SELECT_THRESHOLD:.2f}"
 
 #! Argument ==========================================================================================
 
@@ -49,7 +52,7 @@ SAMPLE_RANGE = slice(None)
 # Visualize & Logging
 STAGE1_VIS = True
 STAGE2_VIS = True
-VIS_ONLY_WRONG = True  # True면 틀린 것만 시각화, False면 모든 것 시각화
+VIS_ONLY_WRONG = False  # True면 틀린 것만 시각화, False면 모든 것 시각화
 TFOPS_PROFILING = True
 MEMORY_EVAL = True
 MEMORY_VIS = False
@@ -217,7 +220,7 @@ def run_stage1_attention_inference(original_image, instruction):
     return pred, resized_image
 
 def find_attention_peaks(pred_result, resized_image, resize_ratio):
-    """어텐션에서 고점들 찾기 (주변 박스는 같은 것으로 취급)"""
+    """어텐션에서 고점들 찾기 (bbox 생성 후 중심점 거리로 중복 제거)"""
     
     attn_scores = np.array(pred_result['attn_scores'][0])
     n_width = pred_result['n_width'] 
@@ -229,46 +232,74 @@ def find_attention_peaks(pred_result, resized_image, resize_ratio):
     patch_w = resized_w / n_width
     patch_h = resized_h / n_height
     
-    # 원본 이미지 기준 ATTENTION_BOX_SIZE를 리사이즈된 이미지 기준으로 변환
-    attention_box_size_resized = ATTENTION_BOX_SIZE * resize_ratio
-    
     # 점수가 높은 순서로 정렬
     sorted_indices = np.argsort(attn_scores)[::-1]
     
     peaks = []
-    used_positions = set()
+    used_bbox_centers = []  # 이미 사용된 bbox 중심점들
     
     for idx in sorted_indices:
         # 패치 좌표 계산
         patch_y = idx // n_width
         patch_x = idx % n_width
         
-        # 이미 사용된 박스 범위인지 확인 (리사이즈된 기준으로)
+        # 패치 중심점의 픽셀 좌표 (리사이즈된 이미지 기준)
+        center_x = (patch_x + 0.5) * patch_w
+        center_y = (patch_y + 0.5) * patch_h
+        
+        # 원본 이미지 기준으로 변환
+        orig_center_x = center_x / resize_ratio
+        orig_center_y = center_y / resize_ratio
+        
+        # 원본 이미지에서 bbox 계산 (실제 크롭이 생성될 위치)
+        orig_w = resized_w / resize_ratio
+        orig_h = resized_h / resize_ratio
+        
+        left = max(0, int(orig_center_x - CROP_WIDTH/2))
+        top = max(0, int(orig_center_y - CROP_HEIGHT/2))
+        right = min(orig_w, int(orig_center_x + CROP_WIDTH/2))
+        bottom = min(orig_h, int(orig_center_y + CROP_HEIGHT/2))
+        
+        # 경계에서 잘렸을 경우 조정
+        if right - left < CROP_WIDTH and right < orig_w:
+            right = min(orig_w, left + int(CROP_WIDTH))
+        if right - left < CROP_WIDTH and left > 0:
+            left = max(0, right - int(CROP_WIDTH))
+        if bottom - top < CROP_HEIGHT and bottom < orig_h:
+            bottom = min(orig_h, top + int(CROP_HEIGHT))
+        if bottom - top < CROP_HEIGHT and top > 0:
+            top = max(0, bottom - int(CROP_HEIGHT))
+        
+        # 실제 bbox 중심점 계산
+        bbox_center_x = (left + right) / 2
+        bbox_center_y = (top + bottom) / 2
+        
+        # 이미 사용된 bbox와 중복되는지 확인
         skip = False
-        for used_x, used_y in used_positions:
-            if abs(patch_x - used_x) * patch_w < attention_box_size_resized and abs(patch_y - used_y) * patch_h < attention_box_size_resized:
+        for used_center in used_bbox_centers:
+            x_distance = abs(bbox_center_x - used_center[0])
+            y_distance = abs(bbox_center_y - used_center[1])
+            # bbox 중심점이 너무 가까우면 스킵 (크롭 크기의 30% 이내)
+            if x_distance < CROP_WIDTH * 0.3 and y_distance < CROP_HEIGHT * 0.3:
                 skip = True
                 break
         
         if not skip:
-            # 패치 중심점의 픽셀 좌표
-            center_x = (patch_x + 0.5) * patch_w
-            center_y = (patch_y + 0.5) * patch_h
-            
             peaks.append({
-                'center_x': center_x,
-                'center_y': center_y, 
+                'center_x': center_x,  # 리사이즈된 이미지 기준 (기존 호환성)
+                'center_y': center_y,
                 'score': float(attn_scores[idx]),
                 'patch_x': patch_x,
-                'patch_y': patch_y
+                'patch_y': patch_y,
+                'bbox_center': (bbox_center_x, bbox_center_y)  # 실제 bbox 중심점
             })
             
-            used_positions.add((patch_x, patch_y))
+            used_bbox_centers.append((bbox_center_x, bbox_center_y))
     
     return peaks
 
-def filter_by_threshold(peaks, threshold=0.7):
-    """1등의 threshold% 이상인 peak들만 남기기"""
+def filter_by_threshold(peaks, threshold=0.7, max_crops=MAX_CROPS):
+    """1등의 threshold% 이상인 peak들만 남기고, 최대 개수 제한 적용"""
     
     if not peaks:
         return []
@@ -276,9 +307,14 @@ def filter_by_threshold(peaks, threshold=0.7):
     max_score = peaks[0]['score']  # 이미 정렬되어 있음
     min_score = max_score * threshold
     
+    # threshold 조건으로 먼저 필터링
     filtered_peaks = [peak for peak in peaks if peak['score'] >= min_score]
     
-    print(f"🎯 Found {len(peaks)} peaks, filtered to {len(filtered_peaks)} (threshold: {threshold})")
+    # 최대 개수 제한 적용 (상위 점수순으로)
+    if len(filtered_peaks) > max_crops:
+        filtered_peaks = filtered_peaks[:max_crops]
+    
+    print(f"🎯 Found {len(peaks)} peaks, filtered to {len(filtered_peaks)} (threshold: {threshold}, max_crops: {max_crops})")
     
     return filtered_peaks
 
@@ -326,31 +362,75 @@ def create_crops_from_attention_peaks(peaks, original_image, resize_ratio):
     
     return crops
 
-def create_merged_image_for_stage2(crops):
-    """Stage 2용: crop들을 세로로 합치기 (빨간 줄로 구분)"""
+# def create_merged_image_for_stage2(crops):
+#     """Stage 2용: crop들을 세로로 합치기 (빨간 줄로 구분)"""
     
+#     if not crops:
+#         return None, []
+    
+#     # 세로로 합칠 이미지들
+#     separator_height = 10  # 빨간 줄 두께
+#     total_height = sum(crop['img'].height for crop in crops)
+#     total_height += (len(crops) - 1) * separator_height  # 구분선들
+#     max_width = max(crop['img'].width for crop in crops)
+    
+#     # 합쳐진 이미지 생성
+#     merged_img = Image.new('RGB', (max_width, total_height), color=(255, 255, 255))
+    
+#     # Y 좌표 매핑 정보 저장 (좌표 변환용)
+#     crop_y_mappings = []
+#     current_y = 0
+    
+#     for i, crop in enumerate(crops):
+#         # 이미지 중앙 정렬하여 붙이기
+#         paste_x = (max_width - crop['img'].width) // 2
+#         merged_img.paste(crop['img'], (paste_x, current_y))
+        
+#         # 매핑 정보 저장: (merged_y_start, merged_y_end) -> (original_bbox)ㄹ
+#         crop_y_mappings.append({
+#             'merged_y_start': current_y,
+#             'merged_y_end': current_y + crop['img'].height,
+#             'original_bbox': crop['bbox'],
+#             'paste_x': paste_x
+#         })
+        
+#         current_y += crop['img'].height
+        
+#         # 마지막이 아니면 빨간 구분선 추가
+#         if i < len(crops) - 1:
+#             from PIL import ImageDraw
+#             draw = ImageDraw.Draw(merged_img)
+#             draw.rectangle([0, current_y, max_width, current_y + separator_height], 
+#                          fill=(255, 0, 0))
+#             current_y += separator_height
+    
+#     return merged_img, crop_y_mappings
+
+
+def create_merged_image_for_stage2(crops):
+    """Stage 2용: crop들을 세로로 합치기 (검정 구분선 이미지로 분리) - bbox y좌표 순으로 정렬"""
+
     if not crops:
         return None, []
     
-    # 세로로 합칠 이미지들
-    separator_height = 10  # 빨간 줄 두께
-    total_height = sum(crop['img'].height for crop in crops)
-    total_height += (len(crops) - 1) * separator_height  # 구분선들
-    max_width = max(crop['img'].width for crop in crops)
+    # bbox의 y좌표(top) 순으로 정렬 (위에서 아래로)
+    sorted_crops = sorted(crops, key=lambda crop: crop['bbox'][1])
     
-    # 합쳐진 이미지 생성
-    merged_img = Image.new('RGB', (max_width, total_height), color=(255, 255, 255))
+    # 세로로 합칠 이미지들과 구분선들을 별도로 준비
+    separator_height = 28  # 검정 구분선 두께
+    max_width = max(crop['img'].width for crop in sorted_crops)
     
-    # Y 좌표 매핑 정보 저장 (좌표 변환용)
+    # 합칠 이미지들 리스트 (crop 이미지 + 구분선 이미지들)
+    images_to_merge = []
     crop_y_mappings = []
     current_y = 0
     
-    for i, crop in enumerate(crops):
-        # 이미지 중앙 정렬하여 붙이기
-        paste_x = (max_width - crop['img'].width) // 2
-        merged_img.paste(crop['img'], (paste_x, current_y))
+    for i, crop in enumerate(sorted_crops):
+        # crop 이미지 추가
+        images_to_merge.append(crop['img'])
         
-        # 매핑 정보 저장: (merged_y_start, merged_y_end) -> (original_bbox)ㄹ
+        # 매핑 정보 저장: (merged_y_start, merged_y_end) -> (original_bbox)
+        paste_x = (max_width - crop['img'].width) // 2
         crop_y_mappings.append({
             'merged_y_start': current_y,
             'merged_y_end': current_y + crop['img'].height,
@@ -360,15 +440,39 @@ def create_merged_image_for_stage2(crops):
         
         current_y += crop['img'].height
         
-        # 마지막이 아니면 빨간 구분선 추가
-        if i < len(crops) - 1:
-            from PIL import ImageDraw
-            draw = ImageDraw.Draw(merged_img)
-            draw.rectangle([0, current_y, max_width, current_y + separator_height], 
-                         fill=(255, 0, 0))
+        # 마지막이 아니면 검정 구분선 이미지 추가
+        if i < len(sorted_crops) - 1:
+            separator_img = Image.new('RGB', (max_width, separator_height), color=(0, 0, 0))
+            images_to_merge.append(separator_img)
             current_y += separator_height
     
+    # 총 높이 계산
+    total_height = current_y
+    
+    # 합쳐진 이미지 생성
+    merged_img = Image.new('RGB', (max_width, total_height), color=(0, 0, 0))
+    
+    # 이미지들을 순서대로 붙이기
+    paste_y = 0
+    image_idx = 0
+    
+    for i, crop in enumerate(sorted_crops):
+        # crop 이미지 붙이기 (중앙 정렬)
+        crop_img = images_to_merge[image_idx]
+        paste_x = (max_width - crop_img.width) // 2
+        merged_img.paste(crop_img, (paste_x, paste_y))
+        paste_y += crop_img.height
+        image_idx += 1
+        
+        # 구분선 이미지 붙이기 (마지막이 아닌 경우)
+        if i < len(sorted_crops) - 1:
+            separator_img = images_to_merge[image_idx]
+            merged_img.paste(separator_img, (0, paste_y))
+            paste_y += separator_img.height
+            image_idx += 1
+    
     return merged_img, crop_y_mappings
+
 
 def run_stage2_merged_inference(merged_img, instruction):
     """Stage 2: 합쳐진 이미지로 inference"""
@@ -618,7 +722,7 @@ def create_crop_point_based_attention_maps(s2_corrected_point, s1_crop_list, ori
     
     return crop_attention_maps
 
-def ensemble_attention_maps(stage1_attention_map, crop_attention_maps, attention_ratio=ATTENTION_ENSEMBLE_RATIO, crop_ratio=CROP_ENSEMBLE_RATIO):
+def ensemble_attention_maps(stage1_attention_map, crop_attention_maps, attention_ratio=STAGE1_ENSEMBLE_RATIO, crop_ratio=STAGE2_ENSEMBLE_RATIO):
     """Stage1 어텐션과 크롭 어텐션들을 앙상블 (벡터화된 고속 버전)"""
     
     orig_h, orig_w = stage1_attention_map.shape
@@ -722,8 +826,8 @@ def run_stage1_attention_based(original_image, instruction, gt_bbox):
         print("⚠️ No attention peaks found")
         return s1_pred, [], 0, resized_image, scaled_gt_bbox
     
-    # 4. 1등의 70% 이상만 남기기
-    filtered_peaks = filter_by_threshold(peaks, threshold=SELECT_THRESHOLD)
+    # 4. 1등의 70% 이상만 남기고 최대 개수 제한 적용
+    filtered_peaks = filter_by_threshold(peaks, threshold=SELECT_THRESHOLD, max_crops=MAX_CROPS)
     
     if not filtered_peaks:
         print("⚠️ No peaks passed threshold")
@@ -865,14 +969,6 @@ if __name__ == '__main__':
             # data_source 정보 추출 (없으면 "unknown"으로 기본값 설정)
             data_source = item.get("data_source", "unknown")
 
-            
-            # 디렉토리 설정 (시각화용 - 필요시에만)
-            if any([STAGE1_VIS, STAGE2_VIS]):
-                inst_dir_name = re.sub(r'\W+', '_', instruction).strip('_')
-                inst_dir = os.path.join(save_dir, "visualize", filename_wo_ext, inst_dir_name)
-            else:
-                inst_dir = None
-
             #! ==================================================================
             #! Stage 1 | Attention-based Crop Generation
             #! ==================================================================
@@ -984,8 +1080,8 @@ if __name__ == '__main__':
                 stage2_normalized = np.zeros_like(stage2_attention_map)
             
             # 최종 앙상블 맵 계산
-            ensemble_map = (ATTENTION_ENSEMBLE_RATIO * stage1_normalized + 
-                           CROP_ENSEMBLE_RATIO * stage2_normalized)
+            ensemble_map = (STAGE1_ENSEMBLE_RATIO * stage1_normalized + 
+                           STAGE2_ENSEMBLE_RATIO * stage2_normalized)
             
             # 앙상블 결과에서 최적점 찾기
             s3_ensemble_point, ensemble_score = find_ensemble_best_point(ensemble_map)
@@ -1023,86 +1119,92 @@ if __name__ == '__main__':
             #! [Visualization - After Time Measurement]
             #! ==================================================================
             
-            # Stage1 시각화
-            if STAGE1_VIS and inst_dir and (not VIS_ONLY_WRONG or not stage3_ensemble_success):
-                from visualize_util import visualize_stage1_attention_crops
-                visualize_stage1_attention_crops(
-                    s1_pred=s1_pred,
-                    resized_image=resized_image, 
-                    crop_list=s1_crop_list,
-                    original_image=original_image,
-                    save_dir=inst_dir,
-                    instruction=instruction,
-                    gt_bbox=original_bbox
-                )
-            
-            # Stage2 시각화
-            if STAGE2_VIS and inst_dir and s2_merged_img is not None and (not VIS_ONLY_WRONG or not stage3_ensemble_success):
-                from visualize_util import visualize_stage2_merged_attention
-                visualize_stage2_merged_attention(
-                    s2_pred=s2_pred,
-                    merged_img=s2_merged_img,
-                    save_dir=inst_dir,
-                    instruction=instruction,
-                    predicted_point=s2_corrected_point
-                )
-                
-                # 앙상블 결과도 시각화 (s3_ensemble_point와 ensemble_map 추가)
-                if s3_ensemble_point is not None:
-                    os.makedirs(inst_dir, exist_ok=True)
-                    
-                    # 앙상블 맵 시각화
-                    plt.figure(figsize=(12, 8))
-                    plt.imshow(ensemble_map, cmap='hot', interpolation='nearest')
-                    plt.colorbar(label='Ensemble Score')
-                    plt.title('Ensemble Attention Map')
-                    
-                    # 예측점과 GT 표시
-                    plt.plot(s3_ensemble_point[0], s3_ensemble_point[1], 'bo', markersize=10, label='Ensemble Prediction')
-                    
-                    # GT를 초록색 박스로 표시
-                    from matplotlib.patches import Rectangle
-                    gt_rect = Rectangle((original_bbox[0], original_bbox[1]), 
-                                      original_bbox[2] - original_bbox[0], 
-                                      original_bbox[3] - original_bbox[1],
-                                      linewidth=2, edgecolor='lime', facecolor='none', label='Ground Truth')
-                    plt.gca().add_patch(gt_rect)
-                    plt.legend()
-                    
-                    plt.savefig(os.path.join(inst_dir, 's3_ensemble_map.png'), dpi=150, bbox_inches='tight')
-                    plt.close()
-                    
-                    # 원본 이미지에 결과 오버레이
-                    plt.figure(figsize=(15, 10))
-                    plt.imshow(original_image)
-                    
-                    # 크롭 박스들 표시
-                    for i, crop in enumerate(s1_crop_list):
-                        bbox = crop['bbox']
-                        rect = plt.Rectangle((bbox[0], bbox[1]), bbox[2]-bbox[0], bbox[3]-bbox[1], 
-                                           fill=False, edgecolor='yellow', linewidth=2, alpha=0.7)
-                        plt.gca().add_patch(rect)
-                        plt.text(bbox[0], bbox[1]-10, f'Crop{i+1}', color='yellow', fontsize=10)
-                    
-                    # GT를 초록색 박스로 표시
-                    gt_rect = Rectangle((original_bbox[0], original_bbox[1]), 
-                                      original_bbox[2] - original_bbox[0], 
-                                      original_bbox[3] - original_bbox[1],
-                                      linewidth=3, edgecolor='lime', facecolor='none', label='Ground Truth')
-                    plt.gca().add_patch(gt_rect)
-                    
-                    # 예측점들 표시
-                    plt.plot(s3_ensemble_point[0], s3_ensemble_point[1], 'bo', markersize=12, label='Ensemble Prediction')
-                    plt.plot(s2_corrected_point[0], s2_corrected_point[1], 'go', markersize=10, label='S2 Original Prediction')
-                    
-                    plt.title(f'Ensemble Result (Attn:{ATTENTION_ENSEMBLE_RATIO}, Crop:{CROP_ENSEMBLE_RATIO})')
-                    plt.legend()
-                    plt.axis('off')
-                    
-                    plt.savefig(os.path.join(inst_dir, 's3_ensemble_result.png'), dpi=150, bbox_inches='tight')
-                    plt.close()
+            # 시각화용 디렉토리 설정 (stage3 결과에 따라)
+            if any([STAGE1_VIS, STAGE2_VIS]) and (len(s1_crop_list) >= 2 or (s2_hit != s3_ensemble_hit)):  #! 잠시 크롭이 2개 이상일 때만 시각화
+                inst_dir_name = re.sub(r'\W+', '_', instruction).strip('_')
+                result_folder = "correct" if stage3_ensemble_success else "incorrect"
+                inst_dir = os.path.join(save_dir, "visualize", result_folder, f"{num_action}_{inst_dir_name}")
 
-            num_attention_crops = len(s1_crop_list) if s1_crop_list else 0
+                # Stage1 시각화
+                if STAGE1_VIS and inst_dir and (not VIS_ONLY_WRONG or not stage3_ensemble_success):
+                    from visualize_util import visualize_stage1_attention_crops
+                    visualize_stage1_attention_crops(
+                        s1_pred=s1_pred,
+                        resized_image=resized_image, 
+                        crop_list=s1_crop_list,
+                        original_image=original_image,
+                        save_dir=inst_dir,
+                        instruction=instruction,
+                        gt_bbox=original_bbox
+                    )
+                
+                # Stage2 시각화
+                if STAGE2_VIS and inst_dir and s2_merged_img is not None and (not VIS_ONLY_WRONG or not stage3_ensemble_success):
+                    from visualize_util import visualize_stage2_merged_attention
+                    visualize_stage2_merged_attention(
+                        s2_pred=s2_pred,
+                        merged_img=s2_merged_img,
+                        save_dir=inst_dir,
+                        instruction=instruction,
+                        predicted_point=s2_corrected_point
+                    )
+                    
+                    # 앙상블 결과도 시각화 (s3_ensemble_point와 ensemble_map 추가)
+                    if s3_ensemble_point is not None:
+                        os.makedirs(inst_dir, exist_ok=True)
+                        
+                        # 앙상블 맵 시각화
+                        plt.figure(figsize=(12, 8))
+                        plt.imshow(ensemble_map, cmap='hot', interpolation='nearest')
+                        plt.colorbar(label='Ensemble Score')
+                        plt.title('Ensemble Attention Map')
+                        
+                        # 예측점과 GT 표시
+                        plt.plot(s3_ensemble_point[0], s3_ensemble_point[1], 'bo', markersize=10, label='Ensemble Prediction')
+                        
+                        # GT를 초록색 박스로 표시
+                        from matplotlib.patches import Rectangle
+                        gt_rect = Rectangle((original_bbox[0], original_bbox[1]), 
+                                        original_bbox[2] - original_bbox[0], 
+                                        original_bbox[3] - original_bbox[1],
+                                        linewidth=2, edgecolor='lime', facecolor='none', label='Ground Truth')
+                        plt.gca().add_patch(gt_rect)
+                        plt.legend()
+                        
+                        plt.savefig(os.path.join(inst_dir, 's3_ensemble_map.png'), dpi=150, bbox_inches='tight')
+                        plt.close()
+                        
+                        # 원본 이미지에 결과 오버레이
+                        plt.figure(figsize=(15, 10))
+                        plt.imshow(original_image)
+                        
+                        # 크롭 박스들 표시
+                        for i, crop in enumerate(s1_crop_list):
+                            bbox = crop['bbox']
+                            rect = plt.Rectangle((bbox[0], bbox[1]), bbox[2]-bbox[0], bbox[3]-bbox[1], 
+                                            fill=False, edgecolor='yellow', linewidth=2, alpha=0.7)
+                            plt.gca().add_patch(rect)
+                            plt.text(bbox[0], bbox[1]-10, f'Crop{i+1}', color='yellow', fontsize=10)
+                        
+                        # GT를 초록색 박스로 표시
+                        gt_rect = Rectangle((original_bbox[0], original_bbox[1]), 
+                                        original_bbox[2] - original_bbox[0], 
+                                        original_bbox[3] - original_bbox[1],
+                                        linewidth=3, edgecolor='lime', facecolor='none', label='Ground Truth')
+                        plt.gca().add_patch(gt_rect)
+                        
+                        # 예측점들 표시
+                        plt.plot(s3_ensemble_point[0], s3_ensemble_point[1], 'bo', markersize=12, label='Ensemble Prediction')
+                        plt.plot(s2_corrected_point[0], s2_corrected_point[1], 'go', markersize=10, label='S2 Original Prediction')
+                        
+                        plt.title(f'Ensemble Result (Attn:{STAGE1_ENSEMBLE_RATIO}, Crop:{STAGE2_ENSEMBLE_RATIO})')
+                        plt.legend()
+                        plt.axis('off')
+                        
+                        plt.savefig(os.path.join(inst_dir, 's3_ensemble_result.png'), dpi=150, bbox_inches='tight')
+                        plt.close()
+
+            num_attention_crops = len(s1_crop_list)
             print(f"✂️  Attention Crops : {num_attention_crops}")
             print(f"🕖 Times - S1: {s1_time:.2f}s | S2: {s2_time:.2f}s | S3: {s3_ensemble_time:.2f}s | Total: {total_time:.2f}s")
             if TFOPS_PROFILING:
@@ -1226,8 +1328,8 @@ if __name__ == '__main__':
                 'total_tflops': s1_tflops+s2_tflops,
                 'peak_memory_gb': peak_memory_gb if MEMORY_EVAL else None,
                 'ensemble_config': {
-                    'attention_ratio': ATTENTION_ENSEMBLE_RATIO,
-                    'crop_ratio': CROP_ENSEMBLE_RATIO
+                    'attention_ratio': STAGE1_ENSEMBLE_RATIO,
+                    'crop_ratio': STAGE2_ENSEMBLE_RATIO
                 }
             }
             task_res.append(item_res)
@@ -1260,8 +1362,8 @@ if __name__ == '__main__':
             "hyperparameters": {
                 "select_threshold": SELECT_THRESHOLD,
                 "attn_impl": ATTN_IMPL,
-                "attention_ensemble_ratio": ATTENTION_ENSEMBLE_RATIO,
-                "crop_ensemble_ratio": CROP_ENSEMBLE_RATIO
+                "STAGE1_ensemble_ratio": STAGE1_ENSEMBLE_RATIO,
+                "STAGE2_ensemble_ratio": STAGE2_ENSEMBLE_RATIO
             }
         }
 
@@ -1294,8 +1396,8 @@ if __name__ == '__main__':
                     "hyperparameters": {
                         "select_threshold": SELECT_THRESHOLD,
                         "attn_impl": ATTN_IMPL,
-                        "attention_ensemble_ratio": ATTENTION_ENSEMBLE_RATIO,
-                        "crop_ensemble_ratio": CROP_ENSEMBLE_RATIO
+                        "STAGE1_ensemble_ratio": STAGE1_ENSEMBLE_RATIO,
+                        "STAGE2_ensemble_ratio": STAGE2_ENSEMBLE_RATIO
                     }
                 }
         
@@ -1313,6 +1415,6 @@ if __name__ == '__main__':
         print(f"Avg FLOPs: S1 {metrics['avg_flops_tflops']['stage1']:.2f} | S2 {metrics['avg_flops_tflops']['stage2']:.2f} | Total {metrics['avg_flops_tflops']['total']:.2f} TFLOPs")
         if MEMORY_EVAL and metrics['avg_peak_memory_gb'] is not None:
             print(f"Avg Peak Memory: {metrics['avg_peak_memory_gb']:.3f} GB")
-        print(f"Ensemble Config: Attention {ATTENTION_ENSEMBLE_RATIO:.1f}, Crop {CROP_ENSEMBLE_RATIO:.1f}")
+        print(f"Ensemble Config: Attention {STAGE1_ENSEMBLE_RATIO:.1f}, Crop {STAGE2_ENSEMBLE_RATIO:.1f}")
         
         print("=" * 60)
