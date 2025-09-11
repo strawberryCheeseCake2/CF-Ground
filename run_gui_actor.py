@@ -2,8 +2,9 @@ import os
 import argparse
 
 parser = argparse.ArgumentParser()
-parser.add_argument('--resize', type=float, help='Stage 1 Resize ratio')
 parser.add_argument('gpu', type=int, help='GPU number')
+parser.add_argument('--ensemble', type=float, help='Stage 1 Ensemble ratio')
+parser.add_argument('--resize', type=float, help='Stage 1 Resize ratio')
 args = parser.parse_args()
 
 os.environ["CUDA_DEVICE_ORDER"]="PCI_BUS_ID"
@@ -19,7 +20,7 @@ S1_RESIZE_RATIO = args.resize if args.resize else 0.50  #! 모바일은 낮아�
 SELECT_THRESHOLD = 0.50  #! score >= tau * max_score 인 모든 crop select
 
 # Ensemble Hyperparameters
-STAGE1_ENSEMBLE_RATIO = 0.40  #! Stage1 attention 가중치
+STAGE1_ENSEMBLE_RATIO = args.ensemble if args.ensemble else 0.50  #! Stage1 attention 가중치
 STAGE2_ENSEMBLE_RATIO = 1 - STAGE1_ENSEMBLE_RATIO  # Stage2 crop 가중치
 
 # Crop 개수 제한
@@ -30,7 +31,10 @@ CROP_WIDTH = 1190  # 크롭할 직사각형 가로 크기 (아이폰 전체 가�
 CROP_HEIGHT = 560  # 크롭할 직사각형 세로 크기
 
 # 앙상블용 상위 패치 개수
-ENSEMBLE_TOP_PATCHES = 100  # Stage2에서 앙상블에 사용할 상위 패치 개수 (100개여도 충분한듯?)
+ENSEMBLE_TOP_PATCHES = 100  # Stage2에서 앙상블에 사용할 상위 패치 개수
+
+# 최대 PIXELS 제한
+MAX_PIXELS = None if S1_RESIZE_RATIO < 1.0 else 3211264  # 100% 넣어준다면 OOM 방지
 
 memo = f"new_resize_{S1_RESIZE_RATIO:.2f}_ensemble_{STAGE1_ENSEMBLE_RATIO:.2f}_{STAGE2_ENSEMBLE_RATIO:.2f}_select_{SELECT_THRESHOLD:.2f}"
 
@@ -46,8 +50,8 @@ TASKS = ["mobile", "web", "desktop"]
 # TASKS = ["mobile"]
 # TASKS = ["web"]
 # TASKS = ["desktop"]
-SAMPLE_RANGE = slice(None)
-# SAMPLE_RANGE = slice(0,2)
+# SAMPLE_RANGE = slice(None)
+SAMPLE_RANGE = slice(0,2)
 
 # Visualize & Logging
 STAGE1_VIS = True
@@ -69,7 +73,6 @@ import json
 import re
 import sys
 import time
-import matplotlib.pyplot as plt
 import threading
 import os
 
@@ -85,6 +88,7 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from iter_logger import init_iter_logger, append_iter_log  # log csv 기록 파일
 from gui_actor.modeling_qwen25vl import Qwen2_5_VLForConditionalGenerationWithPointer
 from gui_actor.inference import inference
+from visualize_util import visualize_stage1_attention_crops, visualize_stage2_merged_attention, visualize_stage3_ensemble_attention
 if TFOPS_PROFILING:
     from deepspeed.profiling.flops_profiler import FlopsProfiler
 
@@ -101,6 +105,15 @@ class NpEncoder(json.JSONEncoder):
         if isinstance(obj, (np.bool_, bool)):
             return bool(obj)
         return super(NpEncoder, self).default(obj)
+
+def resize_image(image, resize_to_pixels=MAX_PIXELS):
+    image_width, image_height = image.size
+    if (resize_to_pixels is not None) and ((image_width * image_height) > resize_to_pixels):
+        resize_ratio = (resize_to_pixels / (image_width * image_height)) ** 0.5
+        image_width_resized, image_height_resized = int(image_width * resize_ratio), int(image_height * resize_ratio)
+        image = image.resize((image_width_resized, image_height_resized))
+        print(f"🔧 Resized image: {image_width}x{image_height} -> {image_width_resized}x{image_height_resized} (ratio: {resize_ratio:.3f})")
+    return image
 
 def warm_up_model(model, tokenizer, processor):
     print("🔄 Warming up the model...")
@@ -280,7 +293,7 @@ def find_attention_peaks(pred_result, resized_image, resize_ratio):
             x_distance = abs(bbox_center_x - used_center[0])
             y_distance = abs(bbox_center_y - used_center[1])
             # bbox 중심점이 너무 가까우면 스킵 (크롭 크기의 30% 이내)
-            if x_distance < CROP_WIDTH * 0.3 and y_distance < CROP_HEIGHT * 0.3:
+            if x_distance < CROP_WIDTH * 0.3 and y_distance < CROP_HEIGHT * 0.3:  #! 크롭
                 skip = True
                 break
         
@@ -361,51 +374,6 @@ def create_crops_from_attention_peaks(peaks, original_image, resize_ratio):
         # print(f"🔧 Crop {i+1}: center=({orig_center_x:.1f}, {orig_center_y:.1f}), bbox={bbox}, size={CROP_WIDTH}x{CROP_HEIGHT}")
     
     return crops
-
-# def create_merged_image_for_stage2(crops):
-#     """Stage 2용: crop들을 세로로 합치기 (빨간 줄로 구분)"""
-    
-#     if not crops:
-#         return None, []
-    
-#     # 세로로 합칠 이미지들
-#     separator_height = 10  # 빨간 줄 두께
-#     total_height = sum(crop['img'].height for crop in crops)
-#     total_height += (len(crops) - 1) * separator_height  # 구분선들
-#     max_width = max(crop['img'].width for crop in crops)
-    
-#     # 합쳐진 이미지 생성
-#     merged_img = Image.new('RGB', (max_width, total_height), color=(255, 255, 255))
-    
-#     # Y 좌표 매핑 정보 저장 (좌표 변환용)
-#     crop_y_mappings = []
-#     current_y = 0
-    
-#     for i, crop in enumerate(crops):
-#         # 이미지 중앙 정렬하여 붙이기
-#         paste_x = (max_width - crop['img'].width) // 2
-#         merged_img.paste(crop['img'], (paste_x, current_y))
-        
-#         # 매핑 정보 저장: (merged_y_start, merged_y_end) -> (original_bbox)ㄹ
-#         crop_y_mappings.append({
-#             'merged_y_start': current_y,
-#             'merged_y_end': current_y + crop['img'].height,
-#             'original_bbox': crop['bbox'],
-#             'paste_x': paste_x
-#         })
-        
-#         current_y += crop['img'].height
-        
-#         # 마지막이 아니면 빨간 구분선 추가
-#         if i < len(crops) - 1:
-#             from PIL import ImageDraw
-#             draw = ImageDraw.Draw(merged_img)
-#             draw.rectangle([0, current_y, max_width, current_y + separator_height], 
-#                          fill=(255, 0, 0))
-#             current_y += separator_height
-    
-#     return merged_img, crop_y_mappings
-
 
 def create_merged_image_for_stage2(crops):
     """Stage 2용: crop들을 세로로 합치기 (검정 구분선 이미지로 분리) - bbox y좌표 순으로 정렬"""
@@ -900,11 +868,11 @@ if __name__ == '__main__':
             md_name=f"iter_log_{task}.md",
             headers=[  # 순서 그대로 들어감
                 "idx", "orig_w", "orig_h", "num_crop",
-                "s1_time", "s1_tflops", "s1_hit", 
+                "s1_time", "s1_tflops", "s1_hit", "crop_hit",
                 "s2_time", "s2_tflops", "s2_hit", 
                 "s3_ensemble_time", "s3_ensemble_hit",
                 "total_time", "total_tflops", "peak_memory_gb", 
-                "s1_acc_uptonow", "s2_acc_uptonow", "s3_ensemble_acc_uptonow",
+                "s1_acc_uptonow", "crop_acc_uptonow", "s2_acc_uptonow", "s3_ensemble_acc_uptonow",
                 "filename", "instruction"
             ],
             write_md=False, use_fsync=True, use_lock=True
@@ -922,6 +890,7 @@ if __name__ == '__main__':
         s1_time_sum = s2_time_sum = s3_time_sum = 0.0
         s1_tflops_sum = s2_tflops_sum = 0.0
         stage1_success_count = stage2_success_count = stage3_ensemble_success_count = 0
+        crop_success_count = 0  # 새로운 crop 성공 카운터 추가
         peak_memory_sum = 0.0  # 피크 메모리 합계 추가
         
         # data_source별 통계 변수 초기화
@@ -961,11 +930,14 @@ if __name__ == '__main__':
                            original_bbox[0] + original_bbox[2], original_bbox[1] + original_bbox[3]]
 
             orig_w, orig_h = original_image.size
-            
-            resized_image = original_image
-            resize_ratio = 1.0
-            scaled_bbox = original_bbox
-                
+
+            if MAX_PIXELS is not None:
+                resized_image = resize_image(original_image, MAX_PIXELS)
+            else:
+                resized_image = original_image
+                resize_ratio = 1.0
+                scaled_bbox = original_bbox
+
             # data_source 정보 추출 (없으면 "unknown"으로 기본값 설정)
             data_source = item.get("data_source", "unknown")
 
@@ -991,19 +963,35 @@ if __name__ == '__main__':
             if TFOPS_PROFILING:
                 s1_tflops = prof.get_total_flops() / 1e12
 
-            # Stage1 성공 여부 확인 (GT가 생성된 crop들 중 하나라도 포함되는지 확인)
-            stage1_success = False
+            # Stage1 Grounding 성공 여부 확인 (실제 예측 결과)
+            s1_success = False
+            s1_original_point = None
+            if s1_pred and "topk_points" in s1_pred and s1_pred["topk_points"]:
+                s1_predicted_point = s1_pred["topk_points"][0]  # 정규화된 좌표 (0~1)
+                # 정규화된 좌표를 원본 이미지 픽셀 좌표로 변환
+                s1_original_point = [
+                    s1_predicted_point[0] * original_image.size[0],
+                    s1_predicted_point[1] * original_image.size[1]
+                ]
+                s1_success = point_in_bbox(s1_original_point, original_bbox)
+            
+            s1_hit = "✅" if s1_success else "❌"
+            if s1_success:
+                stage1_success_count += 1
+
+            # Crop 생성 성공 여부 확인 (GT가 생성된 crop들 중 하나라도 포함되는지 확인)
+            crop_success = False
             if num_crops > 0:
                 gt_center = [(original_bbox[0] + original_bbox[2])/2, (original_bbox[1] + original_bbox[3])/2]
                 for crop in s1_crop_list:
                     crop_bbox = crop["bbox"]
                     if point_in_bbox(gt_center, crop_bbox):
-                        stage1_success = True
+                        crop_success = True
                         break
             
-            s1_hit = "✅" if stage1_success else "❌"
-            if stage1_success:
-                stage1_success_count += 1
+            crop_hit = "✅" if crop_success else "❌"
+            if crop_success:
+                crop_success_count += 1
 
             #! ==================================================================
             #! [Stage 2] Merged Crop Inference
@@ -1096,9 +1084,6 @@ if __name__ == '__main__':
             if stage3_ensemble_success:
                 stage3_ensemble_success_count += 1
 
-            # print(f"🎯 Stage 2 Original prediction: {s2_corrected_point}, GT: {original_bbox}")
-            # print(f"🎯 Stage 3 Ensemble prediction: {s3_ensemble_point}, GT: {original_bbox}")
-
             #! ==================================================================
             #! [Common Processing]
             #! ==================================================================
@@ -1120,10 +1105,11 @@ if __name__ == '__main__':
             #! ==================================================================
             
             # 시각화용 디렉토리 설정 (stage3 결과에 따라)
-            if any([STAGE1_VIS, STAGE2_VIS]) and (len(s1_crop_list) >= 2 or (s2_hit != s3_ensemble_hit)):  #! 잠시 크롭이 2개 이상일 때만 시각화
+            if any([STAGE1_VIS, STAGE2_VIS]):
+            # if any([STAGE1_VIS, STAGE2_VIS]) and (len(s1_crop_list) >= 2 or ((not s1_hit or not s2_hit) and s3_ensemble_hit)):  #! 잠시 크롭이 2개 이상일 때 or 앙상블로인해 맞은거만 시각화
                 inst_dir_name = re.sub(r'\W+', '_', instruction).strip('_')
                 result_folder = "correct" if stage3_ensemble_success else "incorrect"
-                inst_dir = os.path.join(save_dir, "visualize", result_folder, f"{num_action}_{inst_dir_name}")
+                inst_dir = os.path.join(save_dir, f"visualize_{result_folder}", f"{task}_{num_action}_{inst_dir_name}")
 
                 # Stage1 시각화
                 if STAGE1_VIS and inst_dir and (not VIS_ONLY_WRONG or not stage3_ensemble_success):
@@ -1135,7 +1121,8 @@ if __name__ == '__main__':
                         original_image=original_image,
                         save_dir=inst_dir,
                         instruction=instruction,
-                        gt_bbox=original_bbox
+                        gt_bbox=original_bbox,
+                        s1_predicted_point=s1_original_point
                     )
                 
                 # Stage2 시각화
@@ -1148,61 +1135,22 @@ if __name__ == '__main__':
                         instruction=instruction,
                         predicted_point=s2_corrected_point
                     )
-                    
-                    # 앙상블 결과도 시각화 (s3_ensemble_point와 ensemble_map 추가)
-                    if s3_ensemble_point is not None:
-                        os.makedirs(inst_dir, exist_ok=True)
-                        
-                        # 앙상블 맵 시각화
-                        plt.figure(figsize=(12, 8))
-                        plt.imshow(ensemble_map, cmap='hot', interpolation='nearest')
-                        plt.colorbar(label='Ensemble Score')
-                        plt.title('Ensemble Attention Map')
-                        
-                        # 예측점과 GT 표시
-                        plt.plot(s3_ensemble_point[0], s3_ensemble_point[1], 'bo', markersize=10, label='Ensemble Prediction')
-                        
-                        # GT를 초록색 박스로 표시
-                        from matplotlib.patches import Rectangle
-                        gt_rect = Rectangle((original_bbox[0], original_bbox[1]), 
-                                        original_bbox[2] - original_bbox[0], 
-                                        original_bbox[3] - original_bbox[1],
-                                        linewidth=2, edgecolor='lime', facecolor='none', label='Ground Truth')
-                        plt.gca().add_patch(gt_rect)
-                        plt.legend()
-                        
-                        plt.savefig(os.path.join(inst_dir, 's3_ensemble_map.png'), dpi=150, bbox_inches='tight')
-                        plt.close()
-                        
-                        # 원본 이미지에 결과 오버레이
-                        plt.figure(figsize=(15, 10))
-                        plt.imshow(original_image)
-                        
-                        # 크롭 박스들 표시
-                        for i, crop in enumerate(s1_crop_list):
-                            bbox = crop['bbox']
-                            rect = plt.Rectangle((bbox[0], bbox[1]), bbox[2]-bbox[0], bbox[3]-bbox[1], 
-                                            fill=False, edgecolor='yellow', linewidth=2, alpha=0.7)
-                            plt.gca().add_patch(rect)
-                            plt.text(bbox[0], bbox[1]-10, f'Crop{i+1}', color='yellow', fontsize=10)
-                        
-                        # GT를 초록색 박스로 표시
-                        gt_rect = Rectangle((original_bbox[0], original_bbox[1]), 
-                                        original_bbox[2] - original_bbox[0], 
-                                        original_bbox[3] - original_bbox[1],
-                                        linewidth=3, edgecolor='lime', facecolor='none', label='Ground Truth')
-                        plt.gca().add_patch(gt_rect)
-                        
-                        # 예측점들 표시
-                        plt.plot(s3_ensemble_point[0], s3_ensemble_point[1], 'bo', markersize=12, label='Ensemble Prediction')
-                        plt.plot(s2_corrected_point[0], s2_corrected_point[1], 'go', markersize=10, label='S2 Original Prediction')
-                        
-                        plt.title(f'Ensemble Result (Attn:{STAGE1_ENSEMBLE_RATIO}, Crop:{STAGE2_ENSEMBLE_RATIO})')
-                        plt.legend()
-                        plt.axis('off')
-                        
-                        plt.savefig(os.path.join(inst_dir, 's3_ensemble_result.png'), dpi=150, bbox_inches='tight')
-                        plt.close()
+                
+                # Stage3 앙상블 시각화
+                visualize_stage3_ensemble_attention(
+                    ensemble_map=ensemble_map,
+                    original_image=original_image,
+                    crop_list=s1_crop_list,
+                    original_bbox=original_bbox,
+                    s3_ensemble_point=s3_ensemble_point,
+                    s2_corrected_point=s2_corrected_point,
+                    s1_original_point=s1_original_point,
+                    stage1_ratio=STAGE1_ENSEMBLE_RATIO,
+                    stage2_ratio=STAGE2_ENSEMBLE_RATIO,
+                    save_dir=inst_dir,
+                    vis_only_wrong=VIS_ONLY_WRONG,
+                    stage3_success=stage3_ensemble_success
+                )
 
             num_attention_crops = len(s1_crop_list)
             print(f"✂️  Attention Crops : {num_attention_crops}")
@@ -1225,6 +1173,7 @@ if __name__ == '__main__':
                 peak_memory_gb = round(peak_memory, 3)
 
                 if MEMORY_VIS:
+                    import matplotlib.pyplot as plt
                     plt.figure(figsize=(10, 4))
                     plt.plot(time_log, mem_log)
                     plt.xlabel("Time (s)")
@@ -1248,6 +1197,7 @@ if __name__ == '__main__':
                     's2_tflops_sum': 0.0,
                     'total_tflops': 0.0,
                     'stage1_success_count': 0,
+                    'crop_success_count': 0,
                     'stage2_success_count': 0,
                     'stage3_ensemble_success_count': 0,
                     'peak_memory_sum': 0.0
@@ -1264,17 +1214,21 @@ if __name__ == '__main__':
                 stats['total_tflops'] += total_tflops_this
             if MEMORY_EVAL:
                 stats['peak_memory_sum'] += peak_memory_gb
-            if stage1_success:
+            if s1_success:
                 stats['stage1_success_count'] += 1
+            if crop_success:
+                stats['crop_success_count'] += 1
             if stage2_success:
                 stats['stage2_success_count'] += 1
             if stage3_ensemble_success:
                 stats['stage3_ensemble_success_count'] += 1
 
             up2now_s1_score = stage1_success_count / num_action * 100
+            up2now_crop_score = crop_success_count / num_action * 100
             up2now_s2_score = stage2_success_count / num_action * 100
             up2now_s3_ensemble_score = stage3_ensemble_success_count / num_action * 100
             print(f"Up2Now Stage1 Accuracy: {up2now_s1_score:.2f}%")
+            print(f"Up2Now Crop Accuracy: {up2now_crop_score:.2f}%")
             print(f"Up2Now Stage2 Accuracy: {up2now_s2_score:.2f}%")
             print(f"Up2Now Stage3 Ensemble Accuracy: {up2now_s3_ensemble_score:.2f}%")
 
@@ -1287,6 +1241,7 @@ if __name__ == '__main__':
                 s1_time=f"{s1_time:.3f}",
                 s1_tflops=f"{s1_tflops:.2f}",
                 s1_hit=s1_hit,
+                crop_hit=crop_hit,
                 s2_time=f"{s2_time:.3f}",
                 s2_tflops=f"{s2_tflops:.2f}",
                 s2_hit=s2_hit,
@@ -1296,6 +1251,7 @@ if __name__ == '__main__':
                 total_tflops=f"{total_tflops_this:.2f}",
                 peak_memory_gb=f"{peak_memory_gb:.3f}" if MEMORY_EVAL else "N/A",
                 s1_acc_uptonow=f"{up2now_s1_score:.2f}",
+                crop_acc_uptonow=f"{up2now_crop_score:.2f}",
                 s2_acc_uptonow=f"{up2now_s2_score:.2f}",
                 s3_ensemble_acc_uptonow=f"{up2now_s3_ensemble_score:.2f}",
                 filename=filename_wo_ext,
@@ -1311,13 +1267,16 @@ if __name__ == '__main__':
                 'gt_bbox': original_bbox,
                 'data_source': data_source,
                 'num_crop': num_attention_crops,
-                'stage1_success': stage1_success,
+                'stage1_success': s1_success,
+                'crop_success': crop_success,
                 'stage2_success': stage2_success,
                 'stage3_ensemble_success': stage3_ensemble_success,
                 's1_hit': s1_hit,
+                'crop_hit': crop_hit,
                 's2_hit': s2_hit,
                 's3_ensemble_hit': s3_ensemble_hit,
                 's3_ensemble_point': s3_ensemble_point,
+                's1_original_point': s1_original_point,
                 's2_original_point': s2_corrected_point,
                 's1_time': s1_time,
                 's2_time': s2_time,
@@ -1344,6 +1303,7 @@ if __name__ == '__main__':
         metrics = {
             "task": task,
             "total_samples": num_action,
+            "crop_accuracy": crop_success_count / num_action * 100,
             "stage1_accuracy": stage1_success_count / num_action * 100,
             "stage2_accuracy": stage2_success_count / num_action * 100,
             "stage3_ensemble_accuracy": stage3_ensemble_success_count / num_action * 100,
@@ -1378,6 +1338,7 @@ if __name__ == '__main__':
                     "task": task,
                     "data_source": ds,
                     "total_samples": stats['num_action'],
+                    "crop_accuracy": stats['crop_success_count'] / stats['num_action'] * 100,
                     "stage1_accuracy": stats['stage1_success_count'] / stats['num_action'] * 100,
                     "stage2_accuracy": stats['stage2_success_count'] / stats['num_action'] * 100,
                     "stage3_ensemble_accuracy": stats['stage3_ensemble_success_count'] / stats['num_action'] * 100,
@@ -1404,10 +1365,61 @@ if __name__ == '__main__':
         with open(os.path.join(save_dir, f"source_results_{task}.json"), "w") as dsf:
             json.dump(data_source_metrics, dsf, ensure_ascii=False, indent=4)
 
+        # 전체 결과를 CSV 파일에 한 줄 추가
+        results_csv_path = "./results"
+        os.makedirs(results_csv_path, exist_ok=True)
+        csv_file_path = os.path.join(results_csv_path, f"results_{task}.csv")
+        
+        # CSV 헤더 정의
+        csv_headers = [
+            "s1_resize_ratio", "select_threshold", "stage1_ensemble_ratio", "crop_width", "crop_height",
+            "total_samples", "crop_accuracy", "stage1_accuracy", "stage2_accuracy", "stage3_ensemble_accuracy",
+            "avg_stage1_time", "avg_stage2_time", "avg_stage3_time", "avg_total_time",
+            "avg_stage1_tflops", "avg_stage2_tflops", "avg_total_tflops", "avg_peak_memory_gb",
+            "timestamp"
+        ]
+        
+        # CSV 데이터 행 생성
+        import datetime
+        csv_row = [
+            S1_RESIZE_RATIO, SELECT_THRESHOLD, STAGE1_ENSEMBLE_RATIO, CROP_WIDTH, CROP_HEIGHT,
+            num_action, 
+            round(metrics['crop_accuracy'], 2),
+            round(metrics['stage1_accuracy'], 2),
+            round(metrics['stage2_accuracy'], 2), 
+            round(metrics['stage3_ensemble_accuracy'], 2),
+            round(metrics['avg_times']['stage1'], 4),
+            round(metrics['avg_times']['stage2'], 4),
+            round(metrics['avg_times']['stage3_ensemble'], 4),
+            round(metrics['avg_times']['total'], 4),
+            round(metrics['avg_flops_tflops']['stage1'], 2),
+            round(metrics['avg_flops_tflops']['stage2'], 2),
+            round(metrics['avg_flops_tflops']['total'], 2),
+            metrics['avg_peak_memory_gb'] if metrics['avg_peak_memory_gb'] else 0.0,
+            datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        ]
+        
+        # CSV 파일이 없으면 헤더와 함께 생성, 있으면 데이터 행만 추가
+        import csv
+        file_exists = os.path.exists(csv_file_path)
+        
+        with open(csv_file_path, 'a', newline='', encoding='utf-8') as csvfile:
+            writer = csv.writer(csvfile)
+            
+            # 파일이 없거나 비어있으면 헤더 추가
+            if not file_exists or os.path.getsize(csv_file_path) == 0:
+                writer.writerow(csv_headers)
+            
+            # 데이터 행 추가
+            writer.writerow(csv_row)
+        
+        print(f"📝 Results saved to CSV: {csv_file_path}")
+
         # 최종 결과 출력
         print("=" * 60)
         print(f"📊 Final Results for {task}:")
         print(f"Total Samples: {num_action}")
+        print(f"Crop Accuracy: {metrics['crop_accuracy']:.2f}%")
         print(f"Stage1 Accuracy: {metrics['stage1_accuracy']:.2f}%")
         print(f"Stage2 Accuracy: {metrics['stage2_accuracy']:.2f}%")
         print(f"Stage3 Ensemble Accuracy: {metrics['stage3_ensemble_accuracy']:.2f}%")
