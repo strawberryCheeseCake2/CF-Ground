@@ -376,7 +376,7 @@ def create_crops_from_attention_peaks(peaks, original_image, resize_ratio):
     return crops
 
 def create_merged_image_for_stage2(crops):
-    """Stage 2용: crop들을 세로로 합치기 (검정 구분선 이미지로 분리) - bbox y좌표 순으로 정렬"""
+    """Stage 2용: crop들을 세로로 합치기 (빨간색 구분선 이미지로 분리) - bbox y좌표 순으로 정렬"""
 
     if not crops:
         return None, []
@@ -385,7 +385,7 @@ def create_merged_image_for_stage2(crops):
     sorted_crops = sorted(crops, key=lambda crop: crop['bbox'][1])
     
     # 세로로 합칠 이미지들과 구분선들을 별도로 준비
-    separator_height = 28  # 검정 구분선 두께
+    separator_height = 28  # 빨간색 구분선 두께
     max_width = max(crop['img'].width for crop in sorted_crops)
     
     # 합칠 이미지들 리스트 (crop 이미지 + 구분선 이미지들)
@@ -408,9 +408,9 @@ def create_merged_image_for_stage2(crops):
         
         current_y += crop['img'].height
         
-        # 마지막이 아니면 검정 구분선 이미지 추가
+        # 마지막이 아니면 빨간색 구분선 이미지 추가
         if i < len(sorted_crops) - 1:
-            separator_img = Image.new('RGB', (max_width, separator_height), color=(0, 0, 0))
+            separator_img = Image.new('RGB', (max_width, separator_height), color=(256, 0, 0))
             images_to_merge.append(separator_img)
             current_y += separator_height
     
@@ -873,7 +873,7 @@ if __name__ == '__main__':
                 "s2_time", "s2_tflops", "s2_hit", 
                 "s3_ensemble_time", "s3_ensemble_hit",
                 "total_time", "total_tflops", "peak_memory_gb", 
-                "s1_acc_uptonow", "crop_acc_uptonow", "s2_acc_uptonow", "s3_ensemble_acc_uptonow",
+                "crop_acc_uptonow", "s1_acc_uptonow", "s2_acc_uptonow", "s3_ensemble_acc_uptonow",
                 "filename", "instruction"
             ],
             write_md=False, use_fsync=True, use_lock=True
@@ -1228,8 +1228,8 @@ if __name__ == '__main__':
             up2now_crop_score = crop_success_count / num_action * 100
             up2now_s2_score = stage2_success_count / num_action * 100
             up2now_s3_ensemble_score = stage3_ensemble_success_count / num_action * 100
+            # print(f"Up2Now Crop Accuracy: {up2now_crop_score:.2f}%")
             print(f"Up2Now Stage1 Accuracy: {up2now_s1_score:.2f}%")
-            print(f"Up2Now Crop Accuracy: {up2now_crop_score:.2f}%")
             print(f"Up2Now Stage2 Accuracy: {up2now_s2_score:.2f}%")
             print(f"Up2Now Stage3 Ensemble Accuracy: {up2now_s3_ensemble_score:.2f}%")
 
@@ -1251,8 +1251,8 @@ if __name__ == '__main__':
                 total_time=f"{total_time:.3f}",
                 total_tflops=f"{total_tflops_this:.2f}",
                 peak_memory_gb=f"{peak_memory_gb:.3f}" if MEMORY_EVAL else "N/A",
-                s1_acc_uptonow=f"{up2now_s1_score:.2f}",
                 crop_acc_uptonow=f"{up2now_crop_score:.2f}",
+                s1_acc_uptonow=f"{up2now_s1_score:.2f}",
                 s2_acc_uptonow=f"{up2now_s2_score:.2f}",
                 s3_ensemble_acc_uptonow=f"{up2now_s3_ensemble_score:.2f}",
                 filename=filename_wo_ext,
