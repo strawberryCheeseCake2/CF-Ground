@@ -27,8 +27,8 @@ STAGE2_ENSEMBLE_RATIO = 1 - STAGE1_ENSEMBLE_RATIO  # Stage2 crop 가중치
 MAX_CROPS = 3  # 생성할 수 있는 최대 crop 개수
 
 # Attention 기반 크롭핑 하이퍼파라미터 (14의 배수 = Patch Size 14x14)
-CROP_WIDTH = 1190  # 크롭할 직사각형 가로 크기 (아이폰 전체 가로가 1170px)
-CROP_HEIGHT = 560  # 크롭할 직사각형 세로 크기
+CROP_WIDTH = 1176  # 크롭할 직사각형 가로 크기 (아이폰 전체 가로가 1170px)
+CROP_HEIGHT = 602  # 크롭할 직사각형 세로 크기
 
 # 앙상블용 상위 패치 개수
 ENSEMBLE_TOP_PATCHES = 100  # Stage2에서 앙상블에 사용할 상위 패치 개수
@@ -36,7 +36,7 @@ ENSEMBLE_TOP_PATCHES = 100  # Stage2에서 앙상블에 사용할 상위 패치 
 # 최대 PIXELS 제한
 MAX_PIXELS = None if S1_RESIZE_RATIO < 1.0 else 3211264  # 100% 넣어준다면 OOM 방지
 
-memo = f"new_resize_{S1_RESIZE_RATIO:.2f}_ensemble_{STAGE1_ENSEMBLE_RATIO:.2f}_{STAGE2_ENSEMBLE_RATIO:.2f}_select_{SELECT_THRESHOLD:.2f}"
+memo = f"resize_{S1_RESIZE_RATIO:.2f}_ensemble_{STAGE1_ENSEMBLE_RATIO:.2f}_{STAGE2_ENSEMBLE_RATIO:.2f}_select_{SELECT_THRESHOLD:.2f}"
 
 #! Argument ==========================================================================================
 
@@ -50,8 +50,8 @@ TASKS = ["mobile", "web", "desktop"]
 # TASKS = ["mobile"]
 # TASKS = ["web"]
 # TASKS = ["desktop"]
-# SAMPLE_RANGE = slice(None)
-SAMPLE_RANGE = slice(0,2)
+SAMPLE_RANGE = slice(None)
+# SAMPLE_RANGE = slice(0,2)
 
 # Visualize & Logging
 STAGE1_VIS = True
@@ -867,8 +867,9 @@ if __name__ == '__main__':
             csv_name=f"iter_log_{task}.csv",
             md_name=f"iter_log_{task}.md",
             headers=[  # 순서 그대로 들어감
-                "idx", "orig_w", "orig_h", "num_crop",
-                "s1_time", "s1_tflops", "s1_hit", "crop_hit",
+                "idx", "orig_w", "orig_h", 
+                "num_crop", "crop_hit",
+                "s1_time", "s1_tflops", "s1_hit", 
                 "s2_time", "s2_tflops", "s2_hit", 
                 "s3_ensemble_time", "s3_ensemble_hit",
                 "total_time", "total_tflops", "peak_memory_gb", 
@@ -1238,10 +1239,10 @@ if __name__ == '__main__':
                 orig_w=original_image.size[0],
                 orig_h=original_image.size[1],
                 num_crop=num_attention_crops,
+                crop_hit=crop_hit,
                 s1_time=f"{s1_time:.3f}",
                 s1_tflops=f"{s1_tflops:.2f}",
                 s1_hit=s1_hit,
-                crop_hit=crop_hit,
                 s2_time=f"{s2_time:.3f}",
                 s2_tflops=f"{s2_tflops:.2f}",
                 s2_hit=s2_hit,
@@ -1267,8 +1268,8 @@ if __name__ == '__main__':
                 'gt_bbox': original_bbox,
                 'data_source': data_source,
                 'num_crop': num_attention_crops,
-                'stage1_success': s1_success,
                 'crop_success': crop_success,
+                'stage1_success': s1_success,
                 'stage2_success': stage2_success,
                 'stage3_ensemble_success': stage3_ensemble_success,
                 's1_hit': s1_hit,
