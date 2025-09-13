@@ -40,7 +40,7 @@ SET_OF_MARK = True
 COLLAGE = False
 
 is_ee = "ee" if EARLY_EXIT else "not_ee"
-SAVE_DIR = f"./attn_output/" + is_ee + "_" + str(MAX_PIXELS) + "_" + \
+SAVE_DIR = f"../attn_output/" + is_ee + "_" + str(MAX_PIXELS) + "_" + \
     str(S1_RESIZE_RATIO) + "_" + str(S2_RESIZE_RATIO) + "_" + "0905_gyu_gk20_vis"  #! Save Path (특징이 있다면 적어주세요)
 
 # SAVE_DIR = f"gyu/attn_output/0907_collage_nosom"
@@ -51,8 +51,8 @@ SEED = 0
 
 # Dataset & Model
 MLLM_PATH = "microsoft/GUI-Actor-3B-Qwen2.5-VL"
-SCREENSPOT_IMGS = "./data/screenspotv2_image"  # input image 경로
-SCREENSPOT_JSON = "./data"  # json파일 경로
+SCREENSPOT_IMGS = "../data/screenspotv2_image"  # input image 경로
+SCREENSPOT_JSON = "../data"  # json파일 경로
 # TASKS = ["web", "desktop"]
 TASKS = ["web", "desktop", "mobile"]
 # SAMPLE_RANGE = slice(160,162)  #! 샘플 범위 지정 (3번 샘플이면 3,4 / 5~9번 샘플이면 5,10 / 전체 사용이면 None)
@@ -103,11 +103,11 @@ if TFOPS_PROFILING:
 
 # Project-Local Modules
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
-from iter_logger import init_iter_logger, append_iter_log  # log csv 기록 파일
+from util.iter_logger import init_iter_logger, append_iter_log  # log csv 기록 파일
 from gui_actor.modeling_qwen25vl import Qwen2_5_VLForConditionalGenerationWithPointer
 from gui_actor.multi_image_inference import multi_image_inference
-from visualize_util import get_highest_attention_patch_bbox, _visualize_early_exit_results, _visualize_stage1_results, _visualize_stage2_results, visualize_crop
-from crop import crop_img as run_crop #! 어떤 crop 파일 사용?
+from util.visualize_util import get_highest_attention_patch_bbox, _visualize_early_exit_results, _visualize_stage1_results, _visualize_stage2_results, visualize_crop
+from src.crop import crop_img as run_crop #! 어떤 crop 파일 사용?
 
 #! ==============================================================================================
 

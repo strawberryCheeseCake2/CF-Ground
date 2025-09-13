@@ -30,7 +30,7 @@ from deepspeed.profiling.flops_profiler import FlopsProfiler
 IMAGE_PATCH_SIZE =14
 MAX_PIXELS=3211264
 set_seed(0)
-SAVE_DIR = "./attn_output/vanilla_eval"
+SAVE_DIR = "../attn_output/vanilla_eval"
 
 PRED_PATH = "{save_dir}/{task}_{max_pixels}_preds.json"
 METRIC_PATH = "{save_dir}/{task}_{max_pixels}_metrics.txt"
@@ -104,7 +104,7 @@ def evaluate(model_name_or_path, model_type, use_placeholder, topk, task, device
         ]
     )
 
-    dataset = json.load(open(os.path.join("./data", f"screenspot_{task}_v2.json"), 'r'))
+    dataset = json.load(open(os.path.join("../data", f"screenspot_{task}_v2.json"), 'r'))
 
     results = []
     score_list = []
@@ -123,7 +123,7 @@ def evaluate(model_name_or_path, model_type, use_placeholder, topk, task, device
         iter += 1
         
         filename = example["img_filename"]
-        img_path = os.path.join("./data/screenspotv2_image", filename)
+        img_path = os.path.join("../data/screenspotv2_image", filename)
         if not os.path.exists(img_path):
             print("img not found", flush=True)
             input()
@@ -404,7 +404,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--model_type", type=str, default="qwen2vl", choices=["qwen2vl", "qwen25vl"])
     parser.add_argument("--model_name_or_path", type=str, default="microsoft/GUI-Actor-2B-Qwen2-VL")
-    parser.add_argument("--save_path", type=str, default="./")
+    parser.add_argument("--save_path", type=str, default="../")
     parser.add_argument('--topk', type=int, default=3, help='Topk')
     parser.add_argument('--no-placeholder', dest='use_placeholder', action='store_false', help='Disable the placeholder')
     parser.set_defaults(use_placeholder=True)

@@ -1,0 +1,79 @@
+{
+  "summary": {
+    "total_samples": 1272,
+    "tasks": {
+      "mobile": {
+        "ios": 238,
+        "android": 211,
+        "shop": 52,
+        "forum": 0,
+        "gitlab": 0,
+        "macos": 0,
+        "tool": 0,
+        "windows": 0
+      },
+      "web": {
+        "gitlab": 73,
+        "shop": 165,
+        "forum": 79,
+        "tool": 120,
+        "android": 0,
+        "ios": 0,
+        "macos": 0,
+        "windows": 0
+      },
+      "desktop": {
+        "windows": 159,
+        "macos": 147,
+        "shop": 28,
+        "android": 0,
+        "forum": 0,
+        "gitlab": 0,
+        "ios": 0,
+        "tool": 0
+      }
+    },
+    "data_source_totals": {
+      "android": 211,
+      "forum": 79,
+      "gitlab": 73,
+      "ios": 238,
+      "macos": 147,
+      "shop": 245,
+      "tool": 120,
+      "windows": 159
+    }
+  },
+  "details": {
+    "mobile": {
+      "ios": 238,
+      "android": 211,
+      "shop": 52,
+      "forum": 0,
+      "gitlab": 0,
+      "macos": 0,
+      "tool": 0,
+      "windows": 0
+    },
+    "web": {
+      "gitlab": 73,
+      "shop": 165,
+      "forum": 79,
+      "tool": 120,
+      "android": 0,
+      "ios": 0,
+      "macos": 0,
+      "windows": 0
+    },
+    "desktop": {
+      "windows": 159,
+      "macos": 147,
+      "shop": 28,
+      "android": 0,
+      "forum": 0,
+      "gitlab": 0,
+      "ios": 0,
+      "tool": 0
+    }
+  }
+}

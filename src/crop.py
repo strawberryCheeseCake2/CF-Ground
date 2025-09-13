@@ -236,11 +236,11 @@ def crop_img(orig_img:Image.Image, h_cuts:int=None, h_tolerance:int=None, output
 
 if __name__ == '__main__':
     # 테스트용 main
-    data_path = "./data/screenspotv2_image/"
+    data_path = "../data/screenspotv2_image/"
 
-    output_path = f"./crop_test/{device_type}"
+    output_path = f"../crop_test/{device_type}"
     os.makedirs(output_path, exist_ok=True)
-    jsonlist = json.load(open(f"./data/screenspot_{device_type}_v2.json"))
+    jsonlist = json.load(open(f"../data/screenspot_{device_type}_v2.json"))
 
     target_imgs = sorted(set(item["img_filename"] for item in jsonlist if "img_filename" in item))
 

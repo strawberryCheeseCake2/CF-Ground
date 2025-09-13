@@ -19,7 +19,7 @@ conda activate gui_actor
 3. Install the dependencies: 
 - NVIDIA GPU
 ```bash
-pip install torch==2.5.1 torchvision==0.20.1 torchaudio==2.5.1 --index-url https://download.pytorch.org/whl/cu121
+pip install torch==2.5.1 torchvision==0.20.1 --index-url https://download.pytorch.org/whl/cu121
 pip install -r requirements_gui_agent.txt
 ```
 - MAC OS
@@ -38,4 +38,14 @@ wget https://huggingface.co/datasets/OS-Copilot/ScreenSpot-v2/resolve/main/scree
 unzip screenspotv2_image.zip
 rm screenspotv2_image.zip
 cd ..
+```
+
+## Run
+
+```bash
+python run_gui_actor.py [gpu_num] --resize [Stage 1 Resize ratio] --ensemble [Stage 1 Ensemble ratio]
+```
+
+```bash
+python run_gui_actor.py 0 --resize 0.5 --ensemble 0.5
 ```

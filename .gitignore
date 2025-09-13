@@ -4,7 +4,6 @@ __pycache__/
 # output
 attn_output/
 crop_test/
-cs_test/
 gyu/attn_output/
 
 # conda env

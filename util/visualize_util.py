@@ -278,6 +278,87 @@ def visualize_stage2_merged_attention(s2_pred, merged_img, save_dir, instruction
         print("⚠️ No attention scores found for Stage 2 visualization")
 
 
+def visualize_stage2_individual_crops(all_crop_results, save_dir, instruction):
+    """개별 crop inference 결과들을 시각화 (각 crop별로 attention map과 예측점 표시)"""
+    
+    if not all_crop_results or not save_dir:
+        return
+    
+    # 가장 높은 점수를 가진 crop 찾기
+    best_result = max(all_crop_results, key=lambda x: x['max_attn_score'])
+    
+    for i, result in enumerate(all_crop_results):
+        crop_img = result['crop_img']
+        s2_pred = result['pred']
+        crop_point = result['crop_point']
+        is_best = (result == best_result)
+        
+        # Attention 맵 생성
+        if 'attn_scores' in s2_pred and s2_pred['attn_scores']:
+            attn_scores = np.array(s2_pred['attn_scores'][0])
+            n_width = s2_pred['n_width']
+            n_height = s2_pred['n_height']
+            
+            # crop 이미지에 attention 맵 오버레이
+            blended_img = get_attn_map(
+                image=crop_img,
+                attn_scores=attn_scores,
+                n_width=n_width,
+                n_height=n_height
+            )
+            
+            # 예측점 표시
+            if crop_point:
+                draw = ImageDraw.Draw(blended_img)
+                
+                star_x = int(crop_point[0])
+                star_y = int(crop_point[1])
+                
+                # 별 모양 그리기
+                star_size = 15
+                color = "gold" if is_best else "yellow"
+                draw.line([star_x - star_size, star_y - star_size, star_x + star_size, star_y + star_size], 
+                         fill=color, width=4)
+                draw.line([star_x - star_size, star_y + star_size, star_x + star_size, star_y - star_size], 
+                         fill=color, width=4)
+                draw.line([star_x, star_y - star_size, star_x, star_y + star_size], 
+                         fill=color, width=4)
+                draw.line([star_x - star_size, star_y, star_x + star_size, star_y], 
+                         fill=color, width=4)
+                
+                # 중심점 표시
+                draw.ellipse([star_x - 4, star_y - 4, star_x + 4, star_y + 4], 
+                            fill="red", outline="black", width=2)
+                
+                # Best crop 표시
+                if is_best:
+                    try:
+                        font = ImageFont.truetype("arial.ttf", 16)
+                    except IOError:
+                        font = ImageFont.load_default()
+                    
+                    draw.text((10, 10), "BEST", fill="gold", font=font,
+                             stroke_width=2, stroke_fill="black")
+                
+                # Attention score 표시
+                try:
+                    font = ImageFont.truetype("arial.ttf", 12)
+                except IOError:
+                    font = ImageFont.load_default()
+                
+                score_text = f"Score: {result['max_attn_score']:.3f}"
+                draw.text((10, crop_img.height - 25), score_text, fill="white", font=font,
+                         stroke_width=1, stroke_fill="black")
+            
+            # 저장
+            os.makedirs(save_dir, exist_ok=True)
+            filename = f"s2_individual_crop_{i}_{'best' if is_best else 'other'}.png"
+            save_path = os.path.join(save_dir, filename)
+            blended_img.save(save_path)
+    
+    # print(f"🌄 Stage 2 individual crops visualization saved")
+
+
 def visualize_stage3_ensemble_attention(ensemble_map, original_image, crop_list, original_bbox, 
                                        s3_ensemble_point, s2_corrected_point, s1_original_point,
                                        stage1_ratio, stage2_ratio, save_dir, vis_only_wrong=False, 
