@@ -3,7 +3,8 @@ __pycache__/
 
 # output
 attn_output/
-crop_test/
+_crop_test/
+_sharpness_test/
 gyu/attn_output/
 
 # conda env

@@ -1,0 +1,5 @@
+method,min_resize,max_resize,select_threshold,stage1_ensemble_ratio,crop_width,crop_height,total_samples,crop_accuracy,stage1_accuracy,stage2_accuracy,stage3_accuracy,avg_stage1_time,avg_stage2_time,avg_stage3_time,avg_total_time,avg_stage1_tflops,avg_stage2_tflops,avg_total_tflops,avg_peak_memory_gb,timestamp
+dynamic_resize,0.3,0.7,0.5,0.5,1176,602,501,97.21,91.82,91.22,92.61,0.9785,0.8085,0.0306,1.8176,16.59,15.28,31.87,8.129,2025-09-15 00:56:04
+dynamic_resize,0.4,0.7,0.5,0.5,1176,602,501,96.41,91.02,92.02,92.02,1.1106,0.7923,0.0302,1.9332,19.42,15.05,34.47,8.223,2025-09-15 00:57:21
+dynamic_resize,0.5,0.7,0.5,0.5,1176,602,501,97.6,93.01,92.42,92.42,1.3002,0.8092,0.03,2.1395,22.95,15.16,38.1,8.447,2025-09-15 01:00:44
+dynamic_resize,0.5,0.75,0.5,0.5,1176,602,501,97.41,92.42,92.22,93.01,1.4538,0.8041,0.0327,2.2907,25.74,14.89,40.63,8.674,2025-09-15 01:00:45

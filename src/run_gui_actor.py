@@ -3,8 +3,9 @@ import argparse
 
 parser = argparse.ArgumentParser()
 parser.add_argument('gpu', type=int, help='GPU number')
-parser.add_argument('--resize', type=float, help='Stage 1 Resize ratio')
+parser.add_argument('--resize', type=float, nargs=2, metavar=('MIN_RESIZE', 'MAX_RESIZE'), help='Stage 1 Resize ratio range (min max)')
 parser.add_argument('--ensemble', type=float, help='Stage 1 Ensemble ratio')
+parser.add_argument('--visualize', action='store_true', help='Whether to save visualization images')
 args = parser.parse_args()
 
 os.environ["CUDA_DEVICE_ORDER"]="PCI_BUS_ID"
@@ -15,7 +16,9 @@ os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu)  # 몇번 GPU 사용할지 ar
 ATTN_IMPL = "eager"  # attention implement "eager" "sdpa" "flash" "efficient"
 
 # Image Resize Ratios
-S1_RESIZE_RATIO = args.resize if args.resize else 0.50  #! 모바일은 낮아도 content가 커서 괜찮. 나머지는 pixel대비 content가 작아서 resize를 너무하면안됨
+
+MIN_RESIZE = args.resize[0] if args.resize else 0.50  # DYNAMIC_RESIZE 비율 최소값
+MAX_RESIZE = args.resize[1] if args.resize else 0.80  # DYNAMIC_RESIZE 비율 최대값
 
 # Crop Limitations
 MAX_CROPS = 3  # 생성할 수 있는 최대 crop 개수
@@ -24,16 +27,17 @@ CROP_WIDTH = 1176  # 크롭할 직사각형 가로 크기 (아이폰 전체 가�
 CROP_HEIGHT = 602  # 크롭할 직사각형 세로 크기
 
 # Ensemble Hyperparameters
-STAGE1_ENSEMBLE_RATIO = args.ensemble if args.ensemble else 0.50  #! Stage1 attention 가중치
+# TODO: 이것도 resize처럼 동적으로 측정해서 변경 가능하도록
+STAGE1_ENSEMBLE_RATIO = args.ensemble if args.ensemble else 0.50  # Stage1 attention 가중치
 STAGE2_ENSEMBLE_RATIO = 1 - STAGE1_ENSEMBLE_RATIO  # Stage2 crop 가중치
-ENSEMBLE_TOP_PATCHES = 100  # Stage2에서 앙상블에 사용할 상위 패치 개수 (100이면 충분해보임)
+ENSEMBLE_TOP_PATCHES = 100                         # Stage2에서 앙상블에 사용할 상위 패치 개수
 
 # 최대 PIXELS 제한
-MAX_PIXELS = None if S1_RESIZE_RATIO < 1.0 else 3211264  # 100% 넣어준다면 OOM 방지
+MAX_PIXELS = 3211264  # Process단에서 적용
 
-method = "collage" # csv에 기록할 method 이름
+method = "dynamic_resize" # csv에 기록할 method 이름
 
-memo = f"{method}/resize_{S1_RESIZE_RATIO:.2f}_ensemble_{STAGE1_ENSEMBLE_RATIO:.2f}"
+memo = f"resize_{MIN_RESIZE}~{MAX_RESIZE}_ensemble{STAGE1_ENSEMBLE_RATIO}_crop{CROP_WIDTH}x{CROP_HEIGHT}"
 
 #! Argument ==========================================================================================
 
@@ -51,14 +55,14 @@ SAMPLE_RANGE = slice(None)
 # SAMPLE_RANGE = slice(0,2)
 
 # Visualize & Logging
-VISUALIZE = True
+VISUALIZE = args.visualize if args.visualize else False
 VIS_ONLY_WRONG = False  # True면 틀린 것만 시각화, False면 모든 것 시각화
 TFOPS_PROFILING = True
 MEMORY_EVAL = True
 MEMORY_VIS = False
 
 # Save Path
-SAVE_DIR = f"../attn_output/" + memo
+SAVE_DIR = f"../attn_output/" + method + "/" + memo
 
 #! ==================================================================================================
 
@@ -85,6 +89,7 @@ from util.iter_logger import init_iter_logger, append_iter_log  # log csv 기록
 from gui_actor.modeling_qwen25vl import Qwen2_5_VLForConditionalGenerationWithPointer
 from gui_actor.inference import inference
 from util.visualize_util import visualize_stage1_attention_crops, visualize_stage2_merged_attention, visualize_stage3_ensemble_attention
+from util.sharpness_util import get_fft_blur_score
 if TFOPS_PROFILING:
     from deepspeed.profiling.flops_profiler import FlopsProfiler
 
@@ -102,7 +107,7 @@ class NpEncoder(json.JSONEncoder):
             return bool(obj)
         return super(NpEncoder, self).default(obj)
 
-def resize_image(image, resize_to_pixels=MAX_PIXELS):
+def resize_image(image, resize_to_pixels):
     image_width, image_height = image.size
     if (resize_to_pixels is not None) and ((image_width * image_height) > resize_to_pixels):
         resize_ratio = (resize_to_pixels / (image_width * image_height)) ** 0.5
@@ -207,19 +212,19 @@ def create_conversation_stage2(image, instruction, crop_cnt):
     return conversation
 
 def run_stage1_attention_inference(original_image, instruction):
-    """Stage 1: S1_RESIZE_MAX_PIXEL로 리사이즈하고 inference"""
-    
+    """Stage 1: 리사이즈하고 inference"""
+
+    # 이미지 동적 리사이즈
     orig_w, orig_h = original_image.size
-    
-    # S1_RESIZE_MAX_PIXEL에 따라 리사이즈
-    resize_ratio = S1_RESIZE_RATIO
+    downsampled = original_image.resize((int(orig_w*0.5), int(orig_h*0.5)))
+    resize_ratio = get_fft_blur_score(downsampled, min_resize=MIN_RESIZE, max_resize=MAX_RESIZE)
     resized_w, resized_h = int(orig_w * resize_ratio), int(orig_h * resize_ratio)
-    resized_image = original_image.resize((resized_w, resized_h))
-    print(f"🔧 Resized image: {orig_w}x{orig_h} -> {resized_w}x{resized_h} (ratio: {resize_ratio:.3f})")
+    print(f"🔧 Dynamic Resized image: {orig_w}x{orig_h} -> {resized_w}x{resized_h} (ratio: {resize_ratio:.3f})")
     
     # 리사이즈된 이미지로 inference
+    resized_image = original_image.resize((resized_w, resized_h))
     conversation = create_conversation_stage1(resized_image, instruction, resize_ratio)
-    pred = inference(conversation, model, tokenizer, processor, use_placeholder=True, topk=3)  #! topk 파라미터 변경?
+    pred = inference(conversation, model, tokenizer, processor, use_placeholder=True, topk=1)
     
     # 결과에 리사이즈 정보 추가
     pred['resize_ratio'] = resize_ratio
@@ -443,7 +448,9 @@ def run_stage2_merged_inference(merged_img, instruction):
     
     # 합쳐진 이미지로 inference
     conversation = create_conversation_stage2(merged_img, instruction, 1)
-    pred = inference(conversation, model, tokenizer, processor, use_placeholder=True, topk=3)
+
+    # topk를 10개로 늘려서 앙상블에서 활용
+    pred = inference(conversation, model, tokenizer, processor, use_placeholder=True, topk=10)
     
     return pred
 
@@ -775,7 +782,7 @@ def find_ensemble_best_point(ensemble_map):
 def run_stage1_attention_based(original_image, instruction, gt_bbox):
     """새로운 간단한 Stage 1: Attention 기반 crop 생성"""
     
-    # 1. S1_RESIZE_MAX_PIXEL로 리사이즈하고 inference
+    # 1. 리사이즈하고 inference
     print("🔍 Stage 1: Running attention-based inference...")
     s1_pred, resized_image = run_stage1_attention_inference(original_image, instruction)
     
@@ -840,7 +847,7 @@ if __name__ == '__main__':
     #     low_cpu_mem_usage=False
     # )
     tokenizer = AutoTokenizer.from_pretrained(MLLM_PATH)
-    processor = AutoProcessor.from_pretrained(MLLM_PATH)
+    processor = AutoProcessor.from_pretrained(MLLM_PATH, max_pixels=MAX_PIXELS)
     prof = FlopsProfiler(model)
 
     warm_up_model(model, tokenizer, processor)
@@ -863,7 +870,7 @@ if __name__ == '__main__':
             csv_name=f"iter_log_{task}.csv",
             md_name=f"iter_log_{task}.md",
             headers=[  # 순서 그대로 들어감
-                "idx", "orig_w", "orig_h", 
+                "idx", "orig_w", "orig_h", "resize_ratio",
                 "num_crop", "crop_hit",
                 "s1_time", "s1_tflops", "s1_hit", 
                 "s2_time", "s2_tflops", "s2_hit", 
@@ -927,13 +934,6 @@ if __name__ == '__main__':
                            original_bbox[0] + original_bbox[2], original_bbox[1] + original_bbox[3]]
 
             orig_w, orig_h = original_image.size
-
-            if MAX_PIXELS is not None:
-                resized_image = resize_image(original_image, MAX_PIXELS)
-            else:
-                resized_image = original_image
-                resize_ratio = 1.0
-                scaled_bbox = original_bbox
 
             # data_source 정보 추출 (없으면 "unknown"으로 기본값 설정)
             data_source = item.get("data_source", "unknown")
@@ -1036,46 +1036,61 @@ if __name__ == '__main__':
             
             s3_ensemble_point = None
             stage3_ensemble_success = False
+            skip_stage3 = False
             
-            s3_ensemble_start = time.time()
+            # 크롭 면적이 원본 이미지 면적의 50%를 넘는지 확인
+            crop_area = CROP_WIDTH * CROP_HEIGHT
+            original_area = orig_w * orig_h
+            crop_area_ratio = crop_area / original_area
             
-            # Stage1 어텐션을 원본 크기로 변환
-            stage1_attention_map = resize_attention_to_original(
-                s1_pred, original_image.size, s1_pred['resize_ratio']
-            )
-            
-            # Stage2 어텐션을 원본 크기로 변환 (Stage1과 동일한 방식)
-            stage2_attention_map = create_stage2_attention_to_original(
-                s2_pred, s2_crop_mappings, s2_merged_img, original_image.size, use_top_patches=ENSEMBLE_TOP_PATCHES
-            )
-            
-            # 두 어텐션 맵을 직접 앙상블 (0~1 정규화 후)
-            # Stage1 정규화
-            s1_max = stage1_attention_map.max()
-            if s1_max > 0:
-                stage1_normalized = stage1_attention_map / s1_max
+            if crop_area_ratio > 0.5:
+                # Stage3 건너뛰고 Stage2 결과를 그대로 사용
+                skip_stage3 = True
+                s3_ensemble_point = s2_corrected_point
+                stage3_ensemble_success = stage2_success
+                s3_ensemble_time = 0.0
+                
+                print(f"🔄 Skipping Stage3: Crop area ratio {crop_area_ratio:.3f} > 0.5")
             else:
-                stage1_normalized = np.zeros_like(stage1_attention_map)
-            
-            # Stage2 정규화
-            s2_max = stage2_attention_map.max()
-            if s2_max > 0:
-                stage2_normalized = stage2_attention_map / s2_max
-            else:
-                stage2_normalized = np.zeros_like(stage2_attention_map)
-            
-            # 최종 앙상블 맵 계산
-            ensemble_map = (STAGE1_ENSEMBLE_RATIO * stage1_normalized + 
-                           STAGE2_ENSEMBLE_RATIO * stage2_normalized)
-            
-            # 앙상블 결과에서 최적점 찾기
-            s3_ensemble_point, ensemble_score = find_ensemble_best_point(ensemble_map)
-            
-            # 앙상블 결과로 성공 여부 확인
-            stage3_ensemble_success = point_in_bbox(s3_ensemble_point, original_bbox)
-            
-            s3_ensemble_end = time.time()
-            s3_ensemble_time = s3_ensemble_end - s3_ensemble_start
+                s3_ensemble_start = time.time()
+                
+                # Stage1 어텐션을 원본 크기로 변환
+                stage1_attention_map = resize_attention_to_original(
+                    s1_pred, original_image.size, s1_pred['resize_ratio']
+                )
+                
+                # Stage2 어텐션을 원본 크기로 변환 (Stage1과 동일한 방식)
+                stage2_attention_map = create_stage2_attention_to_original(
+                    s2_pred, s2_crop_mappings, s2_merged_img, original_image.size, use_top_patches=ENSEMBLE_TOP_PATCHES
+                )
+                
+                # 두 어텐션 맵을 직접 앙상블 (0~1 정규화 후)
+                # Stage1 정규화
+                s1_max = stage1_attention_map.max()
+                if s1_max > 0:
+                    stage1_normalized = stage1_attention_map / s1_max
+                else:
+                    stage1_normalized = np.zeros_like(stage1_attention_map)
+                
+                # Stage2 정규화
+                s2_max = stage2_attention_map.max()
+                if s2_max > 0:
+                    stage2_normalized = stage2_attention_map / s2_max
+                else:
+                    stage2_normalized = np.zeros_like(stage2_attention_map)
+                
+                # 최종 앙상블 맵 계산
+                ensemble_map = (STAGE1_ENSEMBLE_RATIO * stage1_normalized + 
+                               STAGE2_ENSEMBLE_RATIO * stage2_normalized)
+                
+                # 앙상블 결과에서 최적점 찾기
+                s3_ensemble_point, ensemble_score = find_ensemble_best_point(ensemble_map)
+                
+                # 앙상블 결과로 성공 여부 확인
+                stage3_ensemble_success = point_in_bbox(s3_ensemble_point, original_bbox)
+                
+                s3_ensemble_end = time.time()
+                s3_ensemble_time = s3_ensemble_end - s3_ensemble_start
             
             s3_ensemble_hit = "✅" if stage3_ensemble_success else "❌"
             if stage3_ensemble_success:
@@ -1130,21 +1145,25 @@ if __name__ == '__main__':
                     predicted_point=s2_corrected_point
                 )
                 
-                # Stage3 앙상블 시각화
-                visualize_stage3_ensemble_attention(
-                    ensemble_map=ensemble_map,
-                    original_image=original_image,
-                    crop_list=s1_crop_list,
-                    original_bbox=original_bbox,
-                    s3_ensemble_point=s3_ensemble_point,
-                    s2_corrected_point=s2_corrected_point,
-                    s1_original_point=s1_original_point,
-                    stage1_ratio=STAGE1_ENSEMBLE_RATIO,
-                    stage2_ratio=STAGE2_ENSEMBLE_RATIO,
-                    save_dir=inst_dir,
-                    vis_only_wrong=VIS_ONLY_WRONG,
-                    stage3_success=stage3_ensemble_success
-                )
+                # Stage3 앙상블 시각화 (Stage3가 실행된 경우만)
+                if not skip_stage3:
+                    visualize_stage3_ensemble_attention(
+                        ensemble_map=ensemble_map,
+                        original_image=original_image,
+                        crop_list=s1_crop_list,
+                        original_bbox=original_bbox,
+                        s3_ensemble_point=s3_ensemble_point,
+                        s2_corrected_point=s2_corrected_point,
+                        s1_original_point=s1_original_point,
+                        stage1_ratio=STAGE1_ENSEMBLE_RATIO,
+                        stage2_ratio=STAGE2_ENSEMBLE_RATIO,
+                        save_dir=inst_dir,
+                        vis_only_wrong=VIS_ONLY_WRONG,
+                        stage3_success=stage3_ensemble_success
+                    )
+                else:
+                    # Stage3를 건너뛴 경우, Stage2 결과를 Stage3 결과로 표시하는 간단한 시각화
+                    print(f"📝 Stage3 skipped (crop area ratio: {crop_area_ratio:.3f}), using Stage2 result as final result")
 
             num_attention_crops = len(s1_crop_list)
             print(f"✂️  Attention Crops : {num_attention_crops}")
@@ -1231,6 +1250,7 @@ if __name__ == '__main__':
                 idx=j+1,
                 orig_w=original_image.size[0],
                 orig_h=original_image.size[1],
+                resize_ratio=s1_pred['resize_ratio'],
                 num_crop=num_attention_crops,
                 crop_hit=crop_hit,
                 s1_time=f"{s1_time:.3f}",
@@ -1367,7 +1387,7 @@ if __name__ == '__main__':
         # CSV 헤더 정의
         csv_headers = [
             "method",
-            "s1_resize_ratio", "select_threshold", "stage1_ensemble_ratio", "crop_width", "crop_height",
+            "min_resize", "max_resize", "select_threshold", "stage1_ensemble_ratio", "crop_width", "crop_height",
             "total_samples", "crop_accuracy", "stage1_accuracy", "stage2_accuracy", "stage3_accuracy",
             "avg_stage1_time", "avg_stage2_time", "avg_stage3_time", "avg_total_time",
             "avg_stage1_tflops", "avg_stage2_tflops", "avg_total_tflops", "avg_peak_memory_gb",
@@ -1378,7 +1398,7 @@ if __name__ == '__main__':
         import datetime
         csv_row = [
             method,
-            S1_RESIZE_RATIO, SELECT_THRESHOLD, STAGE1_ENSEMBLE_RATIO, CROP_WIDTH, CROP_HEIGHT,
+            MIN_RESIZE, MAX_RESIZE, SELECT_THRESHOLD, STAGE1_ENSEMBLE_RATIO, CROP_WIDTH, CROP_HEIGHT,
             num_action, 
             round(metrics['crop_accuracy'], 2),
             round(metrics['stage1_accuracy'], 2),
