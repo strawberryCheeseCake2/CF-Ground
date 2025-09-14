@@ -3,6 +3,32 @@ import numpy as np
 from PIL import Image, ImageFont, ImageDraw
 import torch
 import matplotlib.pyplot as plt
+import matplotlib.font_manager as fm
+
+# matplotlib 폰트 설정 (이모지 및 한글 지원)
+try:
+    # 시스템에서 사용 가능한 폰트 찾기
+    available_fonts = [f.name for f in fm.fontManager.ttflist]
+    
+    # 한글 및 이모지 지원 폰트 우선순위
+    preferred_fonts = ['Noto Color Emoji', 'Apple Color Emoji', 'Segoe UI Emoji', 
+                      'DejaVu Sans', 'Arial Unicode MS', 'Noto Sans CJK JP', 'Malgun Gothic']
+    
+    selected_font = None
+    for font in preferred_fonts:
+        if font in available_fonts:
+            selected_font = font
+            break
+    
+    if selected_font:
+        plt.rcParams['font.family'] = selected_font
+    
+    # 마이너스 기호 깨짐 방지
+    plt.rcParams['axes.unicode_minus'] = False
+    
+except:
+    # 폰트 설정 실패 시 기본 설정 유지
+    pass
 
 @torch.inference_mode()
 def get_attn_map(image: Image.Image, attn_scores: list, n_width: int, n_height: int) -> Image.Image:
@@ -232,32 +258,98 @@ def visualize_stage2_merged_attention(s2_pred, merged_img, save_dir, instruction
             n_height=n_height
         )
         
-        # 2. 예측 점에 별 표시
-        if predicted_point and s2_pred.get("topk_points"):
-            # 정규화된 좌표를 픽셀 좌표로 변환
-            top_point_normalized = s2_pred["topk_points"][0]
+        # 2. Top-K 예측점들을 모두 시각화
+        if s2_pred.get("topk_points"):
+            topk_points = s2_pred["topk_points"]
+            img_w, img_h = merged_img.size
             
             draw = ImageDraw.Draw(blended_img)
             
-            # 별 그리기
-            img_w, img_h = merged_img.size
-            star_x = int(top_point_normalized[0] * img_w)
-            star_y = int(top_point_normalized[1] * img_h)
+            # 색상 설정 (상위 점수순으로 색상 진하게)
+            colors = [
+                "yellow",    # 1등 - 가장 밝은 노란색
+                "gold",      # 2등
+                "orange",    # 3등
+                "red",       # 4등
+                "magenta",   # 5등
+                "purple",    # 6등
+                "blue",      # 7등
+                "cyan",      # 8등
+                "lime",      # 9등
+                "white"      # 10등
+            ]
             
-            # 별 모양 그리기 (간단한 X 모양)
-            star_size = 20
-            draw.line([star_x - star_size, star_y - star_size, star_x + star_size, star_y + star_size], 
-                     fill="yellow", width=5)
-            draw.line([star_x - star_size, star_y + star_size, star_x + star_size, star_y - star_size], 
-                     fill="yellow", width=5)
-            draw.line([star_x, star_y - star_size, star_x, star_y + star_size], 
-                     fill="yellow", width=5)
-            draw.line([star_x - star_size, star_y, star_x + star_size, star_y], 
-                     fill="yellow", width=5)
+            # 각 예측점을 순위에 따라 다른 색상과 크기로 표시
+            for i, point_normalized in enumerate(topk_points[:10]):  # 최대 10개
+                star_x = int(point_normalized[0] * img_w)
+                star_y = int(point_normalized[1] * img_h)
+                
+                # 순위에 따른 크기 조정 (1등이 가장 크게)
+                star_size = max(8, 50 - i * 3)  # 1등: 50px, 10등: 20px
+                line_width = max(2, 5 - i // 2)  # 선 두께도 순위에 따라 조정
+                
+                color = colors[i] if i < len(colors) else "gray"
+                
+                # 별 모양 그리기
+                draw.line([star_x - star_size, star_y - star_size, star_x + star_size, star_y + star_size], 
+                         fill=color, width=line_width)
+                draw.line([star_x - star_size, star_y + star_size, star_x + star_size, star_y - star_size], 
+                         fill=color, width=line_width)
+                draw.line([star_x, star_y - star_size, star_x, star_y + star_size], 
+                         fill=color, width=line_width)
+                draw.line([star_x - star_size, star_y, star_x + star_size, star_y], 
+                         fill=color, width=line_width)
+                
+                # 중심점 표시 (순위에 따라 크기 조정)
+                center_radius = max(2, 5 - i // 3)
+                draw.ellipse([star_x - center_radius, star_y - center_radius, 
+                            star_x + center_radius, star_y + center_radius], 
+                            fill="black", outline="white", width=1)
+                
+                # 순위 번호 표시 (1~3등만)
+                if i < 3:
+                    try:
+                        font = ImageFont.truetype("arial.ttf", 6)
+                    except IOError:
+                        font = ImageFont.load_default()
+                    
+                    rank_text = str(i + 1)
+                    # 텍스트 배경 박스
+                    text_bbox = draw.textbbox((0, 0), rank_text, font=font)
+                    text_w = text_bbox[2] - text_bbox[0]
+                    text_h = text_bbox[3] - text_bbox[1]
+                    
+                    text_x = star_x + star_size + 5
+                    text_y = star_y - text_h // 2
+                    
+                    # 배경 박스
+                    draw.rectangle([text_x - 1, text_y - 1, text_x + text_w + 1, text_y + text_h + 1], 
+                                 fill="black", outline="white", width=1)
+                    # 텍스트
+                    draw.text((text_x, text_y), rank_text, fill=color, font=font)
+        
+        # 3. 범례 추가 (이미지 하단에)
+        if s2_pred.get("topk_points"):
+            try:
+                legend_font = ImageFont.truetype("arial.ttf", 6)
+            except IOError:
+                legend_font = ImageFont.load_default()
             
-            # 중심점 표시
-            draw.ellipse([star_x - 5, star_y - 5, star_x + 5, star_y + 5], 
-                        fill="red", outline="black", width=2)
+            # 범례 텍스트
+            legend_text = "★ Top-10 Predictions (1st=Yellow, 2nd=Gold, 3rd=Orange...)"
+            legend_bbox = draw.textbbox((0, 0), legend_text, font=legend_font)
+            legend_w = legend_bbox[2] - legend_bbox[0]
+            legend_h = legend_bbox[3] - legend_bbox[1]
+            
+            # 이미지 하단 중앙에 범례 배치
+            legend_x = (img_w - legend_w) // 2
+            legend_y = img_h - legend_h - 10
+            
+            # 배경 박스
+            draw.rectangle([legend_x - 5, legend_y - 3, legend_x + legend_w + 5, legend_y + legend_h + 3], 
+                         fill="black", outline="white", width=1)
+            # 범례 텍스트
+            draw.text((legend_x, legend_y), legend_text, fill="white", font=legend_font)
         
         # 4. Top-5 attention 점수 표시한 결과 저장
         os.makedirs(save_dir, exist_ok=True)
@@ -359,11 +451,184 @@ def visualize_stage2_individual_crops(all_crop_results, save_dir, instruction):
     # print(f"🌄 Stage 2 individual crops visualization saved")
 
 
+def visualize_stage3_point_ensemble(s3_ensemble_candidates, original_image, crop_list, original_bbox, 
+                                    s3_ensemble_point, s2_corrected_point, s1_original_point,
+                                    stage1_ratio, stage2_ratio, save_dir, vis_only_wrong=False, 
+                                    stage3_success=True):
+    """Stage 3 포인트 기반 앙상블 시각화 - 후보 포인트들과 최종 선택된 포인트 표시"""
+    
+    if s3_ensemble_point is None or not save_dir:
+        return
+        
+    if vis_only_wrong and stage3_success:
+        return
+    
+    # 원본 이미지 크기 계산
+    orig_w, orig_h = original_image.size
+
+    # 이미지 크기에 비례한 폰트 크기 계산 (최소 8, 최대 24)
+    base_font_size = max(8, min(30, int(orig_w / 50)))  # 50픽셀당 1pt
+    title_font_size = base_font_size
+    label_font_size = base_font_size
+    
+    # 여백 크기 계산 (이미지 높이의 15%)
+    margin_height = int(orig_h * 0.15)
+    legend_height = int(orig_h * 0.12)
+    
+    # 확장된 캔버스 크기
+    canvas_w = orig_w
+    canvas_h = orig_h + margin_height + legend_height
+    
+    # matplotlib 설정
+    fig_width = canvas_w / 100  # DPI 100 기준
+    fig_height = canvas_h / 100
+    
+    plt.figure(figsize=(fig_width, fig_height), dpi=100)
+    
+    # 이미지 영역과 여백 영역 분리
+    ax_main = plt.axes([0, legend_height/canvas_h, 1, orig_h/canvas_h])
+    ax_legend = plt.axes([0, 0, 1, legend_height/canvas_h])
+    
+    # 메인 이미지 영역
+    ax_main.imshow(original_image, alpha=1.0)
+    
+    # GT 박스 표시 (초록색)
+    if original_bbox is not None:
+        from matplotlib.patches import Rectangle
+        gt_rect = Rectangle((original_bbox[0], original_bbox[1]), 
+                           original_bbox[2] - original_bbox[0], 
+                           original_bbox[3] - original_bbox[1],
+                           fill=False, edgecolor='green', linewidth=4, alpha=0.9)
+        ax_main.add_patch(gt_rect)
+        
+        # GT 라벨 추가
+        gt_label_x = original_bbox[0] + 5
+        gt_label_y = original_bbox[1] - 20
+        ax_main.text(gt_label_x, gt_label_y, 'GT', color='green', fontsize=label_font_size, 
+                    weight='bold', bbox=dict(boxstyle="round,pad=0.3", facecolor='white', alpha=0.8))
+    
+    # 크롭 박스들 표시
+    for i, crop in enumerate(crop_list):
+        bbox = crop['bbox']
+        from matplotlib.patches import Rectangle
+        rect = Rectangle((bbox[0], bbox[1]), bbox[2]-bbox[0], bbox[3]-bbox[1], 
+                        fill=False, edgecolor='yellow', linewidth=2, alpha=0.8)
+        ax_main.add_patch(rect)
+    
+    # 주요 포인트들 표시 (기본 크기)
+    base_point_size = 600  # 기본 포인트 크기 (2배로 크게)
+    
+    # Stage1 결과 (연두색 동그라미)
+    if s1_original_point:
+        ax_main.scatter(s1_original_point[0], s1_original_point[1], 
+                       c='limegreen', s=base_point_size, marker='o', alpha=0.9, 
+                       edgecolors='darkgreen', linewidth=3, label='Stage1')
+    
+    # Stage2 결과 (파란색 동그라미)
+    if s2_corrected_point:
+        ax_main.scatter(s2_corrected_point[0], s2_corrected_point[1], 
+                       c='blue', s=base_point_size, marker='o', alpha=0.9, 
+                       edgecolors='darkblue', linewidth=3, label='Stage2')
+    
+    # Stage3 앙상블 후보 포인트들 표시
+    if s3_ensemble_candidates:
+        # 점수 순으로 정렬된 후보들 표시
+        sorted_candidates = sorted(s3_ensemble_candidates, key=lambda x: x['score'], reverse=True)
+        
+        # Stage3 1등 (빨간색 별, 같은 크기) - 배경 추가하여 잘 보이게
+        if len(sorted_candidates) > 0:
+            x, y = sorted_candidates[0]['point']
+            score = sorted_candidates[0]['score']
+            ax_main.scatter(x, y, c='red', s=base_point_size*1.5, marker='*', alpha=1.0, 
+                           edgecolors='darkred', linewidth=3, label='Stage3 #1')
+            # 1등 점수 표시 (배경 추가하여 잘 보이게)
+            ax_main.text(x+30, y-16, f'{score:.3f}', fontsize=label_font_size//2, 
+                        color='red', weight='bold',
+                        bbox=dict(boxstyle="round,pad=0.2", facecolor='white', alpha=0.7))
+        
+        # Stage3 나머지 후보들 (빨간색 동그라미, 점점 작아지게)
+        for i, candidate in enumerate(sorted_candidates[1:5]):  # 2등~5등만 표시
+            x, y = candidate['point']
+            score = candidate['score']
+            # 크기 점점 작아지게 (2등: 80%, 3등: 60%, 4등: 40%, 5등: 20%)
+            size_ratio = max(0.2, 1.0 - (i + 1) * 0.2)
+            point_size = int(base_point_size * size_ratio)
+            # 빨간색 동그라미로 통일
+            color = 'red'
+            ax_main.scatter(x, y, c=color, s=point_size, marker='o', alpha=0.8, 
+                           edgecolors='darkred', linewidth=2)
+            # 순위와 점수 함께 표시 (좌표도 2배로)
+            ax_main.text(x+16, y-10, f'{i+2}({score:.3f})', fontsize=label_font_size//3, 
+                        color='black', weight='bold', 
+                        bbox=dict(boxstyle="round,pad=0.2", facecolor='white', alpha=0.7))
+    
+    # 축 설정
+    ax_main.set_xlim(0, orig_w)
+    ax_main.set_ylim(orig_h, 0)  # y축 뒤집기 (이미지 좌표계)
+    ax_main.set_aspect('equal')
+    ax_main.axis('off')
+    
+    # 이미지와 범례 사이에 구분선 추가
+    fig = plt.gcf()
+    line_y = legend_height / canvas_h  # 범례 영역 상단
+    fig.add_artist(plt.Line2D([0, 1], [line_y, line_y], color='gray', linewidth=2, alpha=0.8))
+    
+    # 범례 영역 설정
+    ax_legend.axis('off')
+    
+    # 제목 및 정보 텍스트
+    title_text = f"Stage 3 Point Ensemble (Success: {stage3_success})"
+    ax_legend.text(0.5, 0.85, title_text, fontsize=title_font_size, weight='bold', 
+                  ha='center', va='center', transform=ax_legend.transAxes)
+    
+    # 앙상블 정보
+    info_text = f"Ensemble Ratio - Stage1: {stage1_ratio:.2f}, Stage2: {stage2_ratio:.2f}"
+    ax_legend.text(0.5, 0.65, info_text, fontsize=label_font_size, 
+                  ha='center', va='center', transform=ax_legend.transAxes)
+    
+    # 색상 및 범례 정보 (시각적 마커와 함께 표시)
+    # 범례 영역에 실제 마커들을 그려서 표시
+    legend_items = [
+        ('S1', 'limegreen', 'o'),
+        ('S2', 'blue', 'o'), 
+        ('S3', 'red', '*'),
+        ('S3-others', 'red', 'o'), 
+        ('GT', 'green', 's'),  # GT 박스 추가
+        ('Crops', 'yellow', 's')
+    ]
+    
+    # 범례 마커들을 가로로 배치
+    x_start = 0.1
+    x_spacing = 0.15
+    y_pos = 0.3
+    
+    for i, (label, color, marker) in enumerate(legend_items):
+        x_pos = x_start + i * x_spacing
+        
+        # 마커 그리기
+        ax_legend.scatter(x_pos, y_pos, c=color, s=300, marker=marker, 
+                         alpha=0.9, edgecolors='black', linewidth=1,
+                         transform=ax_legend.transAxes)
+        
+        # 라벨 텍스트
+        ax_legend.text(x_pos + 0.03, y_pos, label, fontsize=label_font_size-4,
+                      ha='left', va='center', transform=ax_legend.transAxes)
+    
+    # 저장
+    success_str = "success" if stage3_success else "failure"
+    filename = f"s3_point_ensemble_{success_str}.png"
+    filepath = os.path.join(save_dir, filename)
+    plt.savefig(filepath, dpi=100, bbox_inches='tight', pad_inches=0.05)
+    plt.close()
+    
+    # print(f"💾 Stage3 point ensemble visualization saved: {filepath}")
+
+
 def visualize_stage3_ensemble_attention(ensemble_map, original_image, crop_list, original_bbox, 
                                        s3_ensemble_point, s2_corrected_point, s1_original_point,
                                        stage1_ratio, stage2_ratio, save_dir, vis_only_wrong=False, 
                                        stage3_success=True):
-    """Stage 3 앙상블 어텐션 시각화 - 설명 박스가 이미지를 가리지 않도록 여백 추가"""
+    """Stage 3 앙상블 어텐션 시각화 - 설명 박스가 이미지를 가리지 않도록 여백 추가 (기존 방식용)"""
     
     if s3_ensemble_point is None or not save_dir:
         return
