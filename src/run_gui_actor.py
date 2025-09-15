@@ -35,7 +35,9 @@ ENSEMBLE_TOP_PATCHES = 100                         # Stage2에서 앙상블에 �
 # 최대 PIXELS 제한
 MAX_PIXELS = 3211264  # Process단에서 적용
 
-method = "dynamic_resize" # csv에 기록할 method 이름
+# csv에 기록할 method 이름
+# method = "dynamic_resize"
+method = "fixed_resize"
 
 memo = f"resize_{MIN_RESIZE:.2f}~{MAX_RESIZE:.2f}_ensemble{STAGE1_ENSEMBLE_RATIO}_crop{CROP_WIDTH}x{CROP_HEIGHT}"
 
@@ -214,12 +216,19 @@ def create_conversation_stage2(image, instruction, crop_cnt):
 def run_stage1_attention_inference(original_image, instruction):
     """Stage 1: 리사이즈하고 inference"""
 
-    # 이미지 동적 리사이즈
     orig_w, orig_h = original_image.size
-    downsampled = original_image.resize((int(orig_w*0.5), int(orig_h*0.5)))
-    resize_ratio = get_fft_blur_score(downsampled, min_resize=MIN_RESIZE, max_resize=MAX_RESIZE)
-    resized_w, resized_h = int(orig_w * resize_ratio), int(orig_h * resize_ratio)
-    print(f"🔧 Dynamic Resized image: {orig_w}x{orig_h} -> {resized_w}x{resized_h} (ratio: {resize_ratio:.3f})")
+    # 이미지 고정 리사이즈
+    if MIN_RESIZE == MAX_RESIZE:
+        resize_ratio = MIN_RESIZE
+        resized_w, resized_h = int(orig_w * resize_ratio), int(orig_h * resize_ratio)
+        print(f"🔧 Fixed Resized image: {orig_w}x{orig_h} -> {resized_w}x{resized_h} (ratio: {resize_ratio:.3f})")
+    
+    # 이미지 동적 리사이즈
+    else:
+        downsampled = original_image.resize((int(orig_w*0.5), int(orig_h*0.5)))
+        resize_ratio = get_fft_blur_score(downsampled, min_resize=MIN_RESIZE, max_resize=MAX_RESIZE)
+        resized_w, resized_h = int(orig_w * resize_ratio), int(orig_h * resize_ratio)
+        print(f"🔧 Dynamic Resized image: {orig_w}x{orig_h} -> {resized_w}x{resized_h} (ratio: {resize_ratio:.3f})")
     
     # 리사이즈된 이미지로 inference
     resized_image = original_image.resize((resized_w, resized_h))
