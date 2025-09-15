@@ -3,8 +3,9 @@ import argparse
 
 parser = argparse.ArgumentParser()
 parser.add_argument('gpu', type=int, help='GPU number')
-parser.add_argument('--resize', type=float, help='Stage 1 Resize ratio')
+parser.add_argument('--resize', type=float, nargs=2, metavar=('MIN_RESIZE', 'MAX_RESIZE'), help='Stage 1 Resize ratio range (min max)')
 parser.add_argument('--ensemble', type=float, help='Stage 1 Ensemble ratio')
+parser.add_argument('--visualize', action='store_true', help='Whether to save visualization images')
 args = parser.parse_args()
 
 os.environ["CUDA_DEVICE_ORDER"]="PCI_BUS_ID"
@@ -15,7 +16,9 @@ os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu)  # 몇번 GPU 사용할지 ar
 ATTN_IMPL = "eager"  # attention implement "eager" "sdpa" "flash" "efficient"
 
 # Image Resize Ratios
-S1_RESIZE_RATIO = args.resize if args.resize else 0.50  #! 모바일은 낮아도 content가 커서 괜찮. 나머지는 pixel대비 content가 작아서 resize를 너무하면안됨
+
+MIN_RESIZE = args.resize[0] if args.resize else 0.75  # DYNAMIC_RESIZE 비율 최소값
+MAX_RESIZE = args.resize[1] if args.resize else 0.75  # DYNAMIC_RESIZE 비율 최대값
 
 # Crop Limitations
 MAX_CROPS = 3  # 생성할 수 있는 최대 crop 개수
@@ -24,16 +27,19 @@ CROP_WIDTH = 1176  # 크롭할 직사각형 가로 크기 (아이폰 전체 가�
 CROP_HEIGHT = 602  # 크롭할 직사각형 세로 크기
 
 # Ensemble Hyperparameters
-STAGE1_ENSEMBLE_RATIO = args.ensemble if args.ensemble else 0.50  #! Stage1 attention 가중치
+# TODO: 이것도 resize처럼 동적으로 측정해서 변경 가능하도록
+STAGE1_ENSEMBLE_RATIO = args.ensemble if args.ensemble else 0.50  # Stage1 attention 가중치
 STAGE2_ENSEMBLE_RATIO = 1 - STAGE1_ENSEMBLE_RATIO  # Stage2 crop 가중치
-ENSEMBLE_TOP_PATCHES = 100  # Stage2에서 앙상블에 사용할 상위 패치 개수 (100이면 충분해보임)
+ENSEMBLE_TOP_PATCHES = 100                         # Stage2에서 앙상블에 사용할 상위 패치 개수
 
 # 최대 PIXELS 제한
-MAX_PIXELS = None if S1_RESIZE_RATIO < 1.0 else 3211264  # 100% 넣어준다면 OOM 방지
+MAX_PIXELS = 3211264  # Process단에서 적용
 
-method = "collage" # csv에 기록할 method 이름
+# csv에 기록할 method 이름
+# method = "dynamic_resize"
+method = "multi_fixed_resize"
 
-memo = f"{method}/resize_{S1_RESIZE_RATIO:.2f}_ensemble_{STAGE1_ENSEMBLE_RATIO:.2f}_{STAGE2_ENSEMBLE_RATIO:.2f}_select_{SELECT_THRESHOLD:.2f}"
+memo = f"resize_{MIN_RESIZE:.2f}~{MAX_RESIZE:.2f}_ensemble{STAGE1_ENSEMBLE_RATIO}_crop{CROP_WIDTH}x{CROP_HEIGHT}"
 
 #! Argument ==========================================================================================
 
@@ -51,15 +57,14 @@ SAMPLE_RANGE = slice(None)
 # SAMPLE_RANGE = slice(0,2)
 
 # Visualize & Logging
-STAGE1_VIS = True
-STAGE2_VIS = True
+VISUALIZE = args.visualize if args.visualize else False
 VIS_ONLY_WRONG = False  # True면 틀린 것만 시각화, False면 모든 것 시각화
 TFOPS_PROFILING = True
 MEMORY_EVAL = True
 MEMORY_VIS = False
 
 # Save Path
-SAVE_DIR = f"../attn_output/" + memo
+SAVE_DIR = f"../attn_output/" + method + "/" + memo
 
 #! ==================================================================================================
 
@@ -85,7 +90,9 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from util.iter_logger import init_iter_logger, append_iter_log  # log csv 기록 파일
 from gui_actor.modeling_qwen25vl import Qwen2_5_VLForConditionalGenerationWithPointer
 from gui_actor.inference import inference
-from util.visualize_util import visualize_stage1_attention_crops, visualize_stage2_merged_attention, visualize_stage3_ensemble_attention, visualize_stage2_individual_crops
+from gui_actor.multi_image_inference import multi_image_inference
+from util.visualize_util import visualize_stage1_attention_crops, visualize_stage2_merged_attention, visualize_stage2_multi_attention, visualize_stage3_ensemble_attention, visualize_stage3_point_ensemble
+from util.sharpness_util import get_fft_blur_score
 if TFOPS_PROFILING:
     from deepspeed.profiling.flops_profiler import FlopsProfiler
 
@@ -103,7 +110,7 @@ class NpEncoder(json.JSONEncoder):
             return bool(obj)
         return super(NpEncoder, self).default(obj)
 
-def resize_image(image, resize_to_pixels=MAX_PIXELS):
+def resize_image(image, resize_to_pixels):
     image_width, image_height = image.size
     if (resize_to_pixels is not None) and ((image_width * image_height) > resize_to_pixels):
         resize_ratio = (resize_to_pixels / (image_width * image_height)) ** 0.5
@@ -113,7 +120,7 @@ def resize_image(image, resize_to_pixels=MAX_PIXELS):
     return image
 
 def warm_up_model(model, tokenizer, processor):
-    print("🔄 Warming up the model...")
+    print("🏋️‍♂️ Warming up the model...")
     dummy_instruction = "This is a dummy instruction for warm-up."
     dummy_image = Image.new("RGB", (1000, 1000), color=(255, 255, 255))  # 1000x1000 흰색 이미지
     dummy_msgs = create_conversation_stage1(image=dummy_image, instruction=dummy_instruction, resize_ratio=1.0)
@@ -122,7 +129,7 @@ def warm_up_model(model, tokenizer, processor):
     for _ in range(3):  # 3번 반복
         with torch.no_grad():
             _ = inference(dummy_msgs, model, tokenizer, processor, use_placeholder=True, topk=3)
-    print("🔄 Warm-up complete!")
+    print("🏋️‍♂️ Warm-up complete!")
 
 def create_conversation_stage1(image, instruction, resize_ratio):
     conversation = [
@@ -164,155 +171,6 @@ def create_conversation_stage1(image, instruction, resize_ratio):
         },
     ]
     return conversation
-
-def create_conversation_stage2_individual(image, instruction):
-    """개별 crop을 위한 Stage2 대화 생성"""
-    conversation = [
-        {
-            "role": "system",
-            "content": [
-                {
-                    "type": "text",
-                    "text": (
-                        "This is a cropped region from a larger screenshot that was selected as a promising area. "
-                        "You are a GUI agent. Given this cropped image and a human instruction, "
-                        "your task is to locate the screen element that corresponds to the instruction. "
-                        "You should output a PyAutoGUI action that performs a click on the correct position. "
-                        "To indicate the click location, we will use some special tokens, which is used to refer to a visual patch later. "
-                        "For example, you can output: pyautogui.click(<your_special_token_here>)."
-                    ),
-                }
-            ]
-        },
-        {
-            "role": "user",
-            "content": [
-                {
-                    "type": "image",
-                    "image": image,
-                },
-                {
-                    "type": "text",
-                    "text": instruction,
-                }
-            ],
-        },
-    ]
-    return conversation
-
-def run_stage2_individual_inference(crop_list, instruction):
-    """각 crop을 개별적으로 inference하고 가장 높은 점수의 결과 반환"""
-    
-    if not crop_list:
-        return None, None, []
-    
-    all_results = []
-    
-    # 각 crop에 대해 개별 inference 실행
-    for i, crop in enumerate(crop_list):
-        crop_img = crop['img']
-        crop_bbox = crop['bbox']
-        
-        # 개별 crop으로 inference
-        conversation = create_conversation_stage2_individual(crop_img, instruction)
-        pred = inference(conversation, model, tokenizer, processor, use_placeholder=True, topk=3)
-        
-        # 정규화된 좌표를 crop 이미지 좌표로 변환
-        top_point_normalized = pred["topk_points"][0]
-        crop_w, crop_h = crop_img.size
-        crop_x = top_point_normalized[0] * crop_w
-        crop_y = top_point_normalized[1] * crop_h
-        
-        # crop 좌표를 원본 이미지 좌표로 변환
-        original_x = crop_bbox[0] + crop_x
-        original_y = crop_bbox[1] + crop_y
-        
-        # 결과 저장
-        result = {
-            'crop_idx': i,
-            'crop_bbox': crop_bbox,
-            'crop_img': crop_img,  # 시각화를 위해 추가
-            'pred': pred,
-            'crop_point': [crop_x, crop_y],
-            'original_point': [original_x, original_y],
-            'confidence_score': pred.get('confidence_score', 0.0),
-            'max_attn_score': max(pred['attn_scores'][0]) if pred.get('attn_scores') else 0.0
-        }
-        all_results.append(result)
-    
-    # 가장 높은 attention score를 가진 결과 선택
-    best_result = max(all_results, key=lambda x: x['max_attn_score'])
-    
-    # Stage2 예측 결과를 기존 형식에 맞게 반환
-    s2_pred = best_result['pred']
-    s2_corrected_point = best_result['original_point']
-    
-    return s2_pred, s2_corrected_point, all_results
-
-def create_stage2_attention_to_original_individual(all_crop_results, original_size, use_top_patches=ENSEMBLE_TOP_PATCHES):
-    """모든 개별 crop inference 결과를 합쳐서 Stage2 어텐션을 원본 이미지 크기로 변환 (겹치는 부분 가중평균 처리)"""
-    
-    orig_w, orig_h = original_size
-    stage2_attention_map = np.zeros((orig_h, orig_w))
-    overlap_count_map = np.zeros((orig_h, orig_w))  # 겹치는 횟수를 카운트하는 맵
-    
-    if not all_crop_results:
-        return stage2_attention_map
-    
-    # 모든 crop 결과를 순회하면서 어텐션 맵 합치기
-    for result in all_crop_results:
-        s2_pred = result['pred']
-        crop_bbox = result['crop_bbox']
-        
-        attn_scores = np.array(s2_pred['attn_scores'][0])
-        n_width = s2_pred['n_width'] 
-        n_height = s2_pred['n_height']
-        
-        # 상위 패치들만 선별 (효율성을 위해)
-        top_patch_indices = np.argsort(attn_scores)[::-1][:use_top_patches]
-        
-        for patch_idx in top_patch_indices:
-            score = attn_scores[patch_idx]
-            
-            # 패치 좌표 계산
-            patch_y = patch_idx // n_width
-            patch_x = patch_idx % n_width
-            
-            # 패치 중심점 계산 (normalized coordinates)
-            patch_center_x_norm = (patch_x + 0.5) / n_width
-            patch_center_y_norm = (patch_y + 0.5) / n_height
-            
-            # crop 이미지에서의 픽셀 좌표로 변환
-            crop_w = crop_bbox[2] - crop_bbox[0]
-            crop_h = crop_bbox[3] - crop_bbox[1]
-            crop_x = patch_center_x_norm * crop_w
-            crop_y = patch_center_y_norm * crop_h
-            
-            # 원본 이미지 좌표로 변환
-            orig_center_x = crop_bbox[0] + crop_x
-            orig_center_y = crop_bbox[1] + crop_y
-            
-            # 원본에서의 패치 크기 추정 (Stage1과 동일)
-            orig_patch_w = orig_w / n_width
-            orig_patch_h = orig_h / n_height
-            
-            # 패치 영역 계산 (중심점 기준으로)
-            orig_x_start = int(max(0, orig_center_x - orig_patch_w/2))
-            orig_x_end = int(min(orig_w, orig_center_x + orig_patch_w/2))
-            orig_y_start = int(max(0, orig_center_y - orig_patch_h/2))
-            orig_y_end = int(min(orig_h, orig_center_y + orig_patch_h/2))
-            
-            # 해당 영역에 어텐션 스코어 할당 (누적)
-            if orig_x_end > orig_x_start and orig_y_end > orig_y_start:
-                stage2_attention_map[orig_y_start:orig_y_end, orig_x_start:orig_x_end] += score
-                overlap_count_map[orig_y_start:orig_y_end, orig_x_start:orig_x_end] += 1
-    
-    # 겹치는 부분은 겹치는 횟수로 나누어 가중평균 처리
-    # 0으로 나누는 것을 방지하기 위해 overlap_count_map이 0인 곳은 그대로 두기
-    valid_mask = overlap_count_map > 0
-    stage2_attention_map[valid_mask] = stage2_attention_map[valid_mask] / overlap_count_map[valid_mask]
-    
-    return stage2_attention_map
 
 def create_conversation_stage2(image, instruction, crop_cnt):
     conversation = [
@@ -357,19 +215,26 @@ def create_conversation_stage2(image, instruction, crop_cnt):
     return conversation
 
 def run_stage1_attention_inference(original_image, instruction):
-    """Stage 1: S1_RESIZE_MAX_PIXEL로 리사이즈하고 inference"""
-    
+    """Stage 1: 리사이즈하고 inference"""
+
     orig_w, orig_h = original_image.size
+    # 이미지 고정 리사이즈
+    if MIN_RESIZE == MAX_RESIZE:
+        resize_ratio = MIN_RESIZE
+        resized_w, resized_h = int(orig_w * resize_ratio), int(orig_h * resize_ratio)
+        print(f"🔧 Fixed Resized image: {orig_w}x{orig_h} -> {resized_w}x{resized_h} (ratio: {resize_ratio:.3f})")
     
-    # S1_RESIZE_MAX_PIXEL에 따라 리사이즈
-    resize_ratio = S1_RESIZE_RATIO
-    resized_w, resized_h = int(orig_w * resize_ratio), int(orig_h * resize_ratio)
-    resized_image = original_image.resize((resized_w, resized_h))
-    print(f"🔧 Resized image: {orig_w}x{orig_h} -> {resized_w}x{resized_h} (ratio: {resize_ratio:.3f})")
+    # 이미지 동적 리사이즈
+    else:
+        downsampled = original_image.resize((int(orig_w*0.5), int(orig_h*0.5)))
+        resize_ratio = get_fft_blur_score(downsampled, min_resize=MIN_RESIZE, max_resize=MAX_RESIZE)
+        resized_w, resized_h = int(orig_w * resize_ratio), int(orig_h * resize_ratio)
+        print(f"🔧 Dynamic Resized image: {orig_w}x{orig_h} -> {resized_w}x{resized_h} (ratio: {resize_ratio:.3f})")
     
     # 리사이즈된 이미지로 inference
+    resized_image = original_image.resize((resized_w, resized_h))
     conversation = create_conversation_stage1(resized_image, instruction, resize_ratio)
-    pred = inference(conversation, model, tokenizer, processor, use_placeholder=True, topk=3)  #! topk 파라미터 변경?
+    pred = inference(conversation, model, tokenizer, processor, use_placeholder=True, topk=1)
     
     # 결과에 리사이즈 정보 추가
     pred['resize_ratio'] = resize_ratio
@@ -588,419 +453,171 @@ def create_merged_image_for_stage2(crops):
     return merged_img, crop_y_mappings
 
 
-def run_stage2_merged_inference(merged_img, instruction):
-    """Stage 2: 합쳐진 이미지로 inference"""
+def create_multi_image_msgs(crop_list, instruction):
+    user_content = []
+    for crop in crop_list:
+        img = crop["img"]  # "resized_img" -> "img" 수정
+        user_content.append({"type": "image", "image": img})
+
+    user_content.append({
+        "type": "text",
+        "text": instruction,
+    })
+    conversation = [
+        {
+            "role": "system",
+            "content": [
+                {
+                    "type": "text",
+                    "text": (
+                        "You are a GUI agent. Given a screenshot of the current GUI and a human instruction, "
+                        "your task is to locate the screen element that corresponds to the instruction. "
+                        "You should output a PyAutoGUI action that performs a click on the correct position. "
+                        "To indicate the click location, we will use some special tokens, which is used to refer to a visual patch later. "
+                        "For example, you can output: pyautogui.click(<your_special_token_here>)."
+                    ),
+                }
+            ]
+        },
+        {
+            "role": "user",
+            "content": user_content,
+        },
+    ]
+    return conversation
+
+def run_stage2_multi_image_inference(crop_list, instruction):
+    """Stage 2: multi image inference - 각 crop별로 개별 inference"""
     
-    # 합쳐진 이미지로 inference
-    conversation = create_conversation_stage2(merged_img, instruction, 1)
-    pred = inference(conversation, model, tokenizer, processor, use_placeholder=True, topk=3)
+    # multi image inference용 대화 생성
+    conversation = create_multi_image_msgs(crop_list, instruction)
+    
+    # multi image inference 실행 (각 이미지별 결과 반환)
+    pred = multi_image_inference(conversation, model, tokenizer, processor, use_placeholder=True, topk=10)
     
     return pred
 
-def convert_merged_point_to_original(point_in_merged, crop_y_mappings, merged_img_size):
-    """합쳐진 이미지에서의 정규화된 좌표를 원본 이미지 좌표로 변환"""
+def convert_multi_image_results_to_original(multi_pred, crop_list):
+    """multi_image_inference 결과를 원본 이미지 좌표로 변환하고 앙상블"""
     
-    merged_w, merged_h = merged_img_size
+    if not multi_pred.get('per_image') or not crop_list:
+        return None, []
     
-    # 합쳐진 이미지 내에서의 픽셀 좌표
-    merged_x = point_in_merged[0] * merged_w
-    merged_y = point_in_merged[1] * merged_h
+    # 각 crop별 결과를 원본 좌표로 변환
+    converted_results = []
+    all_candidates = []
     
-    # 어느 crop에 속하는지 찾기
-    for mapping in crop_y_mappings:
-        if mapping['merged_y_start'] <= merged_y < mapping['merged_y_end']:
-            # 해당 crop 내에서의 상대 좌표
-            relative_y = merged_y - mapping['merged_y_start']
-            relative_x = merged_x - mapping['paste_x']
+    for img_idx, img_result in enumerate(multi_pred['per_image']):
+        if img_idx >= len(crop_list):
+            continue
+            
+        crop_info = crop_list[img_idx]
+        crop_bbox = crop_info['bbox']  # [left, top, right, bottom]
+        crop_width = crop_bbox[2] - crop_bbox[0]
+        crop_height = crop_bbox[3] - crop_bbox[1]
+        
+        # 해당 이미지의 topk 결과들을 원본 좌표로 변환
+        crop_candidates = []
+        for point_idx, (point, score) in enumerate(zip(img_result['topk_points'], img_result['topk_values'])):
+            # 정규화된 좌표를 crop 내 픽셀 좌표로 변환
+            crop_x = point[0] * crop_width
+            crop_y = point[1] * crop_height
+            
+            # crop 좌표를 원본 이미지 좌표로 변환
+            original_x = crop_bbox[0] + crop_x
+            original_y = crop_bbox[1] + crop_y
+            
+            candidate = {
+                'point': [original_x, original_y],
+                'score': score,
+                'crop_id': crop_info['id'],
+                'crop_bbox': crop_bbox,
+                'rank_in_crop': point_idx
+            }
+            crop_candidates.append(candidate)
+            all_candidates.append(candidate)
+        
+        converted_results.append({
+            'crop_id': crop_info['id'],
+            'crop_bbox': crop_bbox,
+            'candidates': crop_candidates
+        })
+    
+    # 모든 후보들을 점수순으로 정렬하여 최종 앙상블 결과 생성
+    all_candidates.sort(key=lambda x: x['score'], reverse=True)
+    
+    # 최고 점수 후보를 최종 예측으로 선택
+    best_candidate = all_candidates[0] if all_candidates else None
+    
+    return best_candidate, all_candidates
+
+def create_stage2_attention_to_original_multi(multi_pred, crop_list, original_size):
+    """multi_image_inference 결과로부터 원본 이미지 크기의 어텐션 맵 생성"""
+    
+    if not multi_pred.get('per_image') or not crop_list:
+        return None
+    
+    orig_w, orig_h = original_size
+    stage2_attention_map = np.zeros((orig_h, orig_w), dtype=np.float32)
+    overlap_count_map = np.zeros((orig_h, orig_w), dtype=np.int32)
+    
+    # 각 crop의 상위 100개 패치를 원본 이미지에 매핑
+    for img_idx, img_result in enumerate(multi_pred['per_image']):
+        if img_idx >= len(crop_list):
+            continue
+            
+        crop_info = crop_list[img_idx]
+        crop_bbox = crop_info['bbox']  # [left, top, right, bottom]
+        crop_width = crop_bbox[2] - crop_bbox[0]
+        crop_height = crop_bbox[3] - crop_bbox[1]
+        
+        # 해당 이미지의 어텐션 스코어와 그리드 정보
+        attn_scores = np.array(img_result['attn_scores'][0])
+        n_width = img_result['n_width']
+        n_height = img_result['n_height']
+        
+        # 상위 100개 패치 선택
+        top_indices = np.argsort(attn_scores)[-100:][::-1]  # 상위 100개
+        
+        for patch_idx in top_indices:
+            # 패치 좌표 계산 (crop 내에서)
+            patch_y = patch_idx // n_width
+            patch_x = patch_idx % n_width
+            
+            # 패치 중심점의 정규화된 좌표 (crop 내에서)
+            norm_x = (patch_x + 0.5) / n_width
+            norm_y = (patch_y + 0.5) / n_height
+            
+            # crop 내 픽셀 좌표로 변환
+            crop_pixel_x = norm_x * crop_width
+            crop_pixel_y = norm_y * crop_height
             
             # 원본 이미지 좌표로 변환
-            original_bbox = mapping['original_bbox']
-            original_x = original_bbox[0] + relative_x
-            original_y = original_bbox[1] + relative_y
+            orig_pixel_x = crop_bbox[0] + crop_pixel_x
+            orig_pixel_y = crop_bbox[1] + crop_pixel_y
             
-            return [original_x, original_y]
+            # 원본 이미지 범위 내로 클리핑
+            orig_pixel_x = max(0, min(orig_w - 1, orig_pixel_x))
+            orig_pixel_y = max(0, min(orig_h - 1, orig_pixel_y))
+            
+            # 정수 좌표로 변환
+            x_int = int(orig_pixel_x)
+            y_int = int(orig_pixel_y)
+            
+            # 어텐션 스코어 누적 및 겹침 카운트
+            stage2_attention_map[y_int, x_int] += attn_scores[patch_idx]
+            overlap_count_map[y_int, x_int] += 1
     
-    # 범위를 벗어난 경우 첫 번째 crop의 중심으로 근사
-    if crop_y_mappings:
-        first_bbox = crop_y_mappings[0]['original_bbox']
-        center_x = (first_bbox[0] + first_bbox[2]) / 2
-        center_y = (first_bbox[1] + first_bbox[3]) / 2
-        return [center_x, center_y]
-    
-    return [0, 0]
-
-def resize_attention_to_original(s1_pred, original_size, resize_ratio):
-    """Stage1 어텐션 맵을 원본 이미지 크기로 변환"""
-    
-    attn_scores = np.array(s1_pred['attn_scores'][0])
-    n_width = s1_pred['n_width'] 
-    n_height = s1_pred['n_height']
-    
-    orig_w, orig_h = original_size
-    
-    # 어텐션 스코어를 원본 이미지 좌표계로 변환
-    attention_map = np.zeros((orig_h, orig_w))
-    
-    for idx, score in enumerate(attn_scores):
-        # 패치 좌표 계산
-        patch_y = idx // n_width
-        patch_x = idx % n_width
-        
-        # 패치 중심점을 원본 좌표로 변환 (리사이즈 역보정)
-        # 패치 중심점 계산 (normalized coordinates)
-        patch_center_x_norm = (patch_x + 0.5) / n_width
-        patch_center_y_norm = (patch_y + 0.5) / n_height
-        
-        # 원본 좌표로 변환
-        orig_center_x = patch_center_x_norm * orig_w
-        orig_center_y = patch_center_y_norm * orig_h
-        
-        # 원본에서의 패치 크기 추정
-        orig_patch_w = orig_w / n_width
-        orig_patch_h = orig_h / n_height
-        
-        # 패치 영역 계산 (중심점 기준으로)
-        orig_x_start = int(max(0, orig_center_x - orig_patch_w/2))
-        orig_x_end = int(min(orig_w, orig_center_x + orig_patch_w/2))
-        orig_y_start = int(max(0, orig_center_y - orig_patch_h/2))
-        orig_y_end = int(min(orig_h, orig_center_y + orig_patch_h/2))
-        
-        # 해당 영역에 어텐션 스코어 할당
-        if orig_x_end > orig_x_start and orig_y_end > orig_y_start:
-            attention_map[orig_y_start:orig_y_end, orig_x_start:orig_x_end] = score
-    
-    return attention_map
-
-def create_crop_attention_maps(crops, original_size):
-    """각 크롭에 대한 어텐션 맵 생성 (균등 분포) - fallback 함수"""
-    
-    orig_w, orig_h = original_size
-    crop_attention_maps = []
-    
-    for crop in crops:
-        # 각 크롭에 대해 균등한 어텐션 맵 생성
-        crop_map = np.zeros((orig_h, orig_w))
-        bbox = crop['bbox']
-        
-        # 크롭 영역에 균등한 값 할당
-        crop_map[bbox[1]:bbox[3], bbox[0]:bbox[2]] = 1.0
-        
-        crop_attention_maps.append(crop_map)
-    
-    return crop_attention_maps
-
-def create_stage2_attention_to_original(s2_pred, s2_crop_mappings, s2_merged_img, original_size, use_top_patches=ENSEMBLE_TOP_PATCHES):
-    """Stage2 어텐션을 Stage1과 동일한 방식으로 원본 이미지 크기로 변환"""
-    
-    attn_scores = np.array(s2_pred['attn_scores'][0])
-    n_width = s2_pred['n_width'] 
-    n_height = s2_pred['n_height']
-    
-    orig_w, orig_h = original_size
-    
-    # 상위 패치들만 선별 (효율성을 위해)
-    top_patch_indices = np.argsort(attn_scores)[::-1][:use_top_patches]
-    
-    # Stage2 어텐션 맵을 원본 이미지 좌표계로 변환
-    stage2_attention_map = np.zeros((orig_h, orig_w))
-    
-    for patch_idx in top_patch_indices:
-        score = attn_scores[patch_idx]
-        
-        # 패치 좌표 계산
-        patch_y = patch_idx // n_width
-        patch_x = patch_idx % n_width
-        
-        # 패치 중심점 계산 (normalized coordinates)
-        patch_center_x_norm = (patch_x + 0.5) / n_width
-        patch_center_y_norm = (patch_y + 0.5) / n_height
-        
-        # 합쳐진 이미지 좌표를 원본 이미지 좌표로 변환
-        point_original = convert_merged_point_to_original(
-            [patch_center_x_norm, patch_center_y_norm], s2_crop_mappings, s2_merged_img.size
-        )
-        
-        # 원본에서의 패치 크기 추정 (Stage1과 동일)
-        orig_patch_w = orig_w / n_width
-        orig_patch_h = orig_h / n_height
-        
-        # 패치 영역 계산 (중심점 기준으로)
-        orig_center_x, orig_center_y = point_original
-        orig_x_start = int(max(0, orig_center_x - orig_patch_w/2))
-        orig_x_end = int(min(orig_w, orig_center_x + orig_patch_w/2))
-        orig_y_start = int(max(0, orig_center_y - orig_patch_h/2))
-        orig_y_end = int(min(orig_h, orig_center_y + orig_patch_h/2))
-        
-        # 해당 영역에 어텐션 스코어 할당 (Stage1과 동일)
-        if orig_x_end > orig_x_start and orig_y_end > orig_y_start:
-            stage2_attention_map[orig_y_start:orig_y_end, orig_x_start:orig_x_end] += score
+    # 겹치는 부분은 겹치는 횟수로 나누어 가중평균 처리
+    valid_mask = overlap_count_map > 0
+    stage2_attention_map[valid_mask] = stage2_attention_map[valid_mask] / overlap_count_map[valid_mask]
     
     return stage2_attention_map
-
-def create_crop_attention_maps_patches(s2_pred, s2_crop_mappings, s2_merged_img, s1_crop_list, original_size, use_top_patches):
-    """Stage2의 상위 패치들을 Stage1과 동일한 방식으로 크롭 어텐션 맵 생성"""
-    
-    orig_w, orig_h = original_size
-    crop_attention_maps = []
-    
-    # Stage2에서 개별 패치 정보 추출
-    patch_coords = s2_pred['patch_coords']  # normalized coordinates
-    patch_scores = np.array(s2_pred['patch_scores'])
-    
-    # 상위 패치들 선별 (점수가 높은 순으로)
-    top_patch_indices = np.argsort(patch_scores)[::-1][:use_top_patches]
-    
-    for crop in s1_crop_list:
-        crop_map = np.zeros((orig_h, orig_w))
-        crop_bbox = crop['bbox']
-        
-        # 상위 패치들만 처리
-        for patch_idx in top_patch_indices:
-            # 패치 좌표를 합쳐진 이미지에서 원본 이미지로 변환
-            patch_coord_norm = patch_coords[patch_idx]  # [x_norm, y_norm]
-            point_original = convert_merged_point_to_original(
-                patch_coord_norm, s2_crop_mappings, s2_merged_img.size
-            )
-            
-            # 이 점이 현재 크롭 안에 있는지 확인
-            if point_in_bbox(point_original, crop_bbox):
-                # Stage1과 동일하게: 패치 영역에 해당하는 점수 할당
-                # 원본에서의 패치 크기 추정
-                n_width = s2_pred['n_width'] 
-                n_height = s2_pred['n_height']
-                orig_patch_w = orig_w / n_width
-                orig_patch_h = orig_h / n_height
-                
-                # 패치 영역 계산
-                center_x, center_y = point_original
-                patch_x_start = int(max(0, center_x - orig_patch_w/2))
-                patch_x_end = int(min(orig_w, center_x + orig_patch_w/2))
-                patch_y_start = int(max(0, center_y - orig_patch_h/2))
-                patch_y_end = int(min(orig_h, center_y + orig_patch_h/2))
-                
-                # 해당 패치 영역에 점수 할당 (Stage1과 동일)
-                if patch_x_end > patch_x_start and patch_y_end > patch_y_start:
-                    crop_map[patch_y_start:patch_y_end, patch_x_start:patch_x_end] += patch_scores[patch_idx]
-        
-        # 크롭에 패치가 없으면 낮은 균등 분포
-        if crop_map.max() == 0:
-            crop_map[crop_bbox[1]:crop_bbox[3], crop_bbox[0]:crop_bbox[2]] = 0.1
-        
-        crop_attention_maps.append(crop_map)
-    
-    return crop_attention_maps
-
-def create_crop_attention_maps_individual(all_crop_results, s1_crop_list, original_size, use_top_patches=ENSEMBLE_TOP_PATCHES):
-    """개별 crop inference 결과를 기반으로 크롭 어텐션 맵 생성 (모든 crop 결과 사용, 겹치는 부분 가중평균 처리)"""
-    
-    orig_w, orig_h = original_size
-    crop_attention_maps = []
-    
-    for crop in s1_crop_list:
-        crop_map = np.zeros((orig_h, orig_w))
-        crop_overlap_count = np.zeros((orig_h, orig_w))
-        crop_bbox = crop['bbox']
-        
-        # 해당 crop에 대한 모든 inference 결과를 찾아서 합치기
-        for result in all_crop_results:
-            result_crop_bbox = result['crop_bbox']
-            
-            # 같은 crop인지 확인 (bbox로 비교)
-            if (result_crop_bbox[0] == crop_bbox[0] and result_crop_bbox[1] == crop_bbox[1] and 
-                result_crop_bbox[2] == crop_bbox[2] and result_crop_bbox[3] == crop_bbox[3]):
-                
-                s2_pred = result['pred']
-                attn_scores = np.array(s2_pred['attn_scores'][0])
-                n_width = s2_pred['n_width'] 
-                n_height = s2_pred['n_height']
-                
-                # 상위 패치들만 처리
-                top_patch_indices = np.argsort(attn_scores)[::-1][:use_top_patches]
-                
-                for patch_idx in top_patch_indices:
-                    score = attn_scores[patch_idx]
-                    
-                    # 패치 좌표 계산
-                    patch_y = patch_idx // n_width
-                    patch_x = patch_idx % n_width
-                    
-                    # 패치 중심점 계산 (normalized coordinates)
-                    patch_center_x_norm = (patch_x + 0.5) / n_width
-                    patch_center_y_norm = (patch_y + 0.5) / n_height
-                    
-                    # crop 이미지에서의 픽셀 좌표로 변환
-                    crop_w = crop_bbox[2] - crop_bbox[0]
-                    crop_h = crop_bbox[3] - crop_bbox[1]
-                    crop_x = patch_center_x_norm * crop_w
-                    crop_y = patch_center_y_norm * crop_h
-                    
-                    # 원본 이미지 좌표로 변환
-                    orig_center_x = crop_bbox[0] + crop_x
-                    orig_center_y = crop_bbox[1] + crop_y
-                    
-                    # 원본에서의 패치 크기 추정
-                    orig_patch_w = orig_w / n_width
-                    orig_patch_h = orig_h / n_height
-                    
-                    # 패치 영역 계산
-                    orig_x_start = int(max(0, orig_center_x - orig_patch_w/2))
-                    orig_x_end = int(min(orig_w, orig_center_x + orig_patch_w/2))
-                    orig_y_start = int(max(0, orig_center_y - orig_patch_h/2))
-                    orig_y_end = int(min(orig_h, orig_center_y + orig_patch_h/2))
-                    
-                    # 해당 영역에 어텐션 스코어 할당 (누적)
-                    if orig_x_end > orig_x_start and orig_y_end > orig_y_start:
-                        crop_map[orig_y_start:orig_y_end, orig_x_start:orig_x_end] += score
-                        crop_overlap_count[orig_y_start:orig_y_end, orig_x_start:orig_x_end] += 1
-        
-        # 겹치는 부분은 겹치는 횟수로 나누어 가중평균 처리
-        valid_mask = crop_overlap_count > 0
-        if np.any(valid_mask):
-            crop_map[valid_mask] = crop_map[valid_mask] / crop_overlap_count[valid_mask]
-        else:
-            # 해당 crop에 대한 결과가 없으면 낮은 균등 분포로 설정
-            crop_map[crop_bbox[1]:crop_bbox[3], crop_bbox[0]:crop_bbox[2]] = 0.1
-        
-        crop_attention_maps.append(crop_map)
-    
-    return crop_attention_maps
-
-def create_crop_point_based_attention_maps(s2_corrected_point, s1_crop_list, original_size):
-    """Stage2의 예측 점을 기반으로 크롭 어텐션 맵 생성 (벡터화된 고속 버전)"""
-    
-    orig_w, orig_h = original_size
-    crop_attention_maps = []
-    
-    for crop in s1_crop_list:
-        crop_map = np.zeros((orig_h, orig_w))
-        crop_bbox = crop['bbox']
-        
-        # Stage2 예측점이 이 크롭 안에 있는지 확인
-        if point_in_bbox(s2_corrected_point, crop_bbox):
-            # 예측점 주변에 가우시안 분포로 어텐션 할당 (벡터화)
-            center_x, center_y = s2_corrected_point
-            
-            # 크롭 영역의 좌표 그리드 생성
-            y_min, y_max = max(0, crop_bbox[1]), min(orig_h, crop_bbox[3])
-            x_min, x_max = max(0, crop_bbox[0]), min(orig_w, crop_bbox[2])
-            
-            if y_max > y_min and x_max > x_min:
-                # 메시 그리드 생성 (벡터화)
-                y_coords, x_coords = np.meshgrid(
-                    np.arange(y_min, y_max), 
-                    np.arange(x_min, x_max), 
-                    indexing='ij'
-                )
-                
-                # 거리 계산 (벡터화)
-                dist = np.sqrt((x_coords - center_x)**2 + (y_coords - center_y)**2)
-                
-                # 시그마 계산
-                sigma = min(crop_bbox[2] - crop_bbox[0], crop_bbox[3] - crop_bbox[1]) / 6
-                
-                # 가우시안 가중치 계산 (벡터화)
-                weights = np.exp(-(dist**2) / (2 * sigma**2))
-                
-                # 크롭 맵에 할당
-                crop_map[y_min:y_max, x_min:x_max] = weights
-        else:
-            # 예측점이 크롭 밖에 있으면 균등 분포 (낮은 값)
-            crop_map[crop_bbox[1]:crop_bbox[3], crop_bbox[0]:crop_bbox[2]] = 0.1
-        
-        crop_attention_maps.append(crop_map)
-    
-    return crop_attention_maps
-
-def ensemble_attention_maps(stage1_attention_map, crop_attention_maps, attention_ratio=STAGE1_ENSEMBLE_RATIO, crop_ratio=STAGE2_ENSEMBLE_RATIO):
-    """Stage1 어텐션과 크롭 어텐션들을 앙상블 (벡터화된 고속 버전)"""
-    
-    orig_h, orig_w = stage1_attention_map.shape
-    
-    # Stage1 어텐션 정규화 (0~1)
-    s1_max = stage1_attention_map.max()
-    if s1_max > 0:
-        stage1_normalized = stage1_attention_map / s1_max
-    else:
-        stage1_normalized = stage1_attention_map
-    
-    # 크롭 어텐션들을 스택으로 합치기 (벡터화)
-    if crop_attention_maps:
-        crop_stack = np.stack(crop_attention_maps, axis=0)  # (num_crops, H, W)
-        crop_sum = np.sum(crop_stack, axis=0)  # (H, W)
-        overlap_count = np.sum(crop_stack > 0, axis=0)  # (H, W)
-    else:
-        crop_sum = np.zeros((orig_h, orig_w))
-        overlap_count = np.zeros((orig_h, orig_w))
-    
-    # Stage2 크롭 어텐션 정규화 (0~1)
-    crop_max = crop_sum.max()
-    if crop_max > 0:
-        crop_normalized = crop_sum / crop_max
-    else:
-        crop_normalized = crop_sum
-    
-    # 최종 앙상블 맵 계산 (벡터화)
-    ensemble_map = attention_ratio * stage1_normalized
-    
-    # 겹치는 부분 처리 (벡터화)
-    valid_mask = overlap_count > 0
-    if np.any(valid_mask):
-        adjusted_crop_weights = np.where(
-            valid_mask,
-            crop_ratio / overlap_count,
-            0
-        )
-        ensemble_map += adjusted_crop_weights * crop_normalized
-    
-    return ensemble_map
-
-def find_ensemble_best_point(ensemble_map):
-    """앙상블 맵에서 최고점 찾기 (서브픽셀 정확도로)"""
-    
-    # 최대값 위치 찾기
-    max_idx = np.argmax(ensemble_map)
-    orig_h, orig_w = ensemble_map.shape
-    
-    best_y = max_idx // orig_w
-    best_x = max_idx % orig_w
-    best_score = ensemble_map[best_y, best_x]
-    
-    # 서브픽셀 정확도를 위한 보간 (주변 픽셀들의 가중평균)
-    # 3x3 영역에서 가중중심 계산
-    y_start = max(0, best_y - 1)
-    y_end = min(orig_h, best_y + 2)
-    x_start = max(0, best_x - 1) 
-    x_end = min(orig_w, best_x + 2)
-    
-    # 주변 영역 추출
-    region = ensemble_map[y_start:y_end, x_start:x_end]
-    
-    if region.size > 1:
-        # 좌표 메시 생성
-        y_coords, x_coords = np.meshgrid(
-            np.arange(y_start, y_end),
-            np.arange(x_start, x_end),
-            indexing='ij'
-        )
-        
-        # 가중평균으로 서브픽셀 위치 계산
-        total_weight = np.sum(region)
-        if total_weight > 0:
-            refined_y = np.sum(y_coords * region) / total_weight
-            refined_x = np.sum(x_coords * region) / total_weight
-        else:
-            refined_y = float(best_y)
-            refined_x = float(best_x)
-    else:
-        refined_y = float(best_y)
-        refined_x = float(best_x)
-    
-    return [refined_x, refined_y], float(best_score)
 
 def run_stage1_attention_based(original_image, instruction, gt_bbox):
     """새로운 간단한 Stage 1: Attention 기반 crop 생성"""
     
-    # 1. S1_RESIZE_MAX_PIXEL로 리사이즈하고 inference
+    # 1. 리사이즈하고 inference
     print("🔍 Stage 1: Running attention-based inference...")
     s1_pred, resized_image = run_stage1_attention_inference(original_image, instruction)
     
@@ -1028,6 +645,34 @@ def run_stage1_attention_based(original_image, instruction, gt_bbox):
     num_crops = len(crops)
     
     return s1_pred, crops, num_crops, resized_image, scaled_gt_bbox
+
+def get_stage1_score_at_point(point, s1_attn_scores, s1_n_width, s1_n_height, original_size, resize_ratio):
+    """특정 점에서의 Stage1 어텐션 점수를 계산"""
+    
+    orig_w, orig_h = original_size
+    point_x, point_y = point
+    
+    # 원본 좌표를 리사이즈된 좌표로 변환
+    resized_x = point_x * resize_ratio
+    resized_y = point_y * resize_ratio
+    
+    # 리사이즈된 좌표를 패치 좌표로 변환
+    resized_w = orig_w * resize_ratio
+    resized_h = orig_h * resize_ratio
+    
+    patch_x = int((resized_x / resized_w) * s1_n_width)
+    patch_y = int((resized_y / resized_h) * s1_n_height)
+    
+    # 패치 좌표가 유효한 범위 내인지 확인
+    patch_x = max(0, min(patch_x, s1_n_width - 1))
+    patch_y = max(0, min(patch_y, s1_n_height - 1))
+    
+    # 해당 패치의 어텐션 점수 반환
+    patch_idx = patch_y * s1_n_width + patch_x
+    if patch_idx < len(s1_attn_scores):
+        return float(s1_attn_scores[patch_idx])
+    else:
+        return 0.0
 
 def point_in_bbox(point, bbox):
     """점이 bbox 안에 있는지 확인"""
@@ -1065,10 +710,11 @@ if __name__ == '__main__':
     #     low_cpu_mem_usage=False
     # )
     tokenizer = AutoTokenizer.from_pretrained(MLLM_PATH)
-    processor = AutoProcessor.from_pretrained(MLLM_PATH)
+    processor = AutoProcessor.from_pretrained(MLLM_PATH, max_pixels=MAX_PIXELS)
     prof = FlopsProfiler(model)
 
     warm_up_model(model, tokenizer, processor)
+
     if TFOPS_PROFILING:
         prof.start_profile()
 
@@ -1088,13 +734,13 @@ if __name__ == '__main__':
             csv_name=f"iter_log_{task}.csv",
             md_name=f"iter_log_{task}.md",
             headers=[  # 순서 그대로 들어감
-                "idx", "orig_w", "orig_h", 
+                "idx", "orig_w", "orig_h", "resize_ratio",
                 "num_crop", "crop_hit",
                 "s1_time", "s1_tflops", "s1_hit", 
                 "s2_time", "s2_tflops", "s2_hit", 
-                "s3_ensemble_time", "s3_ensemble_hit",
+                "s3_time", "s3_hit",
                 "total_time", "total_tflops", "peak_memory_gb", 
-                "crop_acc_uptonow", "s1_acc_uptonow", "s2_acc_uptonow", "s3_ensemble_acc_uptonow",
+                "crop_acc_uptonow", "s1_acc_uptonow", "s2_acc_uptonow", "s3_acc_uptonow",
                 "filename", "instruction"
             ],
             write_md=False, use_fsync=True, use_lock=True
@@ -1111,7 +757,7 @@ if __name__ == '__main__':
         num_action = 0
         s1_time_sum = s2_time_sum = s3_time_sum = 0.0
         s1_tflops_sum = s2_tflops_sum = 0.0
-        stage1_success_count = stage2_success_count = stage3_ensemble_success_count = 0
+        stage1_success_count = stage2_success_count = stage3_success_count = 0
         crop_success_count = 0  # 새로운 crop 성공 카운터 추가
         peak_memory_sum = 0.0  # 피크 메모리 합계 추가
         
@@ -1152,13 +798,6 @@ if __name__ == '__main__':
                            original_bbox[0] + original_bbox[2], original_bbox[1] + original_bbox[3]]
 
             orig_w, orig_h = original_image.size
-
-            if MAX_PIXELS is not None:
-                resized_image = resize_image(original_image, MAX_PIXELS)
-            else:
-                resized_image = original_image
-                resize_ratio = 1.0
-                scaled_bbox = original_bbox
 
             # data_source 정보 추출 (없으면 "unknown"으로 기본값 설정)
             data_source = item.get("data_source", "unknown")
@@ -1216,11 +855,11 @@ if __name__ == '__main__':
                 crop_success_count += 1
 
             #! ==================================================================
-            #! [Stage 2] Individual Crop Inference
+            #! [Stage 2] Merged Crop Inference
             #! ==================================================================
             
             s2_tflops = 0.0
-            s2_pred = all_crop_results = s2_corrected_point = None  # 시각화용 변수 초기화
+            s2_pred = s2_corrected_point = None  # 시각화용 변수 초기화 (multi-image 방식)
             stage2_success = False
 
             s2_inference_start = time.time()
@@ -1228,11 +867,20 @@ if __name__ == '__main__':
             if TFOPS_PROFILING:
                 prof.reset_profile()
             
-            # 개별 crop들에 대해 inference 실행
-            s2_pred, s2_corrected_point, all_crop_results = run_stage2_individual_inference(s1_crop_list, instruction)
+            # 멀티 이미지로 inference
+            s2_pred = run_stage2_multi_image_inference(s1_crop_list, instruction)
+
+            # Stage2 multi-image 결과를 원본 좌표로 변환
+            s2_best_candidate, s2_all_candidates = convert_multi_image_results_to_original(s2_pred, s1_crop_list)
             
             # Stage2 성공 여부 확인
-            stage2_success = point_in_bbox(s2_corrected_point, original_bbox)
+            if s2_best_candidate:
+                s2_corrected_point = s2_best_candidate['point']
+                stage2_success = point_in_bbox(s2_corrected_point, original_bbox)
+            else:
+                s2_corrected_point = [0, 0]
+                stage2_success = False
+
 
             s2_inference_end = time.time()
             s2_time = s2_inference_end - s2_inference_start
@@ -1249,51 +897,94 @@ if __name__ == '__main__':
             #! ==================================================================
             
             s3_ensemble_point = None
-            stage3_ensemble_success = False
+            stage3_success = False
             
-            s3_ensemble_start = time.time()
+            # 크롭 면적이 원본 이미지 면적의 50%를 넘는지 확인
+            crop_area = CROP_WIDTH * CROP_HEIGHT
+            original_area = orig_w * orig_h
+            crop_area_ratio = crop_area / original_area
             
-            # Stage1 어텐션을 원본 크기로 변환
-            stage1_attention_map = resize_attention_to_original(
-                s1_pred, original_image.size, s1_pred['resize_ratio']
-            )
+            s3_start = time.time()
+            # Multi-image 앙상블 방법: Stage2 multi-image 결과와 해당 위치의 Stage1 점수 조합
+            # Stage1 어텐션 정보
+            s1_attn_scores = np.array(s1_pred['attn_scores'][0])
+            s1_n_width = s1_pred['n_width']
+            s1_n_height = s1_pred['n_height']
+            s1_resize_ratio = s1_pred['resize_ratio']
             
-            # Stage2 어텐션을 원본 크기로 변환 (개별 crop 결과 사용)
-            stage2_attention_map = create_stage2_attention_to_original_individual(
-                all_crop_results, original_image.size, use_top_patches=ENSEMBLE_TOP_PATCHES
-            )
+            # Stage1 attention 점수들 정규화 (1등 기준)
+            s1_max_score = float(max(s1_attn_scores)) if len(s1_attn_scores) > 0 else 1.0
             
-            # 두 어텐션 맵을 직접 앙상블 (0~1 정규화 후)
-            # Stage1 정규화
-            s1_max = stage1_attention_map.max()
-            if s1_max > 0:
-                stage1_normalized = stage1_attention_map / s1_max
+            # Stage2 점수들도 정규화 (1등 기준으로 정규화)
+            s2_max_score = 1.0
+            if s2_all_candidates:
+                s2_scores = [candidate['score'] for candidate in s2_all_candidates]
+                s2_max_score = max(s2_scores) if s2_scores else 1.0
+            
+            # 각 Stage2 후보 점에 대해 앙상블 점수 계산
+            ensemble_candidates = []
+            
+            if s2_all_candidates:  # Stage2 결과가 있을 때만 처리
+                for candidate in s2_all_candidates:
+                    s2_original_point = candidate['point']
+                    s2_raw_score = candidate['score']
+                    
+                    # 해당 점에서의 Stage1 점수 계산 (정규화된 값)
+                    s1_raw_score = get_stage1_score_at_point(
+                        s2_original_point, s1_attn_scores, s1_n_width, s1_n_height, 
+                        original_image.size, s1_resize_ratio
+                    )
+                    s1_score = s1_raw_score / s1_max_score if s1_max_score > 0 else 0.0
+                    
+                    # Stage2 점수도 정규화 (1등 기준)
+                    s2_score = s2_raw_score / s2_max_score if s2_max_score > 0 else 0.0
+                    
+                    # 앙상블 점수 계산
+                    ensemble_score = STAGE1_ENSEMBLE_RATIO * s1_score + STAGE2_ENSEMBLE_RATIO * s2_score
+                
+                ensemble_candidates.append({
+                    'point': s2_original_point,
+                    'score': ensemble_score,
+                    's1_score': s1_score,
+                    's2_score': s2_score,
+                    'crop_id': candidate['crop_id'],
+                    'rank_in_crop': candidate['rank_in_crop']
+                })
+            
+            # 최고 점수를 가진 점 선택
+            if ensemble_candidates:
+                best_candidate = max(ensemble_candidates, key=lambda x: x['score'])
+                s3_ensemble_point = best_candidate['point']
+                stage3_success = True
             else:
-                stage1_normalized = np.zeros_like(stage1_attention_map)
+                # Stage2 결과가 없으면 Stage1 결과를 사용
+                if s1_original_point:
+                    s3_ensemble_point = s1_original_point
+                    stage3_success = point_in_bbox(s3_ensemble_point, original_bbox)
+                else:
+                    s3_ensemble_point = [0, 0]
+                    stage3_success = False
+
+            s3_end = time.time()
+            s3_time = s3_end - s3_start
             
-            # Stage2 정규화
-            s2_max = stage2_attention_map.max()
-            if s2_max > 0:
-                stage2_normalized = stage2_attention_map / s2_max
+            # 디버그 정보 출력 (상위 3개만)
+            if ensemble_candidates:
+                print(f"🎯 Stage3 Multi-Image Ensemble Candidates (Top 3):")
+                for i, candidate in enumerate(sorted(ensemble_candidates, key=lambda x: x['score'], reverse=True)[:3]):
+                    print(f"  Rank {i+1}: Crop_id={candidate['crop_id']}, Crop_rank={candidate['rank_in_crop']}, S1={candidate['s1_score']:.3f}, S2={candidate['s2_score']:.3f}, Ensemble={candidate['score']:.3f}")
             else:
-                stage2_normalized = np.zeros_like(stage2_attention_map)
+                print(f"🎯 Stage3: No ensemble candidates, using Stage1 result")
             
-            # 최종 앙상블 맵 계산
-            ensemble_map = (STAGE1_ENSEMBLE_RATIO * stage1_normalized + 
-                           STAGE2_ENSEMBLE_RATIO * stage2_normalized)
-            
-            # 앙상블 결과에서 최적점 찾기
-            s3_ensemble_point, ensemble_score = find_ensemble_best_point(ensemble_map)
+            # 시각화를 위해 후보들 저장
+            s3_ensemble_candidates = ensemble_candidates
             
             # 앙상블 결과로 성공 여부 확인
-            stage3_ensemble_success = point_in_bbox(s3_ensemble_point, original_bbox)
+            stage3_success = point_in_bbox(s3_ensemble_point, original_bbox)
             
-            s3_ensemble_end = time.time()
-            s3_ensemble_time = s3_ensemble_end - s3_ensemble_start
-            
-            s3_ensemble_hit = "✅" if stage3_ensemble_success else "❌"
-            if stage3_ensemble_success:
-                stage3_ensemble_success_count += 1
+            s3_hit = "✅" if stage3_success else "❌"
+            if stage3_success:
+                stage3_success_count += 1
 
             #! ==================================================================
             #! [Common Processing]
@@ -1302,12 +993,12 @@ if __name__ == '__main__':
             # 공통 통계 업데이트
             s1_time_sum += s1_time
             s2_time_sum += s2_time
-            s3_time_sum += s3_ensemble_time
+            s3_time_sum += s3_time
             s1_tflops_sum += s1_tflops
             s2_tflops_sum += s2_tflops
                 
             # 성능 로깅
-            total_time = s1_time + s2_time + s3_ensemble_time
+            total_time = s1_time + s2_time
             if TFOPS_PROFILING:
                 total_tflops_this = s1_tflops + s2_tflops  # Stage3는 FLOPs 제외
 
@@ -1316,37 +1007,37 @@ if __name__ == '__main__':
             #! ==================================================================
             
             # 시각화용 디렉토리 설정 (stage3 결과에 따라)
-            if any([STAGE1_VIS, STAGE2_VIS]):
-            # if any([STAGE1_VIS, STAGE2_VIS]) and (len(s1_crop_list) >= 2 or ((not s1_hit or not s2_hit) and s3_ensemble_hit)):  #! 잠시 크롭이 2개 이상일 때 or 앙상블로인해 맞은거만 시각화
+            if VISUALIZE and (not VIS_ONLY_WRONG or not stage3_success):
                 inst_dir_name = re.sub(r'\W+', '_', instruction).strip('_')
-                result_folder = "correct" if stage3_ensemble_success else "incorrect"
+                result_folder = "correct" if stage3_success else "incorrect"
                 inst_dir = os.path.join(save_dir, f"{task}_visualize_{result_folder}", f"{num_action}_{inst_dir_name}")
 
                 # Stage1 시각화
-                if STAGE1_VIS and inst_dir and (not VIS_ONLY_WRONG or not stage3_ensemble_success):
-                    from util.visualize_util import visualize_stage1_attention_crops
-                    visualize_stage1_attention_crops(
-                        s1_pred=s1_pred,
-                        resized_image=resized_image, 
+                visualize_stage1_attention_crops(
+                    s1_pred=s1_pred,
+                    resized_image=resized_image, 
+                    crop_list=s1_crop_list,
+                    original_image=original_image,
+                    save_dir=inst_dir,
+                    instruction=instruction,
+                    gt_bbox=original_bbox,
+                    s1_predicted_point=s1_original_point
+                )
+                
+                # Stage2 Multi-Image 시각화
+                if s2_pred and s1_crop_list:  # Stage2 결과가 있을 때만 시각화
+                    visualize_stage2_multi_attention(
+                        s2_pred=s2_pred,
                         crop_list=s1_crop_list,
                         original_image=original_image,
                         save_dir=inst_dir,
                         instruction=instruction,
-                        gt_bbox=original_bbox,
-                        s1_predicted_point=s1_original_point
-                    )
-                
-                # Stage2 개별 crop 시각화
-                if STAGE2_VIS and inst_dir and all_crop_results is not None and (not VIS_ONLY_WRONG or not stage3_ensemble_success):
-                    visualize_stage2_individual_crops(
-                        all_crop_results=all_crop_results,
-                        save_dir=inst_dir,
-                        instruction=instruction
+                        predicted_point=s2_corrected_point
                     )
                 
                 # Stage3 앙상블 시각화
-                visualize_stage3_ensemble_attention(
-                    ensemble_map=ensemble_map,
+                visualize_stage3_point_ensemble(
+                    s3_ensemble_candidates=s3_ensemble_candidates if 's3_ensemble_candidates' in locals() else [],
                     original_image=original_image,
                     crop_list=s1_crop_list,
                     original_bbox=original_bbox,
@@ -1357,15 +1048,16 @@ if __name__ == '__main__':
                     stage2_ratio=STAGE2_ENSEMBLE_RATIO,
                     save_dir=inst_dir,
                     vis_only_wrong=VIS_ONLY_WRONG,
-                    stage3_success=stage3_ensemble_success
+                    stage3_success=stage3_success
                 )
+
 
             num_attention_crops = len(s1_crop_list)
             print(f"✂️  Attention Crops : {num_attention_crops}")
-            print(f"🕖 Times - S1: {s1_time:.2f}s | S2: {s2_time:.2f}s | S3: {s3_ensemble_time:.2f}s | Total: {total_time:.2f}s")
+            print(f"🕖 Times - S1: {s1_time:.2f}s | S2: {s2_time:.2f}s | Total: {total_time:.2f}s")
             if TFOPS_PROFILING:
                 print(f"🔥 FLOPs - S1: {s1_tflops:.2f} | S2: {s2_tflops:.2f} | Total: {total_tflops_this:.2f} TFLOPs")
-            print(f"{'✅ Success' if stage3_ensemble_success else '❌🎯 Fail'}")
+            print(f"{'✅ Success' if stage3_success else '❌🎯 Fail'}")
 
             #! ==================================================================
             #! [End]
@@ -1407,7 +1099,7 @@ if __name__ == '__main__':
                     'stage1_success_count': 0,
                     'crop_success_count': 0,
                     'stage2_success_count': 0,
-                    'stage3_ensemble_success_count': 0,
+                    'stage3_success_count': 0,
                     'peak_memory_sum': 0.0
                 }
             
@@ -1415,7 +1107,7 @@ if __name__ == '__main__':
             stats['num_action'] += 1
             stats['s1_time_sum'] += s1_time
             stats['s2_time_sum'] += s2_time
-            stats['s3_time_sum'] += s3_ensemble_time
+            stats['s3_time_sum'] += s3_time
             if TFOPS_PROFILING:
                 stats['s1_tflops_sum'] += s1_tflops
                 stats['s2_tflops_sum'] += s2_tflops
@@ -1428,13 +1120,13 @@ if __name__ == '__main__':
                 stats['crop_success_count'] += 1
             if stage2_success:
                 stats['stage2_success_count'] += 1
-            if stage3_ensemble_success:
-                stats['stage3_ensemble_success_count'] += 1
+            if stage3_success:
+                stats['stage3_success_count'] += 1
 
             up2now_s1_score = stage1_success_count / num_action * 100
             up2now_crop_score = crop_success_count / num_action * 100
             up2now_s2_score = stage2_success_count / num_action * 100
-            up2now_s3_ensemble_score = stage3_ensemble_success_count / num_action * 100
+            up2now_s3_ensemble_score = stage3_success_count / num_action * 100
             # print(f"Up2Now Crop Accuracy: {up2now_crop_score:.2f}%")
             print(f"Up2Now Stage1 Accuracy: {up2now_s1_score:.2f}%")
             print(f"Up2Now Stage2 Accuracy: {up2now_s2_score:.2f}%")
@@ -1445,6 +1137,7 @@ if __name__ == '__main__':
                 idx=j+1,
                 orig_w=original_image.size[0],
                 orig_h=original_image.size[1],
+                resize_ratio=s1_pred['resize_ratio'],
                 num_crop=num_attention_crops,
                 crop_hit=crop_hit,
                 s1_time=f"{s1_time:.3f}",
@@ -1453,15 +1146,15 @@ if __name__ == '__main__':
                 s2_time=f"{s2_time:.3f}",
                 s2_tflops=f"{s2_tflops:.2f}",
                 s2_hit=s2_hit,
-                s3_ensemble_time=f"{s3_ensemble_time:.3f}",
-                s3_ensemble_hit=s3_ensemble_hit,
+                s3_time=f"{s3_time:.3f}",
+                s3_hit=s3_hit,
                 total_time=f"{total_time:.3f}",
                 total_tflops=f"{total_tflops_this:.2f}",
                 peak_memory_gb=f"{peak_memory_gb:.3f}" if MEMORY_EVAL else "N/A",
                 crop_acc_uptonow=f"{up2now_crop_score:.2f}",
                 s1_acc_uptonow=f"{up2now_s1_score:.2f}",
                 s2_acc_uptonow=f"{up2now_s2_score:.2f}",
-                s3_ensemble_acc_uptonow=f"{up2now_s3_ensemble_score:.2f}",
+                s3_acc_uptonow=f"{up2now_s3_ensemble_score:.2f}",
                 filename=filename_wo_ext,
                 instruction=instruction[:50] + "..." if len(instruction) > 50 else instruction
             )
@@ -1478,17 +1171,17 @@ if __name__ == '__main__':
                 'crop_success': crop_success,
                 'stage1_success': s1_success,
                 'stage2_success': stage2_success,
-                'stage3_ensemble_success': stage3_ensemble_success,
+                'stage3_success': stage3_success,
                 's1_hit': s1_hit,
                 'crop_hit': crop_hit,
                 's2_hit': s2_hit,
-                's3_ensemble_hit': s3_ensemble_hit,
+                's3_hit': s3_hit,
                 's3_ensemble_point': s3_ensemble_point,
                 's1_original_point': s1_original_point,
                 's2_original_point': s2_corrected_point,
                 's1_time': s1_time,
                 's2_time': s2_time,
-                's3_ensemble_time': s3_ensemble_time,
+                's3_time': s3_time,
                 'total_time': total_time,
                 's1_tflops': s1_tflops,
                 's2_tflops': s2_tflops,
@@ -1514,11 +1207,11 @@ if __name__ == '__main__':
             "crop_accuracy": crop_success_count / num_action * 100,
             "stage1_accuracy": stage1_success_count / num_action * 100,
             "stage2_accuracy": stage2_success_count / num_action * 100,
-            "stage3_ensemble_accuracy": stage3_ensemble_success_count / num_action * 100,
+            "stage3_accuracy": stage3_success_count / num_action * 100,
             "avg_times": {
                 "stage1": s1_time_sum / num_action,
                 "stage2": s2_time_sum / num_action,
-                "stage3_ensemble": s3_time_sum / num_action,
+                "stage3": s3_time_sum / num_action,
                 "total": (s1_time_sum + s2_time_sum + s3_time_sum) / num_action
             },
             "avg_flops_tflops": {
@@ -1549,11 +1242,11 @@ if __name__ == '__main__':
                     "crop_accuracy": stats['crop_success_count'] / stats['num_action'] * 100,
                     "stage1_accuracy": stats['stage1_success_count'] / stats['num_action'] * 100,
                     "stage2_accuracy": stats['stage2_success_count'] / stats['num_action'] * 100,
-                    "stage3_ensemble_accuracy": stats['stage3_ensemble_success_count'] / stats['num_action'] * 100,
+                    "stage3_accuracy": stats['stage3_success_count'] / stats['num_action'] * 100,
                     "avg_times": {
                         "stage1": stats['s1_time_sum'] / stats['num_action'],
                         "stage2": stats['s2_time_sum'] / stats['num_action'],
-                        "stage3_ensemble": stats['s3_time_sum'] / stats['num_action'],
+                        "stage3": stats['s3_time_sum'] / stats['num_action'],
                         "total": (stats['s1_time_sum'] + stats['s2_time_sum'] + stats['s3_time_sum']) / stats['num_action']
                     },
                     "avg_flops_tflops": {
@@ -1574,14 +1267,15 @@ if __name__ == '__main__':
             json.dump(data_source_metrics, dsf, ensure_ascii=False, indent=4)
 
         # 전체 결과를 CSV 파일에 한 줄 추가
-        results_csv_path = "../results"
+        results_csv_path = "../_results"
         os.makedirs(results_csv_path, exist_ok=True)
         csv_file_path = os.path.join(results_csv_path, f"results_{task}.csv")
         
         # CSV 헤더 정의
         csv_headers = [
-            "s1_resize_ratio", "select_threshold", "stage1_ensemble_ratio", "crop_width", "crop_height",
-            "total_samples", "crop_accuracy", "stage1_accuracy", "stage2_accuracy", "stage3_ensemble_accuracy",
+            "method",
+            "min_resize", "max_resize", "select_threshold", "stage1_ensemble_ratio", "crop_width", "crop_height",
+            "total_samples", "crop_accuracy", "stage1_accuracy", "stage2_accuracy", "stage3_accuracy",
             "avg_stage1_time", "avg_stage2_time", "avg_stage3_time", "avg_total_time",
             "avg_stage1_tflops", "avg_stage2_tflops", "avg_total_tflops", "avg_peak_memory_gb",
             "timestamp"
@@ -1590,15 +1284,16 @@ if __name__ == '__main__':
         # CSV 데이터 행 생성
         import datetime
         csv_row = [
-            S1_RESIZE_RATIO, SELECT_THRESHOLD, STAGE1_ENSEMBLE_RATIO, CROP_WIDTH, CROP_HEIGHT,
+            method,
+            MIN_RESIZE, MAX_RESIZE, SELECT_THRESHOLD, STAGE1_ENSEMBLE_RATIO, CROP_WIDTH, CROP_HEIGHT,
             num_action, 
             round(metrics['crop_accuracy'], 2),
             round(metrics['stage1_accuracy'], 2),
             round(metrics['stage2_accuracy'], 2), 
-            round(metrics['stage3_ensemble_accuracy'], 2),
+            round(metrics['stage3_accuracy'], 2),
             round(metrics['avg_times']['stage1'], 4),
             round(metrics['avg_times']['stage2'], 4),
-            round(metrics['avg_times']['stage3_ensemble'], 4),
+            round(metrics['avg_times']['stage3'], 4),
             round(metrics['avg_times']['total'], 4),
             round(metrics['avg_flops_tflops']['stage1'], 2),
             round(metrics['avg_flops_tflops']['stage2'], 2),
@@ -1630,8 +1325,8 @@ if __name__ == '__main__':
         print(f"Crop Accuracy: {metrics['crop_accuracy']:.2f}%")
         print(f"Stage1 Accuracy: {metrics['stage1_accuracy']:.2f}%")
         print(f"Stage2 Accuracy: {metrics['stage2_accuracy']:.2f}%")
-        print(f"Stage3 Ensemble Accuracy: {metrics['stage3_ensemble_accuracy']:.2f}%")
-        print(f"Avg Times: S1 {metrics['avg_times']['stage1']:.3f}s | S2 {metrics['avg_times']['stage2']:.3f}s | S3 {metrics['avg_times']['stage3_ensemble']:.3f}s | Total {metrics['avg_times']['total']:.3f}s")
+        print(f"Stage3 Ensemble Accuracy: {metrics['stage3_accuracy']:.2f}%")
+        print(f"Avg Times: S1 {metrics['avg_times']['stage1']:.3f}s | S2 {metrics['avg_times']['stage2']:.3f}s | S3 {metrics['avg_times']['stage3']:.3f}s | Total {metrics['avg_times']['total']:.3f}s")
         print(f"Avg FLOPs: S1 {metrics['avg_flops_tflops']['stage1']:.2f} | S2 {metrics['avg_flops_tflops']['stage2']:.2f} | Total {metrics['avg_flops_tflops']['total']:.2f} TFLOPs")
         if MEMORY_EVAL and metrics['avg_peak_memory_gb'] is not None:
             print(f"Avg Peak Memory: {metrics['avg_peak_memory_gb']:.3f} GB")

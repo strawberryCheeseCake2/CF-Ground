@@ -241,6 +241,232 @@ def visualize_stage1_attention_crops(s1_pred, resized_image, crop_list, original
         print("⚠️ No attention scores found for visualization")
 
 
+def visualize_stage2_multi_attention(s2_pred, crop_list, original_image, save_dir, instruction, predicted_point=None):
+    """Stage 2 multi-image inference 결과 시각화 - 각 crop별 attention과 원본 이미지에 합성된 attention 맵"""
+    
+    if not s2_pred or not s2_pred.get('per_image') or not crop_list:
+        print("⚠️ No Stage2 multi-image results found for visualization")
+        return
+    
+    os.makedirs(save_dir, exist_ok=True)
+    
+    # 1. 개별 crop들의 attention 시각화
+    num_crops = len(crop_list)
+    per_image_results = s2_pred['per_image']
+    
+    # 개별 crop 시각화를 위한 서브플롯 설정
+    fig_width = min(20, num_crops * 6)  # 최대 20, crop당 6인치
+    fig_height = 8
+    
+    plt.figure(figsize=(fig_width, fig_height))
+    
+    for img_idx, img_result in enumerate(per_image_results):
+        if img_idx >= len(crop_list):
+            continue
+            
+        crop_info = crop_list[img_idx]
+        crop_img = crop_info['img']
+        crop_bbox = crop_info['bbox']
+        
+        # attention 정보 추출
+        attn_scores = np.array(img_result['attn_scores'][0])
+        n_width = img_result['n_width']
+        n_height = img_result['n_height']
+        topk_points = img_result['topk_points']
+        topk_values = img_result['topk_values']
+        
+        # 서브플롯에 crop 이미지와 attention 표시
+        plt.subplot(2, num_crops, img_idx + 1)
+        
+        # attention 맵이 겹쳐진 이미지 생성
+        blended_crop = get_attn_map(
+            image=crop_img,
+            attn_scores=attn_scores,
+            n_width=n_width,
+            n_height=n_height
+        )
+        
+        plt.imshow(blended_crop)
+        
+        # 예측 점들 표시 (crop 내 좌표)
+        crop_w, crop_h = crop_img.size
+        for i, (point, score) in enumerate(zip(topk_points[:3], topk_values[:3])):
+            # 정규화된 좌표를 픽셀 좌표로 변환
+            pixel_x = point[0] * crop_w
+            pixel_y = point[1] * crop_h
+            
+            # 점수에 따라 색상과 크기 조정
+            color = 'red' if i == 0 else 'orange' if i == 1 else 'yellow'
+            size = 100 if i == 0 else 80 if i == 1 else 60
+            
+            plt.scatter(pixel_x, pixel_y, c=color, s=size, marker='*', 
+                       edgecolors='white', linewidth=2, alpha=0.9)
+            
+            # 점수 표시
+            plt.text(pixel_x + 10, pixel_y - 10, f'{score:.3f}', 
+                    color='white', fontsize=8, weight='bold',
+                    bbox=dict(boxstyle="round,pad=0.3", facecolor='black', alpha=0.7))
+        
+        plt.title(f'Crop {img_idx+1} (ID: {crop_info["id"]})', fontsize=10)
+        plt.axis('off')
+        
+        # 아래쪽에 원본 이미지에서의 위치 표시
+        plt.subplot(2, num_crops, num_crops + img_idx + 1)
+        
+        # 원본 이미지에 해당 crop 영역 표시
+        orig_img_copy = original_image.copy()
+        draw = ImageDraw.Draw(orig_img_copy)
+        
+        # crop 박스 그리기
+        draw.rectangle(crop_bbox, outline='red', width=3)
+        
+        # crop 라벨
+        draw.text((crop_bbox[0] + 5, crop_bbox[1] + 5), f'Crop {img_idx+1}', 
+                 fill='red', font=None)
+        
+        plt.imshow(orig_img_copy)
+        plt.title(f'Position in Original', fontsize=10)
+        plt.axis('off')
+    
+    plt.tight_layout()
+    
+    # 개별 crop 시각화 저장
+    individual_save_path = os.path.join(save_dir, "s2_multi_individual_crops.png")
+    plt.savefig(individual_save_path, dpi=100, bbox_inches='tight')
+    plt.close()
+    
+    # 2. 원본 이미지에 합성된 전체 attention 맵 시각화
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 8))
+    
+    # 왼쪽: 원본 이미지 + crop 박스들
+    ax1.imshow(original_image)
+    
+    # crop 박스들과 예측점들 표시
+    for img_idx, img_result in enumerate(per_image_results):
+        if img_idx >= len(crop_list):
+            continue
+            
+        crop_info = crop_list[img_idx]
+        crop_bbox = crop_info['bbox']
+        topk_points = img_result['topk_points']
+        topk_values = img_result['topk_values']
+        
+        # crop 박스 그리기
+        from matplotlib.patches import Rectangle
+        rect = Rectangle((crop_bbox[0], crop_bbox[1]), 
+                        crop_bbox[2] - crop_bbox[0], 
+                        crop_bbox[3] - crop_bbox[1],
+                        fill=False, edgecolor='yellow', linewidth=2, alpha=0.8)
+        ax1.add_patch(rect)
+        
+        # crop 라벨
+        ax1.text(crop_bbox[0] + 5, crop_bbox[1] + 15, f'C{img_idx+1}', 
+                color='yellow', fontsize=12, weight='bold',
+                bbox=dict(boxstyle="round,pad=0.3", facecolor='black', alpha=0.7))
+        
+        # 각 crop의 topk 점들을 원본 좌표로 변환하여 표시
+        crop_width = crop_bbox[2] - crop_bbox[0]
+        crop_height = crop_bbox[3] - crop_bbox[1]
+        
+        for i, (point, score) in enumerate(zip(topk_points[:3], topk_values[:3])):
+            # crop 내 좌표를 원본 좌표로 변환
+            orig_x = crop_bbox[0] + point[0] * crop_width
+            orig_y = crop_bbox[1] + point[1] * crop_height
+            
+            # 점수에 따라 색상과 크기 조정
+            color = 'red' if i == 0 else 'orange' if i == 1 else 'yellow'
+            size = 150 if i == 0 else 100 if i == 1 else 80
+            marker = '*' if i == 0 else 'o'
+            
+            ax1.scatter(orig_x, orig_y, c=color, s=size, marker=marker,
+                       edgecolors='white', linewidth=2, alpha=0.9)
+    
+    # 최종 예측점 표시 (파란색 별)
+    if predicted_point:
+        ax1.scatter(predicted_point[0], predicted_point[1], c='blue', s=200, marker='*',
+                   edgecolors='white', linewidth=3, alpha=0.9, label='Final Prediction')
+    
+    ax1.set_title('Stage2 Multi-Image: Crops & Predictions', fontsize=14, weight='bold')
+    ax1.axis('off')
+    
+    # 오른쪽: 합성된 attention 맵
+    # attention 맵을 파라미터로 받거나 여기서 생성
+    ax2.imshow(original_image, alpha=0.7)
+    
+    # 간단한 attention 맵 생성 (각 crop의 attention을 원본에 매핑)
+    orig_w, orig_h = original_image.size
+    combined_attention = np.zeros((orig_h, orig_w), dtype=np.float32)
+    
+    for img_idx, img_result in enumerate(per_image_results):
+        if img_idx >= len(crop_list):
+            continue
+            
+        crop_info = crop_list[img_idx]
+        crop_bbox = crop_info['bbox']
+        crop_width = crop_bbox[2] - crop_bbox[0]
+        crop_height = crop_bbox[3] - crop_bbox[1]
+        
+        # attention 정보 추출
+        attn_scores = np.array(img_result['attn_scores'][0])
+        n_width = img_result['n_width']
+        n_height = img_result['n_height']
+        
+        # 상위 50개 패치만 사용
+        top_indices = np.argsort(attn_scores)[-50:][::-1]
+        
+        for patch_idx in top_indices:
+            # 패치 좌표 계산 (crop 내에서)
+            patch_y = patch_idx // n_width
+            patch_x = patch_idx % n_width
+            
+            # 패치 중심점의 정규화된 좌표 (crop 내에서)
+            norm_x = (patch_x + 0.5) / n_width
+            norm_y = (patch_y + 0.5) / n_height
+            
+            # crop 내 픽셀 좌표로 변환
+            crop_pixel_x = norm_x * crop_width
+            crop_pixel_y = norm_y * crop_height
+            
+            # 원본 이미지 좌표로 변환
+            orig_pixel_x = crop_bbox[0] + crop_pixel_x
+            orig_pixel_y = crop_bbox[1] + crop_pixel_y
+            
+            # 원본 이미지 범위 내로 클리핑
+            orig_pixel_x = max(0, min(orig_w - 1, orig_pixel_x))
+            orig_pixel_y = max(0, min(orig_h - 1, orig_pixel_y))
+            
+            # 정수 좌표로 변환
+            x_int = int(orig_pixel_x)
+            y_int = int(orig_pixel_y)
+            
+            # attention 스코어 누적
+            combined_attention[y_int, x_int] += attn_scores[patch_idx]
+    
+    # attention 맵 오버레이
+    if combined_attention.max() > 0:
+        im = ax2.imshow(combined_attention, cmap='hot', alpha=0.6, interpolation='bilinear')
+        plt.colorbar(im, ax=ax2, fraction=0.046, pad=0.04)
+    
+    # 최종 예측점 표시
+    if predicted_point:
+        ax2.scatter(predicted_point[0], predicted_point[1], c='blue', s=200, marker='*',
+                   edgecolors='white', linewidth=3, alpha=0.9)
+    
+    ax2.set_title('Stage2 Multi-Image: Combined Attention Map', fontsize=14, weight='bold')
+    ax2.axis('off')
+    
+    plt.tight_layout()
+    
+    # 합성 시각화 저장
+    combined_save_path = os.path.join(save_dir, "s2_multi_combined_attention.png")
+    plt.savefig(combined_save_path, dpi=100, bbox_inches='tight')
+    plt.close()
+    
+    print(f"🌄 Stage2 multi-image visualization saved:")
+    print(f"  - Individual crops: {individual_save_path}")
+    print(f"  - Combined attention: {combined_save_path}")
+
+
 def visualize_stage2_merged_attention(s2_pred, merged_img, save_dir, instruction, predicted_point=None):
     """Stage 2 합쳐진 이미지에 attention 맵과 예측 점을 시각화"""
     
