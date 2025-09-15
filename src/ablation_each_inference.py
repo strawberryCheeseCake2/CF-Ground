@@ -3,9 +3,9 @@ import argparse
 
 parser = argparse.ArgumentParser()
 parser.add_argument('gpu', type=int, help='GPU number')
-parser.add_argument('--resize', type=float, nargs=2, metavar=('MIN_RESIZE', 'MAX_RESIZE'), help='Stage 1 Resize ratio range (min max)')
-parser.add_argument('--ensemble', type=float, help='Stage 1 Ensemble ratio')
-parser.add_argument('--visualize', action='store_true', help='Whether to save visualization images')
+parser.add_argument('--r', type=float, nargs=2, metavar=('MIN_RESIZE', 'MAX_RESIZE'), help='Stage 1 Resize ratio range (min max)')
+parser.add_argument('--e', type=float, help='Stage 1 Ensemble ratio')
+parser.add_argument('--v', action='store_true', help='Whether to save visualization images')
 args = parser.parse_args()
 
 os.environ["CUDA_DEVICE_ORDER"]="PCI_BUS_ID"
