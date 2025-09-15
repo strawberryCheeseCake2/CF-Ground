@@ -6,7 +6,3 @@ attn_output/
 _crop_test/
 _sharpness_test/
 gyu/attn_output/
-
-# conda env
-env_zonui/
-env_gui_actor/

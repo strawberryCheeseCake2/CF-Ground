@@ -17,8 +17,8 @@ ATTN_IMPL = "eager"  # attention implement "eager" "sdpa" "flash" "efficient"
 
 # Image Resize Ratios
 
-MIN_RESIZE = args.resize[0] if args.resize else 0.50  # DYNAMIC_RESIZE 비율 최소값
-MAX_RESIZE = args.resize[1] if args.resize else 0.80  # DYNAMIC_RESIZE 비율 최대값
+MIN_RESIZE = args.r[0] if args.r else 0.50  # DYNAMIC_RESIZE 비율 최소값
+MAX_RESIZE = args.r[1] if args.r else 0.50  # DYNAMIC_RESIZE 비율 최대값
 
 # Crop Limitations
 MAX_CROPS = 3  # 생성할 수 있는 최대 crop 개수
@@ -28,7 +28,7 @@ CROP_HEIGHT = 602  # 크롭할 직사각형 세로 크기
 
 # Ensemble Hyperparameters
 # TODO: 이것도 resize처럼 동적으로 측정해서 변경 가능하도록
-STAGE1_ENSEMBLE_RATIO = args.ensemble if args.ensemble else 0.50  # Stage1 attention 가중치
+STAGE1_ENSEMBLE_RATIO = args.e if args.e else 0.50  # Stage1 attention 가중치
 STAGE2_ENSEMBLE_RATIO = 1 - STAGE1_ENSEMBLE_RATIO  # Stage2 crop 가중치
 ENSEMBLE_TOP_PATCHES = 100                         # Stage2에서 앙상블에 사용할 상위 패치 개수
 
@@ -57,7 +57,7 @@ SAMPLE_RANGE = slice(None)
 # SAMPLE_RANGE = slice(0,2)
 
 # Visualize & Logging
-VISUALIZE = args.visualize if args.visualize else False
+VISUALIZE = args.v if args.v else False
 VIS_ONLY_WRONG = False  # True면 틀린 것만 시각화, False면 모든 것 시각화
 TFOPS_PROFILING = True
 MEMORY_EVAL = True

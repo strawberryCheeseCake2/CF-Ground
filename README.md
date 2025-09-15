@@ -24,7 +24,7 @@ pip install -r requirements_gui_agent.txt
 ```
 - MAC OS
 ```bash
-pip install -r requirements_gui_agent_mac.txt
+pip install -r env/requirements_gui_agent_mac.txt
 ```
 
 ## :minidisc: ScreenSpot_v2 Dataset Download

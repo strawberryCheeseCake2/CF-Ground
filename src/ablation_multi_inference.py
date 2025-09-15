@@ -17,8 +17,8 @@ ATTN_IMPL = "eager"  # attention implement "eager" "sdpa" "flash" "efficient"
 
 # Image Resize Ratios
 
-MIN_RESIZE = args.resize[0] if args.resize else 0.75  # DYNAMIC_RESIZE 비율 최소값
-MAX_RESIZE = args.resize[1] if args.resize else 0.75  # DYNAMIC_RESIZE 비율 최대값
+MIN_RESIZE = args.r[0] if args.r else 0.50  # DYNAMIC_RESIZE 비율 최소값
+MAX_RESIZE = args.r[1] if args.r else 0.50  # DYNAMIC_RESIZE 비율 최대값
 
 # Crop Limitations
 MAX_CROPS = 3  # 생성할 수 있는 최대 crop 개수
@@ -28,7 +28,7 @@ CROP_HEIGHT = 602  # 크롭할 직사각형 세로 크기
 
 # Ensemble Hyperparameters
 # TODO: 이것도 resize처럼 동적으로 측정해서 변경 가능하도록
-STAGE1_ENSEMBLE_RATIO = args.ensemble if args.ensemble else 0.50  # Stage1 attention 가중치
+STAGE1_ENSEMBLE_RATIO = args.e if args.e else 0.50  # Stage1 attention 가중치
 STAGE2_ENSEMBLE_RATIO = 1 - STAGE1_ENSEMBLE_RATIO  # Stage2 crop 가중치
 ENSEMBLE_TOP_PATCHES = 100                         # Stage2에서 앙상블에 사용할 상위 패치 개수
 
@@ -57,7 +57,7 @@ SAMPLE_RANGE = slice(None)
 # SAMPLE_RANGE = slice(0,2)
 
 # Visualize & Logging
-VISUALIZE = args.visualize if args.visualize else False
+VISUALIZE = args.v if args.v else False
 VIS_ONLY_WRONG = False  # True면 틀린 것만 시각화, False면 모든 것 시각화
 TFOPS_PROFILING = True
 MEMORY_EVAL = True
@@ -915,32 +915,43 @@ if __name__ == '__main__':
             # Stage1 attention 점수들 정규화 (1등 기준)
             s1_max_score = float(max(s1_attn_scores)) if len(s1_attn_scores) > 0 else 1.0
             
-            # Stage2 점수들도 정규화 (1등 기준으로 정규화)
-            s2_max_score = 1.0
+            # Stage2에서 topk 후보들만 선별 (run_gui_actor와 동일)
             if s2_all_candidates:
-                s2_scores = [candidate['score'] for candidate in s2_all_candidates]
-                s2_max_score = max(s2_scores) if s2_scores else 1.0
+                # 점수 상위 10개만 선택 (run_gui_actor의 topk=10과 동일)
+                s2_topk_candidates = sorted(s2_all_candidates, key=lambda x: x['score'], reverse=True)[:10]
+                s2_topk_scores = [candidate['score'] for candidate in s2_topk_candidates]
+                
+                # topk 점수들만으로 정규화 (run_gui_actor와 동일)
+                if s2_topk_scores:
+                    s2_max_score = max(s2_topk_scores)
+                    if s2_max_score > 0:
+                        s2_normalized_scores = [score / s2_max_score for score in s2_topk_scores]
+                    else:
+                        s2_normalized_scores = [0.0] * len(s2_topk_scores)
+                else:
+                    s2_normalized_scores = []
+            else:
+                s2_topk_candidates = []
+                s2_normalized_scores = []
             
-            # 각 Stage2 후보 점에 대해 앙상블 점수 계산
+            # 각 Stage2 topk 점에 대해 앙상블 점수 계산
             ensemble_candidates = []
             
-            if s2_all_candidates:  # Stage2 결과가 있을 때만 처리
-                for candidate in s2_all_candidates:
-                    s2_original_point = candidate['point']
-                    s2_raw_score = candidate['score']
-                    
-                    # 해당 점에서의 Stage1 점수 계산 (정규화된 값)
-                    s1_raw_score = get_stage1_score_at_point(
-                        s2_original_point, s1_attn_scores, s1_n_width, s1_n_height, 
-                        original_image.size, s1_resize_ratio
-                    )
-                    s1_score = s1_raw_score / s1_max_score if s1_max_score > 0 else 0.0
-                    
-                    # Stage2 점수도 정규화 (1등 기준)
-                    s2_score = s2_raw_score / s2_max_score if s2_max_score > 0 else 0.0
-                    
-                    # 앙상블 점수 계산
-                    ensemble_score = STAGE1_ENSEMBLE_RATIO * s1_score + STAGE2_ENSEMBLE_RATIO * s2_score
+            for i, candidate in enumerate(s2_topk_candidates):
+                s2_original_point = candidate['point']
+                
+                # 해당 점에서의 Stage1 점수 계산 (정규화된 값)
+                s1_raw_score = get_stage1_score_at_point(
+                    s2_original_point, s1_attn_scores, s1_n_width, s1_n_height, 
+                    original_image.size, s1_resize_ratio
+                )
+                s1_score = s1_raw_score / s1_max_score if s1_max_score > 0 else 0.0
+                
+                # Stage2 점수는 정규화된 점수 사용 (run_gui_actor와 동일)
+                s2_score = s2_normalized_scores[i] if i < len(s2_normalized_scores) else 0.0
+                
+                # 앙상블 점수 계산
+                ensemble_score = STAGE1_ENSEMBLE_RATIO * s1_score + STAGE2_ENSEMBLE_RATIO * s2_score
                 
                 ensemble_candidates.append({
                     'point': s2_original_point,
@@ -948,31 +959,29 @@ if __name__ == '__main__':
                     's1_score': s1_score,
                     's2_score': s2_score,
                     'crop_id': candidate['crop_id'],
-                    'rank_in_crop': candidate['rank_in_crop']
+                    'rank_in_crop': candidate['rank_in_crop'],
+                    's2_rank': i + 1  # topk 내에서의 순위
                 })
             
             # 최고 점수를 가진 점 선택
             if ensemble_candidates:
                 best_candidate = max(ensemble_candidates, key=lambda x: x['score'])
                 s3_ensemble_point = best_candidate['point']
-                stage3_success = True
             else:
                 # Stage2 결과가 없으면 Stage1 결과를 사용
                 if s1_original_point:
                     s3_ensemble_point = s1_original_point
-                    stage3_success = point_in_bbox(s3_ensemble_point, original_bbox)
                 else:
                     s3_ensemble_point = [0, 0]
-                    stage3_success = False
 
             s3_end = time.time()
             s3_time = s3_end - s3_start
             
-            # 디버그 정보 출력 (상위 3개만)
+            # 디버그 정보 출력 (상위 3개만) - run_gui_actor와 동일한 형태
             if ensemble_candidates:
-                print(f"🎯 Stage3 Multi-Image Ensemble Candidates (Top 3):")
+                print(f"🎯 Stage3 Ensemble Candidates (Top 3):")
                 for i, candidate in enumerate(sorted(ensemble_candidates, key=lambda x: x['score'], reverse=True)[:3]):
-                    print(f"  Rank {i+1}: Crop_id={candidate['crop_id']}, Crop_rank={candidate['rank_in_crop']}, S1={candidate['s1_score']:.3f}, S2={candidate['s2_score']:.3f}, Ensemble={candidate['score']:.3f}")
+                    print(f"  Rank {i+1}: S2_rank={candidate['s2_rank']}, S1={candidate['s1_score']:.3f}, S2={candidate['s2_score']:.3f}, Ensemble={candidate['score']:.3f}")
             else:
                 print(f"🎯 Stage3: No ensemble candidates, using Stage1 result")
             
