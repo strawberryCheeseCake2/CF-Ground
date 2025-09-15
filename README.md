@@ -6,7 +6,7 @@
 
 1. Clone this repo to your local machine: 
 ```bash
-git clone git@github.com:strawberryCheeseCake2/CF-Ground.git
+git clone https://github.com/strawberryCheeseCake2/CF-Ground.git
 cd CF-Ground
 ```
 
@@ -43,9 +43,16 @@ cd ..
 ## Run
 
 ```bash
-python run_gui_actor.py [gpu_num] --resize [Stage 1 Resize ratio] --ensemble [Stage 1 Ensemble ratio]
+cd src
+python run_gui_actor.py [gpu_num]
 ```
 
+### option
+- `--v` : visulize on
+- `--r` : resize ratio
+- `--e` : ensamble ratio
+
 ```bash
-python run_gui_actor.py 0 --resize 0.5 --ensemble 0.5
+cd src
+python run_gui_actor.py [gpu_num] --r [min resize ratio] [max resize ratio] --e [ensemble ratio] --v
 ```
