@@ -7,7 +7,9 @@ import argparse
 
 parser = argparse.ArgumentParser()
 parser.add_argument('gpu', type=int, default=0, help='GPU number')
-parser.add_argument('--r', type=float, default=0.50, help='Stage 1 Resize ratio range')
+parser.add_argument('--r', type=float, default=0.50, help='Stage 1 Resize ratio')
+parser.add_argument('--th', type=float, default=0.1, help='Stage 1 Crop threshold')
+parser.add_argument('--p', type=int, default=0, help='Stage 1 Crop Padding')
 parser.add_argument('--v', action='store_true', help='Whether to save visualization images')
 args = parser.parse_args()
 
@@ -16,7 +18,7 @@ os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu)
 
 #! Hyperparameter =====================================================================================
 
-ATTN_IMPL = "eager"  # attention implement "eager" "sdpa" "flash" "efficient"
+ATTN_IMPL = "eager"                      # attention implement "eager" "sdpa" "flash" "efficient"
 
 # Image Resize Ratios
 RESIZE_RATIO = args.r
@@ -25,9 +27,9 @@ RESIZE_RATIO = args.r
 MAX_CROPS = 3  # 최대 crop 개수
 
 # Connected Region Based Cropping
-REGION_THRESHOLD = 0.4  # 연결된 영역 검출을 위한 임계값 (0~1)  # TODO: 0.1 ~ 0.5 중 최적 찾기
-MIN_PATCHES = 1  # 최소 패치 수 (너무 작은 영역 제거)
-BBOX_PADDING = 0  # bbox 상하좌우로 확장할 픽셀  # TODO: 0 ~ 50 중 최적 찾기
+REGION_THRESHOLD = args.th              # 연결된 영역 검출을 위한 임계값 (0~1)  # TODO: 0.1 ~ 0.5 중 최적 찾기
+MIN_PATCHES = 1                         # 최소 패치 수 (너무 작은 영역 제거)
+BBOX_PADDING = args.p                   # bbox 상하좌우로 확장할 픽셀  # TODO: 0 ~ 50 중 최적 찾기
 
 # Ensemble Hyperparameters
 STAGE1_ENSEMBLE_RATIO = 0.50                        # Stage1 attention 가중치
@@ -38,9 +40,9 @@ ENSEMBLE_TOP_PATCHES = 100                          # Stage2에서 앙상블에 
 MAX_PIXELS = 3211264  # Process단에서 적용
 
 # csv에 기록할 method 이름
-method = "final"
+method = "final_0917"
 
-memo = f"resize{RESIZE_RATIO:.2f}_region_thresh{REGION_THRESHOLD:.2f}_pad{BBOX_PADDING}"
+memo = f"resize{RESIZE_RATIO:.2f}_region_thresh{REGION_THRESHOLD:.3f}_pad{BBOX_PADDING}"
 
 #! Argument ==========================================================================================
 
@@ -191,7 +193,7 @@ def create_conversation_stage2(crop_list, instruction):
 
 def get_connected_region_bboxes_from_scores(
     image_result: Dict,
-    threshold: Optional[float],
+    threshold: float,
     min_patches: int = 1
 ) -> List[Dict]:
     '''
@@ -204,10 +206,7 @@ def get_connected_region_bboxes_from_scores(
     attn = attn_scores_1d.reshape(n_h, n_w)
     
     vmax = float(attn.max()) if attn.size > 0 else 0.0
-    if threshold is not None:
-        thr_val = float(vmax * threshold) if threshold <= 1.0 else float(threshold)
-    else:
-        thr_val = float(vmax * 0.5)  # 기본값
+    thr_val = float(vmax * threshold) if threshold <= 1.0 else float(threshold)
     
     # 2) 기준 넘는 패치들 마스크 생성
     mask = (attn >= thr_val)
@@ -349,10 +348,6 @@ def find_connected_regions(pred_result, resized_image, resize_ratio):
     # 점수 합이 높은 순서로 정렬
     connected_regions.sort(key=lambda x: x['score'], reverse=True)
     
-    print(f"🎯 Stage 1: Found {len(connected_regions)} connected regions")
-    for i, region in enumerate(connected_regions):
-        print(f"  Region {i+1}: score_sum={region['score']:.3f}, size={region['size']} patches, bbox={region['bbox_padded']}")
-    
     return connected_regions
 
 def create_crops_from_connected_regions(regions, original_image):
@@ -374,8 +369,6 @@ def create_crops_from_connected_regions(regions, original_image):
             'id': i + 1,
             'region_info': region  # 원본 영역 정보 포함
         })
-        
-        print(f"🔧 Crop {i+1}: score={region['score']:.3f}, size={region['size']} patches, bbox={bbox}")
     
     return crops
 
@@ -435,7 +428,6 @@ def convert_multi_image_results_to_original(multi_pred, crop_list):
     
     # 모든 후보들을 점수순으로 정렬
     all_candidates.sort(key=lambda x: x['score'], reverse=True)
-    print(f"🎯 Stage 2: Collected {len(all_candidates)} candidates from {len(crop_list)} crops.")
     
     return all_candidates
 
@@ -738,11 +730,6 @@ if __name__ == '__main__':
 
             s3_end = time.time()
             s3_time = s3_end - s3_start
-            
-            # 디버그 정보 출력
-            print(f"🎯 Stage 3: Ensemble Candidates")
-            for i, candidate in enumerate(sorted(ensemble_candidates, key=lambda x: x['score'], reverse=True)):
-                print(f"        Rank {i+1}: S2_rank={candidate['s2_rank']}, S1={candidate['s1_score']:.3f}, S2={candidate['s2_score']:.3f}, Ensemble={candidate['score']:.3f}")
             
             # 시각화를 위해 후보들 저장
             s3_ensemble_candidates = ensemble_candidates
