@@ -6,48 +6,41 @@ import os
 import argparse
 
 parser = argparse.ArgumentParser()
-parser.add_argument('gpu', type=int, help='GPU number')
-# parser.add_argument('--r', type=float, nargs=2, metavar=('MIN_RESIZE', 'MAX_RESIZE'), help='Stage 1 Resize ratio range (min max)')
-parser.add_argument('--r', type=float, help='Stage 1 Resize ratio range')
+parser.add_argument('gpu', type=int, default=0, help='GPU number')
+parser.add_argument('--r', type=float, default=0.50, help='Stage 1 Resize ratio range')
 parser.add_argument('--v', action='store_true', help='Whether to save visualization images')
 args = parser.parse_args()
 
 os.environ["CUDA_DEVICE_ORDER"]="PCI_BUS_ID"
-os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu)  # 몇번 GPU 사용할지 argument로 지정 : run_gui_actor.py 2 -> 2번 GPU
+os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu)
 
 #! Hyperparameter =====================================================================================
 
 ATTN_IMPL = "eager"  # attention implement "eager" "sdpa" "flash" "efficient"
 
 # Image Resize Ratios
-# MIN_RESIZE = args.r[0] if args.r else 0.50  # DYNAMIC_RESIZE 비율 최소값
-# MAX_RESIZE = args.r[1] if args.r else 0.50  # DYNAMIC_RESIZE 비율 최대값
-MIN_RESIZE = args.r if args.r else 0.50  # DYNAMIC_RESIZE 비율 최소값
-MAX_RESIZE = args.r if args.r else 0.50  # DYNAMIC_RESIZE 비율 최대값
+RESIZE_RATIO = args.r
 
 # Crop Limitations
-MAX_CROPS = 3  # 생성할 수 있는 최대 crop 개수
-SELECT_THRESHOLD = 0.50  #! score >= tau * max_score 인 모든 crop select
+MAX_CROPS = 3  # 최대 crop 개수
 
 # Connected Region Based Cropping
-REGION_THRESHOLD = 0.2  # 연결된 영역 검출을 위한 임계값 (0~1) # TODO: 개수 추가하기
+REGION_THRESHOLD = 0.4  # 연결된 영역 검출을 위한 임계값 (0~1)  # TODO: 0.1 ~ 0.5 중 최적 찾기
 MIN_PATCHES = 1  # 최소 패치 수 (너무 작은 영역 제거)
-CONNECTIVITY = 8  # 4 또는 8 연결
-BBOX_PADDING = 0  # bbox 상하좌우로 확장할 픽셀 수 (0이면 bbox 그대로)  # TODO: 0 ~ 50 중 최적 찾기
+BBOX_PADDING = 0  # bbox 상하좌우로 확장할 픽셀  # TODO: 0 ~ 50 중 최적 찾기
 
 # Ensemble Hyperparameters
-STAGE1_ENSEMBLE_RATIO = 0.50  # Stage1 attention 가중치
-STAGE2_ENSEMBLE_RATIO = 1 - STAGE1_ENSEMBLE_RATIO  # Stage2 crop 가중치
-ENSEMBLE_TOP_PATCHES = 100                         # Stage2에서 앙상블에 사용할 상위 패치 개수 (GUI Actor에서는 안쓰임)
+STAGE1_ENSEMBLE_RATIO = 0.50                        # Stage1 attention 가중치
+STAGE2_ENSEMBLE_RATIO = 1 - STAGE1_ENSEMBLE_RATIO   # Stage2 crop 가중치
+ENSEMBLE_TOP_PATCHES = 100                          # Stage2에서 앙상블에 사용할 상위 패치 개수 (Qwen2.5VL용)
 
 # 최대 PIXELS 제한
 MAX_PIXELS = 3211264  # Process단에서 적용
 
 # csv에 기록할 method 이름
-# method = "dynamic_resize"
-method = "Final"
+method = "final"
 
-memo = f"resize_{MIN_RESIZE:.2f}~{MAX_RESIZE:.2f}_region_thresh{REGION_THRESHOLD:.2f}_pad{BBOX_PADDING}"
+memo = f"resize{RESIZE_RATIO:.2f}_region_thresh{REGION_THRESHOLD:.2f}_pad{BBOX_PADDING}"
 
 #! Argument ==========================================================================================
 
@@ -55,20 +48,15 @@ SEED = 0
 
 # Dataset & Model
 MLLM_PATH = "microsoft/GUI-Actor-3B-Qwen2.5-VL"
-SCREENSPOT_IMGS = "../data/screenspotv2_image"  # input image 경로
-SCREENSPOT_JSON = "../data"  # input image json파일 경로
+SCREENSPOT_IMGS = "../data/screenspotv2_image"       # input image 경로
+SCREENSPOT_JSON = "../data"                          # input image json파일 경로
 TASKS = ["mobile", "web", "desktop"]
-# TASKS = ["mobile"]
-# TASKS = ["web"]
-# TASKS = ["desktop"]
 SAMPLE_RANGE = slice(None)
-# SAMPLE_RANGE = slice(0,2)
 
 # Visualize & Logging
 VISUALIZE = args.v if args.v else False
-VIS_ONLY_WRONG = False  # True면 틀린 것만 시각화, False면 모든 것 시각화
+VIS_ONLY_WRONG = False                                # True면 틀린 것만 시각화, False면 모든 것 시각화
 TFOPS_PROFILING = True
-MEMORY_EVAL = False
 MEMORY_VIS = False
 
 # Save Path
@@ -101,8 +89,7 @@ from util.iter_logger import init_iter_logger, append_iter_log  # log csv 기록
 from gui_actor.modeling_qwen25vl import Qwen2_5_VLForConditionalGenerationWithPointer
 from gui_actor.inference import inference
 from gui_actor.multi_image_inference import multi_image_inference
-from util.visualize_util import visualize_stage1_attention_crops, visualize_stage2_merged_attention, visualize_stage2_multi_attention, visualize_stage3_ensemble_attention, visualize_stage3_point_ensemble
-from util.sharpness_util import get_fft_blur_score
+from util.visualize_util import visualize_stage1_attention_crops, visualize_stage2_multi_attention, visualize_stage3_point_ensemble
 if TFOPS_PROFILING:
     from deepspeed.profiling.flops_profiler import FlopsProfiler
 
@@ -119,15 +106,6 @@ class NpEncoder(json.JSONEncoder):
         if isinstance(obj, (np.bool_, bool)):
             return bool(obj)
         return super(NpEncoder, self).default(obj)
-
-def resize_image(image, resize_to_pixels):
-    image_width, image_height = image.size
-    if (resize_to_pixels is not None) and ((image_width * image_height) > resize_to_pixels):
-        resize_ratio = (resize_to_pixels / (image_width * image_height)) ** 0.5
-        image_width_resized, image_height_resized = int(image_width * resize_ratio), int(image_height * resize_ratio)
-        image = image.resize((image_width_resized, image_height_resized))
-        print(f"🔧 Resized image: {image_width}x{image_height} -> {image_width_resized}x{image_height_resized} (ratio: {resize_ratio:.3f})")
-    return image
 
 def warm_up_model(model, tokenizer, processor):
     print("🏋️‍♂️ Warming up the model...")
@@ -213,105 +191,86 @@ def create_conversation_stage2(crop_list, instruction):
 
 def get_connected_region_bboxes_from_scores(
     image_result: Dict,
-    threshold: Optional[float] = 0.5,
-    min_patches: int = 1,
-    connectivity: int = 8,
-    percentile: Optional[float] = None,
+    threshold: Optional[float],
+    min_patches: int = 1
 ) -> List[Dict]:
     '''
-    어텐션 스코어 맵에서 threshold를 적용해 마스크를 만들고,
-    연결 성분(BFS)으로 묶어서 각 성분의 정규화 bbox와 점수를 반환한다.
-    Args:
-        image_result: prediction_results[‘per_image’]의 단일 아이템
-                      반드시 ‘attn_scores’, ‘n_width’, ‘n_height’ 포함
-        threshold: 0~1 사이면 max(attn_scores)*threshold로 임계값을 잡음.
-                   None이면 percentile을 사용(기본 85p)하거나
-                   자동 규칙(mean+std)으로 결정.
-        min_patches: 너무 작은 성분 제거를 위한 최소 패치 수
-        connectivity: 4 또는 8 연결
-        percentile: None이 아니면 해당 분위수(예: 85.0)로 임계값 설정
-    Returns:
-        List[Dict]: 각 성분에 대해
-            {
-              "bbox": [l, t, r, b],  # 정규화(0~1)
-              "patch_bbox": [x_min, y_min, x_max, y_max],  # 패치 좌표
-              "size": 정점 수(패치 수),
-              "score_sum": 성분 내 점수 합,
-              "score_mean": 성분 내 점수 평균(0~1 정규화 아님),
-              "score_norm": 성분 내 점수합 / 전체 max 합 기반 간단 정규화
-            }
-          형태의 리스트(점수가 높은 순으로 정렬)
+    간단한 버전: attention * threshold 넘는 부분들을 8방향 연결로 합쳐서 box 생성
     '''
-    # 1) 입력 파싱
+    # 1) 입력 파싱 및 임계값 계산
     attn_scores_1d = np.array(image_result["attn_scores"][0], dtype=np.float32)
     n_w = int(image_result["n_width"])
     n_h = int(image_result["n_height"])
-    if attn_scores_1d.size != n_w * n_h:
-        raise ValueError(f"attn_scores size {attn_scores_1d.size} != n_w*n_h {n_w*n_h}")
-    attn = attn_scores_1d.reshape(n_h, n_w)  # [y, x]
-    # 2) 임계값 결정
+    attn = attn_scores_1d.reshape(n_h, n_w)
+    
     vmax = float(attn.max()) if attn.size > 0 else 0.0
-    if percentile is not None:
-        thr_val = float(np.percentile(attn, percentile))
-    elif threshold is not None:
-        # threshold∈(0,1]이면 max 기반, 1보다 크면 절대값으로 간주
+    if threshold is not None:
         thr_val = float(vmax * threshold) if threshold <= 1.0 else float(threshold)
     else:
-        # 자동: mean + 1*std와 max*0.5 중 더 낮은 쪽을 사용
-        mean, std = float(attn.mean()), float(attn.std())
-        thr_val = min(mean + std, vmax * 0.5)
-    # 3) 마스크 생성
+        thr_val = float(vmax * 0.5)  # 기본값
+    
+    # 2) 기준 넘는 패치들 마스크 생성
     mask = (attn >= thr_val)
-    # 4) BFS로 연결 성분 추출
+    
+    # 3) BFS로 연결된 영역들 찾기
     visited = np.zeros_like(mask, dtype=bool)
-    regions: List[List[Tuple[int, int]]] = []
-    if connectivity == 4:
-        nbrs = [(1,0),(-1,0),(0,1),(0,-1)]
-    else:  # 8-연결
-        nbrs = [(di, dj) for di in (-1,0,1) for dj in (-1,0,1) if not (di==0 and dj==0)]
+    regions = []
+    neighbors = [(di, dj) for di in (-1,0,1) for dj in (-1,0,1) if not (di==0 and dj==0)]  # 8방향
+    # neighbors =   # TODO: 4방향 비교
+    
     for y in range(n_h):
         for x in range(n_w):
             if not mask[y, x] or visited[y, x]:
                 continue
-            q = deque([(y, x)])
-            visited[y, x] = True
+                
+            # BFS로 연결된 영역 찾기
             region = [(y, x)]
-            while q:
-                cy, cx = q.popleft()
-                for dy, dx in nbrs:
+            queue = deque([(y, x)])
+            visited[y, x] = True
+            
+            while queue:
+                cy, cx = queue.popleft()
+                for dy, dx in neighbors:
                     ny, nx = cy + dy, cx + dx
-                    if 0 <= ny < n_h and 0 <= nx < n_w and mask[ny, nx] and not visited[ny, nx]:
+                    if (0 <= ny < n_h and 0 <= nx < n_w and 
+                        mask[ny, nx] and not visited[ny, nx]):
                         visited[ny, nx] = True
-                        q.append((ny, nx))
+                        queue.append((ny, nx))
                         region.append((ny, nx))
+            
             if len(region) >= min_patches:
                 regions.append(region)
-    # 5) 각 성분의 bbox 및 점수 계산
-    out: List[Dict] = []
-    eps = 1e-9
+    
+    # 4) 각 영역의 bbox와 점수 계산
+    out = []
     for region in regions:
         ys = [p[0] for p in region]
         xs = [p[1] for p in region]
         y_min, y_max = min(ys), max(ys)
         x_min, x_max = min(xs), max(xs)
-        # 정규화 bbox (픽셀 좌표가 아니라 패치 그리드 기준)
+        
+        # 정규화된 bbox
         l = x_min / n_w
-        t = y_min / n_h
+        t = y_min / n_h  
         r = (x_max + 1) / n_w
         b = (y_max + 1) / n_h
-        # 점수 집계
+        
+        # 점수 계산
         region_scores = attn[ys, xs]
         score_sum = float(region_scores.sum())
         score_mean = float(region_scores.mean())
-        score_norm = float(score_sum / (vmax * (len(region) + eps) + eps))  # 간단 정규화
+        
         out.append({
             "bbox": [l, t, r, b],
             "patch_bbox": [int(x_min), int(y_min), int(x_max), int(y_max)],
             "size": int(len(region)),
             "score_sum": score_sum,
             "score_mean": score_mean,
-            "score_norm": score_norm,
+            "score_norm": score_sum / (vmax * len(region) + 1e-9),
         })
+    
+    # 5) 점수순 정렬
+    out.sort(key=lambda x: x["score_sum"], reverse=True)
     return out
 
 def run_stage1_attention_inference(original_image, instruction):
@@ -319,17 +278,9 @@ def run_stage1_attention_inference(original_image, instruction):
 
     orig_w, orig_h = original_image.size
     # 이미지 고정 리사이즈
-    if MIN_RESIZE == MAX_RESIZE:
-        resize_ratio = MIN_RESIZE
-        resized_w, resized_h = int(orig_w * resize_ratio), int(orig_h * resize_ratio)
-        print(f"🔧 Fixed Resized image: {orig_w}x{orig_h} -> {resized_w}x{resized_h} (ratio: {resize_ratio:.3f})")
-    
-    # 이미지 동적 리사이즈
-    else:
-        downsampled = original_image.resize((int(orig_w*0.5), int(orig_h*0.5)))
-        resize_ratio = get_fft_blur_score(downsampled, min_resize=MIN_RESIZE, max_resize=MAX_RESIZE)
-        resized_w, resized_h = int(orig_w * resize_ratio), int(orig_h * resize_ratio)
-        print(f"🔧 Dynamic Resized image: {orig_w}x{orig_h} -> {resized_w}x{resized_h} (ratio: {resize_ratio:.3f})")
+    resize_ratio = RESIZE_RATIO
+    resized_w, resized_h = int(orig_w * resize_ratio), int(orig_h * resize_ratio)
+    print(f"🔧 Resized image: {orig_w}x{orig_h} -> {resized_w}x{resized_h} (ratio: {resize_ratio:.3f})")
     
     # 리사이즈된 이미지로 inference
     resized_image = original_image.resize((resized_w, resized_h))
@@ -344,19 +295,13 @@ def run_stage1_attention_inference(original_image, instruction):
     return pred, resized_image
 
 def find_connected_regions(pred_result, resized_image, resize_ratio):
-    """어텐션에서 연결된 영역들 찾기 (get_connected_region_bboxes_from_scores 사용)"""
-    
-    # get_connected_region_bboxes_from_scores를 사용해 연결된 영역들 추출
+    """어텐션에서 연결된 영역들 찾기"""
+
     regions = get_connected_region_bboxes_from_scores(
         image_result=pred_result,
         threshold=REGION_THRESHOLD,
-        min_patches=MIN_PATCHES,
-        connectivity=CONNECTIVITY
+        min_patches=MIN_PATCHES
     )
-    
-    if not regions:
-        print("⚠️ No connected regions found")
-        return []
     
     resized_w, resized_h = resized_image.size
     orig_w = resized_w / resize_ratio
@@ -409,26 +354,6 @@ def find_connected_regions(pred_result, resized_image, resize_ratio):
         print(f"  Region {i+1}: score_sum={region['score']:.3f}, size={region['size']} patches, bbox={region['bbox_padded']}")
     
     return connected_regions
-
-def filter_by_threshold(regions, threshold=0.5, max_crops=MAX_CROPS):
-    """1등의 threshold% 이상인 region들만 남기고, 최대 개수 제한 적용"""
-    
-    if not regions:
-        return []
-    
-    max_score = regions[0]['score']
-    min_score = max_score * threshold
-    
-    # threshold 조건으로 먼저 필터링
-    filtered_regions = [region for region in regions if region['score'] >= min_score]
-    
-    # 최대 개수 제한 적용 (상위 점수순으로)
-    if len(filtered_regions) > max_crops:
-        filtered_regions = filtered_regions[:max_crops]
-    
-    print(f"🎯 Stage 1: Found {len(regions)} regions, filtered to {len(filtered_regions)} (threshold: {threshold}, max_crops: {max_crops})")
-    
-    return filtered_regions
 
 def create_crops_from_connected_regions(regions, original_image):
     """연결된 영역들을 기반으로 원본 이미지에서 직접 crop"""
@@ -527,21 +452,11 @@ def run_stage1_attention_based(original_image, instruction, gt_bbox):
     
     # 3. 연결된 영역들 찾기
     regions = find_connected_regions(s1_pred, resized_image, resize_ratio)
-    
-    if not regions:
-        print("⚠️ No connected regions found")
-        return s1_pred, [], 0, resized_image, scaled_gt_bbox
-    
-    # 4. 1등의 threshold% 이상만 남기고 최대 개수 제한 적용
-    filtered_regions = filter_by_threshold(regions, threshold=SELECT_THRESHOLD, max_crops=MAX_CROPS)
-    filtered_regions = regions
-    
-    if not filtered_regions:
-        print("⚠️ No regions passed threshold")
-        return s1_pred, [], 0, resized_image, scaled_gt_bbox
+
+    regions = regions[:MAX_CROPS]
     
     # 5. 원본 이미지에서 직접 crop 생성
-    crops = create_crops_from_connected_regions(filtered_regions, original_image)
+    crops = create_crops_from_connected_regions(regions, original_image)
     
     num_crops = len(crops)
     
@@ -580,15 +495,6 @@ def point_in_bbox(point, bbox):
     if point is None or bbox is None:
         return False
     return bbox[0] <= point[0] <= bbox[2] and bbox[1] <= point[1] <= bbox[3]
-
-def monitor_memory(interval=0.1):
-    start = time.time()
-    while not stop_flag:
-        mem = torch.cuda.memory_allocated() / 1024**3
-        now = time.time() - start
-        mem_log.append(mem)
-        time_log.append(now)
-        time.sleep(interval)
 
 #! ================================================================================================
 
@@ -640,7 +546,7 @@ if __name__ == '__main__':
                 "s1_time", "s1_tflops", "s1_hit", 
                 "s2_time", "s2_tflops", "s2_hit", 
                 "s3_time", "s3_hit",
-                "total_time", "total_tflops", "peak_memory_gb", 
+                "total_time", "total_tflops",
                 "crop_acc_uptonow", "s1_acc_uptonow", "s2_acc_uptonow", "s3_acc_uptonow",
                 "filename", "instruction"
             ],
@@ -658,9 +564,7 @@ if __name__ == '__main__':
         num_action = 0
         s1_time_sum = s2_time_sum = s3_time_sum = 0.0
         s1_tflops_sum = s2_tflops_sum = 0.0
-        stage1_success_count = stage2_success_count = stage3_success_count = 0
-        crop_success_count = 0  # 새로운 crop 성공 카운터 추가
-        peak_memory_sum = 0.0  # 피크 메모리 합계 추가
+        crop_success_count = stage1_success_count = stage2_success_count = stage3_success_count = 0
         
         # data_source별 통계 변수 초기화
         data_source_stats = {}
@@ -671,19 +575,10 @@ if __name__ == '__main__':
 
         for j, item in tqdm(enumerate(screenspot_data)):
 
-            if MEMORY_EVAL:
-                mem_log = []
-                time_log = []
-                stop_flag = False
-                monitor_thread = threading.Thread(target=monitor_memory, daemon=True)
-                monitor_thread.start()
-                torch.cuda.reset_peak_memory_stats()
-
             s1_tflops = s2_tflops = 0.0
+            num_action += 1
 
             print("\n\n----------------------\n")
-
-            num_action += 1
             
             # 파일 및 데이터 로드
             filename = item["img_filename"]
@@ -766,7 +661,6 @@ if __name__ == '__main__':
                 prof.reset_profile()
 
             s2_inference_start = time.time()
-            
             
             # 멀티 이미지로 inference
             s2_pred = run_stage2_multi_image_inference(s1_crop_list, instruction)
@@ -936,29 +830,6 @@ if __name__ == '__main__':
             #! [End]
             #! ==================================================================
 
-            if MEMORY_EVAL:
-                time.sleep(0.1)
-                stop_flag = True
-                monitor_thread.join()
-
-                # 피크 메모리 계산 (GB 단위, 소수점 3자리)
-                peak_memory = max(mem_log) if mem_log else 0.0
-                peak_memory_gb = round(peak_memory, 3)
-
-                if MEMORY_VIS:
-                    import matplotlib.pyplot as plt
-                    plt.figure(figsize=(10, 4))
-                    plt.plot(time_log, mem_log)
-                    plt.xlabel("Time (s)")
-                    plt.ylabel("GPU Memory Allocated (GB)")
-                    plt.title("GPU Memory Usage Over Time")
-                    plt.grid(True)
-                    plt.savefig(f"{memory_dir}/{num_action}_{filename}")
-                    plt.close()  # 메모리 누수 방지를 위해 close 추가
-
-            if MEMORY_EVAL:
-                peak_memory_sum += peak_memory_gb
-
             # data_source별 통계 업데이트
             if data_source not in data_source_stats:
                 data_source_stats[data_source] = {
@@ -972,8 +843,7 @@ if __name__ == '__main__':
                     'stage1_success_count': 0,
                     'crop_success_count': 0,
                     'stage2_success_count': 0,
-                    'stage3_success_count': 0,
-                    'peak_memory_sum': 0.0
+                    'stage3_success_count': 0
                 }
             
             stats = data_source_stats[data_source]
@@ -985,8 +855,6 @@ if __name__ == '__main__':
                 stats['s1_tflops_sum'] += s1_tflops
                 stats['s2_tflops_sum'] += s2_tflops
                 stats['total_tflops'] += total_tflops_this
-            if MEMORY_EVAL:
-                stats['peak_memory_sum'] += peak_memory_gb
             if s1_success:
                 stats['stage1_success_count'] += 1
             if crop_success:
@@ -1023,7 +891,6 @@ if __name__ == '__main__':
                 s3_hit=s3_hit,
                 total_time=f"{total_time:.3f}",
                 total_tflops=f"{total_tflops_this:.2f}",
-                peak_memory_gb=f"{peak_memory_gb:.3f}" if MEMORY_EVAL else "N/A",
                 crop_acc_uptonow=f"{up2now_crop_score:.2f}",
                 s1_acc_uptonow=f"{up2now_s1_score:.2f}",
                 s2_acc_uptonow=f"{up2now_s2_score:.2f}",
@@ -1059,7 +926,6 @@ if __name__ == '__main__':
                 's1_tflops': s1_tflops,
                 's2_tflops': s2_tflops,
                 'total_tflops': s1_tflops+s2_tflops,
-                'peak_memory_gb': peak_memory_gb if MEMORY_EVAL else None,
                 'ensemble_config': {
                     'attention_ratio': STAGE1_ENSEMBLE_RATIO,
                     'crop_ratio': STAGE2_ENSEMBLE_RATIO
@@ -1092,13 +958,10 @@ if __name__ == '__main__':
                 "stage2": s2_tflops_sum / num_action,
                 "total": (s1_tflops_sum + s2_tflops_sum) / num_action
             },
-            "avg_peak_memory_gb": round(peak_memory_sum / num_action, 3) if MEMORY_EVAL else None,
             "hyperparameters": {
-                "select_threshold": SELECT_THRESHOLD,
                 "region_threshold": REGION_THRESHOLD,
                 "bbox_padding": BBOX_PADDING,
                 "min_patches": MIN_PATCHES,
-                "connectivity": CONNECTIVITY,
                 "attn_impl": ATTN_IMPL,
                 "STAGE1_ensemble_ratio": STAGE1_ENSEMBLE_RATIO,
                 "STAGE2_ensemble_ratio": STAGE2_ENSEMBLE_RATIO
@@ -1131,13 +994,10 @@ if __name__ == '__main__':
                         "stage2": stats['s2_tflops_sum'] / stats['num_action'],
                         "total": (stats['s1_tflops_sum'] + stats['s2_tflops_sum']) / stats['num_action']
                     },
-                    "avg_peak_memory_gb": round(stats['peak_memory_sum'] / stats['num_action'], 3) if MEMORY_EVAL else None,
                     "hyperparameters": {
-                        "select_threshold": SELECT_THRESHOLD,
                         "region_threshold": REGION_THRESHOLD,
                         "bbox_padding": BBOX_PADDING,
                         "min_patches": MIN_PATCHES,
-                        "connectivity": CONNECTIVITY,
                         "attn_impl": ATTN_IMPL,
                         "STAGE1_ensemble_ratio": STAGE1_ENSEMBLE_RATIO,
                         "STAGE2_ensemble_ratio": STAGE2_ENSEMBLE_RATIO
@@ -1155,10 +1015,10 @@ if __name__ == '__main__':
         # CSV 헤더 정의
         csv_headers = [
             "method",
-            "min_resize", "max_resize", "select_threshold", "stage1_ensemble_ratio", "region_threshold", "bbox_padding",
+            "resize_ratio", "region_threshold", "bbox_padding",
             "total_samples", "crop_accuracy", "stage1_accuracy", "stage2_accuracy", "stage3_accuracy",
             "avg_stage1_time", "avg_stage2_time", "avg_stage3_time", "avg_total_time",
-            "avg_stage1_tflops", "avg_stage2_tflops", "avg_total_tflops", "avg_peak_memory_gb",
+            "avg_stage1_tflops", "avg_stage2_tflops", "avg_total_tflops",
             "timestamp"
         ]
         
@@ -1166,7 +1026,7 @@ if __name__ == '__main__':
         import datetime
         csv_row = [
             method,
-            MIN_RESIZE, MAX_RESIZE, SELECT_THRESHOLD, STAGE1_ENSEMBLE_RATIO, REGION_THRESHOLD, BBOX_PADDING,
+            RESIZE_RATIO, REGION_THRESHOLD, BBOX_PADDING,
             num_action, 
             round(metrics['crop_accuracy'], 2),
             round(metrics['stage1_accuracy'], 2),
@@ -1179,7 +1039,6 @@ if __name__ == '__main__':
             round(metrics['avg_flops_tflops']['stage1'], 2),
             round(metrics['avg_flops_tflops']['stage2'], 2),
             round(metrics['avg_flops_tflops']['total'], 2),
-            metrics['avg_peak_memory_gb'] if metrics['avg_peak_memory_gb'] else 0.0,
             datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         ]
         
@@ -1209,8 +1068,6 @@ if __name__ == '__main__':
         print(f"Stage3 Ensemble Accuracy: {metrics['stage3_accuracy']:.2f}%")
         print(f"Avg Times: S1 {metrics['avg_times']['stage1']:.3f}s | S2 {metrics['avg_times']['stage2']:.3f}s | S3 {metrics['avg_times']['stage3']:.3f}s | Total {metrics['avg_times']['total']:.3f}s")
         print(f"Avg FLOPs: S1 {metrics['avg_flops_tflops']['stage1']:.2f} | S2 {metrics['avg_flops_tflops']['stage2']:.2f} | Total {metrics['avg_flops_tflops']['total']:.2f} TFLOPs")
-        if MEMORY_EVAL and metrics['avg_peak_memory_gb'] is not None:
-            print(f"Avg Peak Memory: {metrics['avg_peak_memory_gb']:.3f} GB")
         print(f"Ensemble Config: Attention {STAGE1_ENSEMBLE_RATIO:.1f}, Crop {STAGE2_ENSEMBLE_RATIO:.1f}")
         print(f"Region Config: threshold={REGION_THRESHOLD}, padding={BBOX_PADDING}px, min_patches={MIN_PATCHES}")
         
