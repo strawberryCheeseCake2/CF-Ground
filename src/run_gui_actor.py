@@ -70,12 +70,11 @@ SAVE_DIR = f"../attn_output/" + method + "/" + memo
 import os
 import sys
 import time
-import threading
 import re
 import json
 import logging
 logging.disable(logging.CRITICAL)  # 모든 로깅 호출 무력화
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List
 from collections import deque
 
 # Third-Party Libraries
@@ -525,6 +524,28 @@ if __name__ == '__main__':
         save_dir = f"{SAVE_DIR}_{suffix}"
     os.makedirs(save_dir)
 
+    # 전체 task 통계 변수 초기화
+    total_samples = 0
+    total_crop_success = 0
+    total_stage1_success = 0
+    total_stage2_success = 0
+    total_stage3_success = 0
+    total_s1_time = 0.0
+    total_s2_time = 0.0
+    total_s3_time = 0.0
+    total_s1_tflops = 0.0
+    total_s2_tflops = 0.0
+
+    # CSV 헤더 정의 (모든 task에서 공통 사용)
+    csv_headers = [
+        "method",
+        "resize_ratio", "region_threshold", "bbox_padding",
+        "total_samples", "crop_accuracy", "stage1_accuracy", "stage2_accuracy", "stage3_accuracy",
+        "avg_stage1_time", "avg_stage2_time", "avg_stage3_time", "avg_total_time",
+        "avg_stage1_tflops", "avg_stage2_tflops", "avg_total_tflops",
+        "timestamp"
+    ]
+
     # Process
     for task in TASKS:
         # 각 task별로 별도의 로그 파일 생성
@@ -645,7 +666,7 @@ if __name__ == '__main__':
                 crop_success_count += 1
 
             #! ==================================================================
-            #! [Stage 2] Merged Crop Inference
+            #! [Stage 2] Crop Inference
             #! ==================================================================
             
             s2_tflops = 0.0
@@ -742,22 +763,6 @@ if __name__ == '__main__':
                 stage3_success_count += 1
 
             #! ==================================================================
-            #! [Common Processing]
-            #! ==================================================================
-            
-            # 공통 통계 업데이트
-            s1_time_sum += s1_time
-            s2_time_sum += s2_time
-            s3_time_sum += s3_time
-            s1_tflops_sum += s1_tflops
-            s2_tflops_sum += s2_tflops
-                
-            # 성능 로깅
-            total_time = s1_time + s2_time
-            if TFOPS_PROFILING:
-                total_tflops_this = s1_tflops + s2_tflops  # Stage3는 FLOPs 제외
-
-            #! ==================================================================
             #! [Visualization - After Time Measurement]
             #! ==================================================================
             
@@ -805,6 +810,21 @@ if __name__ == '__main__':
                     stage3_success=stage3_success
                 )
 
+            #! ==================================================================
+            #! [Common Processing]
+            #! ==================================================================
+            
+            # 공통 통계 업데이트
+            s1_time_sum += s1_time
+            s2_time_sum += s2_time
+            s3_time_sum += s3_time
+            s1_tflops_sum += s1_tflops
+            s2_tflops_sum += s2_tflops
+                
+            # 성능 로깅
+            total_time = s1_time + s2_time
+            if TFOPS_PROFILING:
+                total_tflops_this = s1_tflops + s2_tflops  # Stage3는 FLOPs 제외
 
             num_attention_crops = len(s1_crop_list)
             print(f"✂️  Attention Crops : {num_attention_crops}")
@@ -814,7 +834,7 @@ if __name__ == '__main__':
             print(f"{'✅ Success' if stage3_success else '❌🎯 Fail'}")
 
             #! ==================================================================
-            #! [End]
+            #! [Statistics & Logging]
             #! ==================================================================
 
             # data_source별 통계 업데이트
@@ -999,16 +1019,6 @@ if __name__ == '__main__':
         os.makedirs(results_csv_path, exist_ok=True)
         csv_file_path = os.path.join(results_csv_path, f"results_{task}.csv")
         
-        # CSV 헤더 정의
-        csv_headers = [
-            "method",
-            "resize_ratio", "region_threshold", "bbox_padding",
-            "total_samples", "crop_accuracy", "stage1_accuracy", "stage2_accuracy", "stage3_accuracy",
-            "avg_stage1_time", "avg_stage2_time", "avg_stage3_time", "avg_total_time",
-            "avg_stage1_tflops", "avg_stage2_tflops", "avg_total_tflops",
-            "timestamp"
-        ]
-        
         # CSV 데이터 행 생성
         import datetime
         csv_row = [
@@ -1045,6 +1055,18 @@ if __name__ == '__main__':
         
         print(f"📝 Results saved to CSV: {csv_file_path}")
 
+        # 전체 task 통계에 누적
+        total_samples += num_action
+        total_crop_success += crop_success_count
+        total_stage1_success += stage1_success_count
+        total_stage2_success += stage2_success_count
+        total_stage3_success += stage3_success_count
+        total_s1_time += s1_time_sum
+        total_s2_time += s2_time_sum
+        total_s3_time += s3_time_sum
+        total_s1_tflops += s1_tflops_sum
+        total_s2_tflops += s2_tflops_sum
+
         # 최종 결과 출력
         print("=" * 60)
         print(f"📊 Final Results for {task}:")
@@ -1059,3 +1081,72 @@ if __name__ == '__main__':
         print(f"Region Config: threshold={REGION_THRESHOLD}, padding={BBOX_PADDING}px, min_patches={MIN_PATCHES}")
         
         print("=" * 60)
+
+    print("\n📊 All Task Done!")
+
+    # 전체 결과 계산 및 저장
+    total_crop_success_rate = total_crop_success / total_samples
+    total_stage1_success_rate = total_stage1_success / total_samples
+    total_stage2_success_rate = total_stage2_success / total_samples
+    total_stage3_success_rate = total_stage3_success / total_samples
+    
+    # 전체 평균 시간
+    avg_s1_time = total_s1_time / total_samples
+    avg_s2_time = total_s2_time / total_samples
+    avg_s3_time = total_s3_time / total_samples
+    avg_total_time = (total_s1_time + total_s2_time + total_s3_time) / total_samples
+    
+    # 전체 평균 TFLOPS
+    avg_s1_tflops = total_s1_tflops / total_samples
+    avg_s2_tflops = total_s2_tflops / total_samples
+    avg_total_tflops = (total_s1_tflops + total_s2_tflops) / total_samples
+    
+    print(f"Total Sample num: {total_samples}")
+    print(f"Total Crop Success Rate: {total_crop_success_rate:.4f}")
+    print(f"Total Stage1 Success Rate: {total_stage1_success_rate:.4f}")
+    print(f"Total Stage2 Success Rate: {total_stage2_success_rate:.4f}")
+    print(f"Total Stage3 Success Rate: {total_stage3_success_rate:.4f}")
+    print(f"Total avg Stage1 time: {avg_s1_time:.4f}s")
+    print(f"Total avg Stage2 time: {avg_s2_time:.4f}s")
+    print(f"Total avg Stage3 time: {avg_s3_time:.4f}s")
+    print(f"Total avg All Stage time: {avg_total_time:.4f}s")
+    print(f"Total avg Stage1 TFLOPS: {avg_s1_tflops:.4f}")
+    print(f"Total avg Stage2 TFLOPS: {avg_s2_tflops:.4f}")
+    print(f"Total avg All Stage TFLOPS: {avg_total_tflops:.4f}")
+    
+    # 전체 결과를 CSV로 저장
+    cumulative_csv_path = os.path.join("../_results", "results_all.csv")
+    
+    # 전체 결과 CSV 행 생성
+    cumulative_csv_row = [
+        method,
+        RESIZE_RATIO, REGION_THRESHOLD, BBOX_PADDING,
+        total_samples,
+        round(total_crop_success_rate * 100, 2),
+        round(total_stage1_success_rate * 100, 2),
+        round(total_stage2_success_rate * 100, 2),
+        round(total_stage3_success_rate * 100, 2),
+        round(avg_s1_time, 4),
+        round(avg_s2_time, 4),
+        round(avg_s3_time, 4),
+        round(avg_total_time, 4),
+        round(avg_s1_tflops, 2),
+        round(avg_s2_tflops, 2),
+        round(avg_total_tflops, 2),
+        datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    ]
+    
+    # CSV 파일이 없으면 헤더와 함께 생성, 있으면 데이터 행만 추가
+    file_exists = os.path.exists(cumulative_csv_path)
+    
+    with open(cumulative_csv_path, 'a', newline='', encoding='utf-8') as csvfile:
+        writer = csv.writer(csvfile)
+        
+        # 파일이 없거나 비어있으면 헤더 추가
+        if not file_exists or os.path.getsize(cumulative_csv_path) == 0:
+            writer.writerow(csv_headers)
+        
+        # 전체 결과 행 추가
+        writer.writerow(cumulative_csv_row)
+
+    print(f"📝 Total Results : {cumulative_csv_path}")
