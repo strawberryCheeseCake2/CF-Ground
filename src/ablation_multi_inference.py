@@ -16,7 +16,6 @@ os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu)  # 몇번 GPU 사용할지 ar
 ATTN_IMPL = "eager"  # attention implement "eager" "sdpa" "flash" "efficient"
 
 # Image Resize Ratios
-
 MIN_RESIZE = args.r[0] if args.r else 0.50  # DYNAMIC_RESIZE 비율 최소값
 MAX_RESIZE = args.r[1] if args.r else 0.50  # DYNAMIC_RESIZE 비율 최대값
 
@@ -60,7 +59,7 @@ SAMPLE_RANGE = slice(None)
 VISUALIZE = args.v if args.v else False
 VIS_ONLY_WRONG = False  # True면 틀린 것만 시각화, False면 모든 것 시각화
 TFOPS_PROFILING = True
-MEMORY_EVAL = True
+MEMORY_EVAL = False
 MEMORY_VIS = False
 
 # Save Path
@@ -138,15 +137,10 @@ def create_conversation_stage1(image, instruction, resize_ratio):
             "content": [
                 {
                     "type": "text",
-                    # "text": (
-                    #     "You are a GUI agent. Given a screenshot of the current GUI and a human instruction, "
-                    #     "your task is to locate the screen element that corresponds to the instruction. "
-                    #     "You should output a PyAutoGUI action that performs a click on the correct position. "
-                    #     "To indicate the click location, we will use some special tokens, which is used to refer to a visual patch later. "
-                    #     "For example, you can output: pyautogui.click(<your_special_token_here>)."
-                    # ),
                     "text": (
+                        # 추가 content
                         f"This is a resized screenshot of the whole GUI, scaled by {resize_ratio}. "
+                        # 기존 content
                         "You are a GUI agent. Given a screenshot of the current GUI and a human instruction, "
                         "your task is to locate the screen element that corresponds to the instruction. "
                         "You should output a PyAutoGUI action that performs a click on the correct position. "
@@ -172,24 +166,25 @@ def create_conversation_stage1(image, instruction, resize_ratio):
     ]
     return conversation
 
-def create_conversation_stage2(image, instruction, crop_cnt):
+def create_conversation_stage2(crop_list, instruction):
+    user_content = []
+    for crop in crop_list:
+        user_content.append({"type": "image", "image": crop["img"]})
+    user_content.append({
+        "type": "text",
+        "text": instruction,
+    })
     conversation = [
         {
             "role": "system",
             "content": [
                 {
                     "type": "text",
-                    # "text": (
-                    #     "You are a GUI agent. Given a screenshot of the current GUI and a human instruction, "
-                    #     "your task is to locate the screen element that corresponds to the instruction. "
-                    #     "You should output a PyAutoGUI action that performs a click on the correct position. "
-                    #     "To indicate the click location, we will use some special tokens, which is used to refer to a visual patch later. "
-                    #     "For example, you can output: pyautogui.click(<your_special_token_here>)."
-                    # ),
                     "text": (
-                        f"This image is a vertical collage of {crop_cnt} cropped regions that were selected as promising. "
-                        "Each crop has the same width and fixed height, separated by a red horizontal line. "
-                        "You are a GUI agent. Given this collage image and a human instruction, "
+                        # 추가 content
+                        f"This is a list of {len(crop_list)} cropped screenshots of the GUI, each showing a part of the GUI. "
+                        # 기존 content
+                        "You are a GUI agent. Given a screenshot of the current GUI and a human instruction, "
                         "your task is to locate the screen element that corresponds to the instruction. "
                         "You should output a PyAutoGUI action that performs a click on the correct position. "
                         "To indicate the click location, we will use some special tokens, which is used to refer to a visual patch later. "
@@ -200,16 +195,7 @@ def create_conversation_stage2(image, instruction, crop_cnt):
         },
         {
             "role": "user",
-            "content": [
-                {
-                    "type": "image",
-                    "image": image,
-                },
-                {
-                    "type": "text",
-                    "text": instruction,
-                }
-            ],
+            "content": user_content,
         },
     ]
     return conversation
@@ -304,7 +290,7 @@ def find_attention_peaks(pred_result, resized_image, resize_ratio):
             x_distance = abs(bbox_center_x - used_center[0])
             y_distance = abs(bbox_center_y - used_center[1])
             # bbox 중심점이 너무 가까우면 스킵 (크롭 크기의 30% 이내)
-            if x_distance < CROP_WIDTH * 0.3 and y_distance < CROP_HEIGHT * 0.3:  #! 크롭
+            if x_distance < CROP_WIDTH * 0.3 and y_distance < CROP_HEIGHT * 0.3:  #! 크롭 중심점 사이 최소 거리
                 skip = True
                 break
         
@@ -338,7 +324,7 @@ def filter_by_threshold(peaks, threshold=0.7, max_crops=MAX_CROPS):
     if len(filtered_peaks) > max_crops:
         filtered_peaks = filtered_peaks[:max_crops]
     
-    print(f"🎯 Found {len(peaks)} peaks, filtered to {len(filtered_peaks)} (threshold: {threshold}, max_crops: {max_crops})")
+    print(f"🎯 Stage 1: Found {len(peaks)} peaks, filtered to {len(filtered_peaks)} (threshold: {threshold}, max_crops: {max_crops})")
     
     return filtered_peaks
 
@@ -386,111 +372,11 @@ def create_crops_from_attention_peaks(peaks, original_image, resize_ratio):
     
     return crops
 
-def create_merged_image_for_stage2(crops):
-    """Stage 2용: crop들을 세로로 합치기 (빨간색 구분선 이미지로 분리) - bbox y좌표 순으로 정렬"""
-
-    if not crops:
-        return None, []
-    
-    # bbox의 y좌표(top) 순으로 정렬 (위에서 아래로)
-    sorted_crops = sorted(crops, key=lambda crop: crop['bbox'][1])
-    
-    # 세로로 합칠 이미지들과 구분선들을 별도로 준비
-    separator_height = 28  # 빨간색 구분선 두께
-    max_width = max(crop['img'].width for crop in sorted_crops)
-    
-    # 합칠 이미지들 리스트 (crop 이미지 + 구분선 이미지들)
-    images_to_merge = []
-    crop_y_mappings = []
-    current_y = 0
-    
-    for i, crop in enumerate(sorted_crops):
-        # crop 이미지 추가
-        images_to_merge.append(crop['img'])
-        
-        # 매핑 정보 저장: (merged_y_start, merged_y_end) -> (original_bbox)
-        paste_x = (max_width - crop['img'].width) // 2
-        crop_y_mappings.append({
-            'merged_y_start': current_y,
-            'merged_y_end': current_y + crop['img'].height,
-            'original_bbox': crop['bbox'],
-            'paste_x': paste_x
-        })
-        
-        current_y += crop['img'].height
-        
-        # 마지막이 아니면 빨간색 구분선 이미지 추가
-        if i < len(sorted_crops) - 1:
-            separator_img = Image.new('RGB', (max_width, separator_height), color=(256, 0, 0))
-            images_to_merge.append(separator_img)
-            current_y += separator_height
-    
-    # 총 높이 계산
-    total_height = current_y
-    
-    # 합쳐진 이미지 생성
-    merged_img = Image.new('RGB', (max_width, total_height), color=(0, 0, 0))
-    
-    # 이미지들을 순서대로 붙이기
-    paste_y = 0
-    image_idx = 0
-    
-    for i, crop in enumerate(sorted_crops):
-        # crop 이미지 붙이기 (중앙 정렬)
-        crop_img = images_to_merge[image_idx]
-        paste_x = (max_width - crop_img.width) // 2
-        merged_img.paste(crop_img, (paste_x, paste_y))
-        paste_y += crop_img.height
-        image_idx += 1
-        
-        # 구분선 이미지 붙이기 (마지막이 아닌 경우)
-        if i < len(sorted_crops) - 1:
-            separator_img = images_to_merge[image_idx]
-            merged_img.paste(separator_img, (0, paste_y))
-            paste_y += separator_img.height
-            image_idx += 1
-    
-    return merged_img, crop_y_mappings
-
-
-def create_multi_image_msgs(crop_list, instruction):
-    user_content = []
-    for crop in crop_list:
-        img = crop["img"]  # "resized_img" -> "img" 수정
-        user_content.append({"type": "image", "image": img})
-
-    user_content.append({
-        "type": "text",
-        "text": instruction,
-    })
-    conversation = [
-        {
-            "role": "system",
-            "content": [
-                {
-                    "type": "text",
-                    "text": (
-                        "You are a GUI agent. Given a screenshot of the current GUI and a human instruction, "
-                        "your task is to locate the screen element that corresponds to the instruction. "
-                        "You should output a PyAutoGUI action that performs a click on the correct position. "
-                        "To indicate the click location, we will use some special tokens, which is used to refer to a visual patch later. "
-                        "For example, you can output: pyautogui.click(<your_special_token_here>)."
-                    ),
-                }
-            ]
-        },
-        {
-            "role": "user",
-            "content": user_content,
-        },
-    ]
-    return conversation
-
 def run_stage2_multi_image_inference(crop_list, instruction):
     """Stage 2: multi image inference - 각 crop별로 개별 inference"""
     
     # multi image inference용 대화 생성
-    conversation = create_multi_image_msgs(crop_list, instruction)
+    conversation = create_conversation_stage2(crop_list, instruction)
     
     # multi image inference 실행 (각 이미지별 결과 반환)
     pred = multi_image_inference(conversation, model, tokenizer, processor, use_placeholder=True, topk=10)
@@ -498,10 +384,7 @@ def run_stage2_multi_image_inference(crop_list, instruction):
     return pred
 
 def convert_multi_image_results_to_original(multi_pred, crop_list):
-    """multi_image_inference 결과를 원본 이미지 좌표로 변환하고 앙상블"""
-    
-    if not multi_pred.get('per_image') or not crop_list:
-        return None, []
+    """multi_image_inference 결과를 원본 이미지 좌표로 변환"""
     
     # 각 crop별 결과를 원본 좌표로 변환
     converted_results = []
@@ -543,76 +426,11 @@ def convert_multi_image_results_to_original(multi_pred, crop_list):
             'candidates': crop_candidates
         })
     
-    # 모든 후보들을 점수순으로 정렬하여 최종 앙상블 결과 생성
+    # 모든 후보들을 점수순으로 정렬
     all_candidates.sort(key=lambda x: x['score'], reverse=True)
+    print(f"🎯 Stage 2: Collected {len(all_candidates)} candidates from {len(crop_list)} crops.")
     
-    # 최고 점수 후보를 최종 예측으로 선택
-    best_candidate = all_candidates[0] if all_candidates else None
-    
-    return best_candidate, all_candidates
-
-def create_stage2_attention_to_original_multi(multi_pred, crop_list, original_size):
-    """multi_image_inference 결과로부터 원본 이미지 크기의 어텐션 맵 생성"""
-    
-    if not multi_pred.get('per_image') or not crop_list:
-        return None
-    
-    orig_w, orig_h = original_size
-    stage2_attention_map = np.zeros((orig_h, orig_w), dtype=np.float32)
-    overlap_count_map = np.zeros((orig_h, orig_w), dtype=np.int32)
-    
-    # 각 crop의 상위 100개 패치를 원본 이미지에 매핑
-    for img_idx, img_result in enumerate(multi_pred['per_image']):
-        if img_idx >= len(crop_list):
-            continue
-            
-        crop_info = crop_list[img_idx]
-        crop_bbox = crop_info['bbox']  # [left, top, right, bottom]
-        crop_width = crop_bbox[2] - crop_bbox[0]
-        crop_height = crop_bbox[3] - crop_bbox[1]
-        
-        # 해당 이미지의 어텐션 스코어와 그리드 정보
-        attn_scores = np.array(img_result['attn_scores'][0])
-        n_width = img_result['n_width']
-        n_height = img_result['n_height']
-        
-        # 상위 100개 패치 선택
-        top_indices = np.argsort(attn_scores)[-100:][::-1]  # 상위 100개
-        
-        for patch_idx in top_indices:
-            # 패치 좌표 계산 (crop 내에서)
-            patch_y = patch_idx // n_width
-            patch_x = patch_idx % n_width
-            
-            # 패치 중심점의 정규화된 좌표 (crop 내에서)
-            norm_x = (patch_x + 0.5) / n_width
-            norm_y = (patch_y + 0.5) / n_height
-            
-            # crop 내 픽셀 좌표로 변환
-            crop_pixel_x = norm_x * crop_width
-            crop_pixel_y = norm_y * crop_height
-            
-            # 원본 이미지 좌표로 변환
-            orig_pixel_x = crop_bbox[0] + crop_pixel_x
-            orig_pixel_y = crop_bbox[1] + crop_pixel_y
-            
-            # 원본 이미지 범위 내로 클리핑
-            orig_pixel_x = max(0, min(orig_w - 1, orig_pixel_x))
-            orig_pixel_y = max(0, min(orig_h - 1, orig_pixel_y))
-            
-            # 정수 좌표로 변환
-            x_int = int(orig_pixel_x)
-            y_int = int(orig_pixel_y)
-            
-            # 어텐션 스코어 누적 및 겹침 카운트
-            stage2_attention_map[y_int, x_int] += attn_scores[patch_idx]
-            overlap_count_map[y_int, x_int] += 1
-    
-    # 겹치는 부분은 겹치는 횟수로 나누어 가중평균 처리
-    valid_mask = overlap_count_map > 0
-    stage2_attention_map[valid_mask] = stage2_attention_map[valid_mask] / overlap_count_map[valid_mask]
-    
-    return stage2_attention_map
+    return all_candidates
 
 def run_stage1_attention_based(original_image, instruction, gt_bbox):
     """새로운 간단한 Stage 1: Attention 기반 crop 생성"""
@@ -817,9 +635,9 @@ if __name__ == '__main__':
                 instruction=instruction,
                 gt_bbox=original_bbox
             )
-            
-            s1_infence_end = time.time()
-            s1_time = s1_infence_end - s1_start
+
+            s1_end = time.time()
+            s1_time = s1_end - s1_start
 
             if TFOPS_PROFILING:
                 s1_tflops = prof.get_total_flops() / 1e12
@@ -859,8 +677,6 @@ if __name__ == '__main__':
             #! ==================================================================
             
             s2_tflops = 0.0
-            s2_pred = s2_corrected_point = None  # 시각화용 변수 초기화 (multi-image 방식)
-            stage2_success = False
 
             s2_inference_start = time.time()
             
@@ -871,16 +687,11 @@ if __name__ == '__main__':
             s2_pred = run_stage2_multi_image_inference(s1_crop_list, instruction)
 
             # Stage2 multi-image 결과를 원본 좌표로 변환
-            s2_best_candidate, s2_all_candidates = convert_multi_image_results_to_original(s2_pred, s1_crop_list)
+            s2_all_candidates = convert_multi_image_results_to_original(s2_pred, s1_crop_list)
             
             # Stage2 성공 여부 확인
-            if s2_best_candidate:
-                s2_corrected_point = s2_best_candidate['point']
-                stage2_success = point_in_bbox(s2_corrected_point, original_bbox)
-            else:
-                s2_corrected_point = [0, 0]
-                stage2_success = False
-
+            s2_corrected_point = s2_all_candidates[0]['point']  # 최고 점수 후보
+            stage2_success = point_in_bbox(s2_corrected_point, original_bbox)
 
             s2_inference_end = time.time()
             s2_time = s2_inference_end - s2_inference_start
@@ -899,45 +710,24 @@ if __name__ == '__main__':
             s3_ensemble_point = None
             stage3_success = False
             
-            # 크롭 면적이 원본 이미지 면적의 50%를 넘는지 확인
-            crop_area = CROP_WIDTH * CROP_HEIGHT
-            original_area = orig_w * orig_h
-            crop_area_ratio = crop_area / original_area
-            
             s3_start = time.time()
-            # Multi-image 앙상블 방법: Stage2 multi-image 결과와 해당 위치의 Stage1 점수 조합
             # Stage1 어텐션 정보
             s1_attn_scores = np.array(s1_pred['attn_scores'][0])
             s1_n_width = s1_pred['n_width']
             s1_n_height = s1_pred['n_height']
             s1_resize_ratio = s1_pred['resize_ratio']
             
-            # Stage1 attention 점수들 정규화 (1등 기준)
+            # Stage1 attention 최고점수 구하기
             s1_max_score = float(max(s1_attn_scores)) if len(s1_attn_scores) > 0 else 1.0
             
-            # Stage2에서 topk 후보들만 선별 (run_gui_actor와 동일)
-            if s2_all_candidates:
-                # 점수 상위 10개만 선택 (run_gui_actor의 topk=10과 동일)
-                s2_topk_candidates = sorted(s2_all_candidates, key=lambda x: x['score'], reverse=True)[:10]
-                s2_topk_scores = [candidate['score'] for candidate in s2_topk_candidates]
-                
-                # topk 점수들만으로 정규화 (run_gui_actor와 동일)
-                if s2_topk_scores:
-                    s2_max_score = max(s2_topk_scores)
-                    if s2_max_score > 0:
-                        s2_normalized_scores = [score / s2_max_score for score in s2_topk_scores]
-                    else:
-                        s2_normalized_scores = [0.0] * len(s2_topk_scores)
-                else:
-                    s2_normalized_scores = []
-            else:
-                s2_topk_candidates = []
-                s2_normalized_scores = []
-            
+            # Stage2에서 topk 후보 최고점수 구하기
+            s2_topk_scores = [candidate['score'] for candidate in s2_all_candidates]
+            s2_max_score = max(s2_topk_scores)
+
             # 각 Stage2 topk 점에 대해 앙상블 점수 계산
             ensemble_candidates = []
             
-            for i, candidate in enumerate(s2_topk_candidates):
+            for i, candidate in enumerate(s2_all_candidates):
                 s2_original_point = candidate['point']
                 
                 # 해당 점에서의 Stage1 점수 계산 (정규화된 값)
@@ -945,10 +735,10 @@ if __name__ == '__main__':
                     s2_original_point, s1_attn_scores, s1_n_width, s1_n_height, 
                     original_image.size, s1_resize_ratio
                 )
-                s1_score = s1_raw_score / s1_max_score if s1_max_score > 0 else 0.0
-                
-                # Stage2 점수는 정규화된 점수 사용 (run_gui_actor와 동일)
-                s2_score = s2_normalized_scores[i] if i < len(s2_normalized_scores) else 0.0
+
+                # 각 점수 최고점 기준으로 정규화
+                s1_score = s1_raw_score / s1_max_score
+                s2_score = candidate['score'] / s2_max_score
                 
                 # 앙상블 점수 계산
                 ensemble_score = STAGE1_ENSEMBLE_RATIO * s1_score + STAGE2_ENSEMBLE_RATIO * s2_score
@@ -964,26 +754,16 @@ if __name__ == '__main__':
                 })
             
             # 최고 점수를 가진 점 선택
-            if ensemble_candidates:
-                best_candidate = max(ensemble_candidates, key=lambda x: x['score'])
-                s3_ensemble_point = best_candidate['point']
-            else:
-                # Stage2 결과가 없으면 Stage1 결과를 사용
-                if s1_original_point:
-                    s3_ensemble_point = s1_original_point
-                else:
-                    s3_ensemble_point = [0, 0]
+            best_candidate = max(ensemble_candidates, key=lambda x: x['score'])
+            s3_ensemble_point = best_candidate['point']
 
             s3_end = time.time()
             s3_time = s3_end - s3_start
             
-            # 디버그 정보 출력 (상위 3개만) - run_gui_actor와 동일한 형태
-            if ensemble_candidates:
-                print(f"🎯 Stage3 Ensemble Candidates (Top 3):")
-                for i, candidate in enumerate(sorted(ensemble_candidates, key=lambda x: x['score'], reverse=True)[:3]):
-                    print(f"  Rank {i+1}: S2_rank={candidate['s2_rank']}, S1={candidate['s1_score']:.3f}, S2={candidate['s2_score']:.3f}, Ensemble={candidate['score']:.3f}")
-            else:
-                print(f"🎯 Stage3: No ensemble candidates, using Stage1 result")
+            # 디버그 정보 출력
+            print(f"🎯 Stage 3: Ensemble Candidates")
+            for i, candidate in enumerate(sorted(ensemble_candidates, key=lambda x: x['score'], reverse=True)):
+                print(f"        Rank {i+1}: S2_rank={candidate['s2_rank']}, S1={candidate['s1_score']:.3f}, S2={candidate['s2_score']:.3f}, Ensemble={candidate['score']:.3f}")
             
             # 시각화를 위해 후보들 저장
             s3_ensemble_candidates = ensemble_candidates
@@ -1015,7 +795,6 @@ if __name__ == '__main__':
             #! [Visualization - After Time Measurement]
             #! ==================================================================
             
-            # 시각화용 디렉토리 설정 (stage3 결과에 따라)
             if VISUALIZE and (not VIS_ONLY_WRONG or not stage3_success):
                 inst_dir_name = re.sub(r'\W+', '_', instruction).strip('_')
                 result_folder = "correct" if stage3_success else "incorrect"

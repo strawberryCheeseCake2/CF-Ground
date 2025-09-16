@@ -20,7 +20,7 @@ conda activate gui_actor
 - NVIDIA GPU
 ```bash
 pip install torch==2.5.1 torchvision==0.20.1 --index-url https://download.pytorch.org/whl/cu121
-pip install -r requirements_gui_actor.txt
+pip install -r env/requirements_gui_actor.txt
 ```
 - MAC OS
 ```bash
@@ -54,5 +54,5 @@ python run_gui_actor.py [gpu_num]
 
 ```bash
 cd src
-python run_gui_actor.py [gpu_num] --r [min resize ratio] [max resize ratio] --e [ensemble ratio] --v
+python run_gui_actor.py [gpu_num] --r [min resize ratio] [max resize ratio] --v
 ```
