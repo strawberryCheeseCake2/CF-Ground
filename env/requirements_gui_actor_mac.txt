@@ -1,4 +1,4 @@
-# pip install -r requirements_gui_agent_mac.txt
+# pip install -r requirements_gui_actor_mac.txt
 
 torch==2.5.1
 torchvision

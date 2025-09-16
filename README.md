@@ -20,11 +20,11 @@ conda activate gui_actor
 - NVIDIA GPU
 ```bash
 pip install torch==2.5.1 torchvision==0.20.1 --index-url https://download.pytorch.org/whl/cu121
-pip install -r requirements_gui_agent.txt
+pip install -r requirements_gui_actor.txt
 ```
 - MAC OS
 ```bash
-pip install -r env/requirements_gui_agent_mac.txt
+pip install -r env/requirements_gui_actor_mac.txt
 ```
 
 ## :minidisc: ScreenSpot_v2 Dataset Download
