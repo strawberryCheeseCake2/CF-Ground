@@ -44,15 +44,20 @@ cd ..
 
 ```bash
 cd src
-python run_gui_actor.py [gpu_num]
+python run_gui_actor.py [gpu]
 ```
 
 ### option
+## Command Line Arguments
+
+- `gpu` (int, default: 0): Specifies the GPU number to use for computation.
+- `--r` (float, default: 0.50): Sets the resize ratio for Stage 1 processing.
+- `--th` (float, default: 0.1): Defines the crop threshold for Stage 1.
+- `--p` (int, default: 0): Determines the crop padding for Stage 1.
+- `--v` (flag): If set, saves visualization images during processing.
 - `--v` : visulize on
-- `--r` : resize ratio
-- `--e` : ensamble ratio
 
 ```bash
 cd src
-python run_gui_actor.py [gpu_num] --r [min resize ratio] [max resize ratio] --v
+python run_gui_actor.py [gpu] --r [resize ratio] --th [crop threshold] --p [crop padding] --v
 ```

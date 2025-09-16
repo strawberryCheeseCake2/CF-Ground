@@ -3,22 +3,22 @@
 if [ "$1" == "0" ]; then
     # Stage 1 Resize ratio: 0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50
     for r in $(seq 0.20 0.05 0.50); do
-        python run_gui_actor.py $1 --r $r --th 0.03 --p 0
-        python run_gui_actor.py $1 --r $r --th 0.03 --p 10
-        python run_gui_actor.py $1 --r $r --th 0.03 --p 20
-        python run_gui_actor.py $1 --r $r --th 0.03 --p 30
-        python run_gui_actor.py $1 --r $r --th 0.03 --p 40
-        python run_gui_actor.py $1 --r $r --th 0.03 --p 50
+        python run_gui_actor.py $1 --r $r --th 0.15 --p 0
+        python run_gui_actor.py $1 --r $r --th 0.15 --p 10
+        python run_gui_actor.py $1 --r $r --th 0.15 --p 20
+        python run_gui_actor.py $1 --r $r --th 0.15 --p 30
+        python run_gui_actor.py $1 --r $r --th 0.15 --p 40
+        python run_gui_actor.py $1 --r $r --th 0.15 --p 50
     done
 
 elif [ "$1" == "1" ]; then
     for r in $(seq 0.20 0.05 0.50); do
-        python run_gui_actor.py $1 --r $r --th 0.05 --p 0
-        python run_gui_actor.py $1 --r $r --th 0.05 --p 10
-        python run_gui_actor.py $1 --r $r --th 0.05 --p 20
-        python run_gui_actor.py $1 --r $r --th 0.05 --p 30
-        python run_gui_actor.py $1 --r $r --th 0.05 --p 40
-        python run_gui_actor.py $1 --r $r --th 0.05 --p 50
+        python run_gui_actor.py $1 --r $r --th 0.12 --p 0
+        python run_gui_actor.py $1 --r $r --th 0.12 --p 10
+        python run_gui_actor.py $1 --r $r --th 0.12 --p 20
+        python run_gui_actor.py $1 --r $r --th 0.12 --p 30
+        python run_gui_actor.py $1 --r $r --th 0.12 --p 40
+        python run_gui_actor.py $1 --r $r --th 0.12 --p 50
     done
 
 elif [ "$1" == "2" ]; then

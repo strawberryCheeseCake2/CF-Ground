@@ -42,7 +42,7 @@ MAX_PIXELS = 3211264  # Process단에서 적용
 # csv에 기록할 method 이름
 method = "final_0917"
 
-memo = f"resize{RESIZE_RATIO:.2f}_region_thresh{REGION_THRESHOLD:.3f}_pad{BBOX_PADDING}"
+memo = f"resize{RESIZE_RATIO:.2f}_region_thresh{REGION_THRESHOLD:.2f}_pad{BBOX_PADDING}"
 
 #! Argument ==========================================================================================
 
