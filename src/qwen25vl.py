@@ -503,7 +503,9 @@ if __name__ == '__main__':
     )
     tokenizer = AutoTokenizer.from_pretrained(MLLM_PATH)
     processor = AutoProcessor.from_pretrained(MLLM_PATH, max_pixels=MAX_PIXELS)
-    prof = FlopsProfiler(model)
+    
+    if TFOPS_PROFILING:
+        prof = FlopsProfiler(model)
 
     warm_up_model(model, tokenizer, processor)
 
