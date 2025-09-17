@@ -2,22 +2,22 @@
 
 if [ "$1" == "0" ]; then
     for r in $(seq 0.30 0.10 0.80); do
-        python run_gui_actor.py $1 --r $r --th 0.12 --p 20
+        python run_gui_actor.py $1 --r $r --th 0.11 --p 20
     done
 
 elif [ "$1" == "1" ]; then
     for r in $(seq 0.30 0.10 0.80); do
-        python run_gui_actor.py $1 --r $r --th 0.12 --p 20
+        python run_gui_actor.py $1 --r $r --th 0.13 --p 20
     done
 
 elif [ "$1" == "2" ]; then
     for r in $(seq 0.30 0.10 0.80); do
-        python run_gui_actor.py $1 --r $r --th 0.12 --p 20
+        python run_gui_actor.py $1 --r $r --th 0.14 --p 20
     done
 
 elif [ "$1" == "3" ]; then
     for r in $(seq 0.30 0.10 0.80); do
-        python run_gui_actor.py $1 --r $r --th 0.12 --p 20
+        python run_gui_actor.py $1 --r $r --th 0.12 --p 25
     done
 
 else
