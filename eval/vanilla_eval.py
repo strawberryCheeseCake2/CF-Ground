@@ -1,6 +1,6 @@
 import os
 os.environ["CUDA_DEVICE_ORDER"]="PCI_BUS_ID"
-os.environ["CUDA_VISIBLE_DEVICES"]= "3"  # 몇번 GPU 사용할지 ("0,1", "2" 등)
+os.environ["CUDA_VISIBLE_DEVICES"] = "3"
 device_map = "balanced"
 
 import torch
@@ -8,11 +8,15 @@ import torch
 import json
 import argparse
 import time
+import csv
+import datetime
 from tqdm import tqdm
 from datasets import load_dataset
 from transformers import AutoProcessor, set_seed
 from PIL import Image
-# sys.path.append(os.path.dirname(os.path.abspath(os.path.dirname(__file__))))
+import sys
+
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from gui_actor.constants import chat_template
 from gui_actor.modeling import Qwen2VLForConditionalGenerationWithPointer
 from gui_actor.modeling_qwen25vl import Qwen2_5_VLForConditionalGenerationWithPointer
@@ -28,12 +32,15 @@ from deepspeed.profiling.flops_profiler import FlopsProfiler
 #!=================================================================================
 
 IMAGE_PATCH_SIZE =14
+
+RESIZE_RATIO=0.6
+
 MAX_PIXELS=3211264
 set_seed(0)
 SAVE_DIR = "../attn_output/vanilla_eval"
 
-PRED_PATH = "{save_dir}/{task}_{max_pixels}_preds.json"
-METRIC_PATH = "{save_dir}/{task}_{max_pixels}_metrics.txt"
+PRED_PATH = "{save_dir}/{task}_{resize_ratio}_preds.json"
+METRIC_PATH = "{save_dir}/{task}_{resize_ratio}_metrics.txt"
 
 TASKS = ["mobile", "web", "desktop"]
 # TASKS = ["mobile"]
@@ -44,14 +51,6 @@ TASKS = ["mobile", "web", "desktop"]
 
 def calc_acc(score_list):
     return sum(score_list) / len(score_list) if len(score_list) != 0 else 0
-
-def resize_image(image, resize_to_pixels=MAX_PIXELS):
-    image_width, image_height = image.size
-    if (resize_to_pixels is not None) and ((image_width * image_height) != resize_to_pixels):
-        resize_ratio = (resize_to_pixels / (image_width * image_height)) ** 0.5
-        image_width_resized, image_height_resized = int(image_width * resize_ratio), int(image_height * resize_ratio)
-        image = image.resize((image_width_resized, image_height_resized))
-    return image, image_width_resized, image_height_resized 
 
 def normalize_bbox(bbox_x1y1x2y2, img_width, img_height):
     # if bbox_x1y1x2y2 is not normalized to [0, 1], normalize it
@@ -86,7 +85,8 @@ def evaluate(model_name_or_path, model_type, use_placeholder, topk, task, device
         print(f"Loading model with Qwen2.5-VL backbone from {model_name_or_path}")
         model = Qwen2_5_VLForConditionalGenerationWithPointer.from_pretrained(
             model_name_or_path,
-            torch_dtype=torch.bfloat16,
+            # torch_dtype=torch.bfloat16,
+            torch_dtype="auto",
             # device_map=device_map,
             device_map="auto",
             attn_implementation="eager",
@@ -131,16 +131,32 @@ def evaluate(model_name_or_path, model_type, use_placeholder, topk, task, device
         original_image = Image.open(img_path).convert("RGB")
         w_orig, h_orig = original_image.size
 
-        img = deepcopy(original_image)
+        # 리사이즈 처리
+        if RESIZE_RATIO < 1.00:
+            print(f"Resized image from ({w_orig}, {h_orig})", end=" -> ")
+            w_resized, h_resized = int(w_orig * RESIZE_RATIO), int(h_orig * RESIZE_RATIO)
+            resized_image = original_image.resize((w_resized, h_resized))
+            print(f"({w_resized}, {h_resized}) (ratio: {RESIZE_RATIO})")
+            img = deepcopy(resized_image)
+        else:
+            img = deepcopy(original_image)
+            w_resized, h_resized = w_orig, h_orig
         
+        # GT bbox를 리사이즈 비율에 맞춰 조정
         gt_bbox = example["bbox"]
         gt_bbox = [gt_bbox[0], gt_bbox[1], gt_bbox[0] + gt_bbox[2], gt_bbox[1] + gt_bbox[3]]
+        
+        # GT bbox를 리사이즈된 좌표계로 변환
+        if RESIZE_RATIO < 1.00:
+            gt_bbox_resized = [coord * RESIZE_RATIO for coord in gt_bbox]
+        else:
+            gt_bbox_resized = gt_bbox.copy()
 
         ele = {
             "file_name": example["img_filename"],
             "data_type": example["data_type"],
             "instruction": example["instruction"],
-            "img_size": [w_orig, h_orig],
+            "img_size": [w_resized, h_resized],  # 리사이즈된 이미지 크기 사용
             "bbox_x1y1x2y2": example["bbox"],
             "hit_top1": 0,
             "overlap_top1": 0,
@@ -175,34 +191,6 @@ def evaluate(model_name_or_path, model_type, use_placeholder, topk, task, device
             },
         ]
 
-       
-
-        # resized_image를 이후 처리에 사용하도록 변경
-        conversation = [
-            {
-                "role": "system",
-                "content": [
-                    {
-                        "type": "text",
-                        "text": grounding_system_message,
-                    }
-                ]
-            },
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "image",
-                        "image": img,  # 조정된 이미지를 사용
-                    },
-                    {
-                        "type": "text",
-                        "text": example["instruction"]
-                    },
-                ],
-            },
-        ]
-
         #! =======================================================
         prof.reset_profile()
         #! =======================================================
@@ -223,14 +211,22 @@ def evaluate(model_name_or_path, model_type, use_placeholder, topk, task, device
         
         # compute the metrics
         px, py = topk_points[0]
-        px, py = px * w_orig, py * h_orig
-        # px *= w_resized
+        
+        # 예측 좌표를 원본 좌표계로 되돌리기
+        if RESIZE_RATIO < 1.00:
+            px_orig = px * w_resized / RESIZE_RATIO  # 리사이즈된 좌표를 원본 좌표로 변환
+            py_orig = py * h_resized / RESIZE_RATIO
+        else:
+            px_orig = px * w_orig
+            py_orig = py * h_orig
 
-        print(f"{px}, {py}")
-        print(gt_bbox)
-        x1, y1, x2, y2 = gt_bbox
+        print(f"Predicted (resized): ({px * w_resized}, {py * h_resized})")
+        print(f"Predicted (original): ({px_orig}, {py_orig})")
+        print(f"GT bbox (original): {gt_bbox}")
+        
+        x1, y1, x2, y2 = gt_bbox  # 원본 좌표계의 GT bbox 사용
 
-        if (x1 <= px <= x2) and (y1 <= py <= y2):
+        if (x1 <= px_orig <= x2) and (y1 <= py_orig <= y2):
             ele["hit_top1"] = 1
             ele["hit_topk"] = 1
             score_list.append(1)
@@ -241,17 +237,27 @@ def evaluate(model_name_or_path, model_type, use_placeholder, topk, task, device
             score_list.append(0)
         print(f"up2now: {calc_acc(score_list)}")
 
-        # w, h = example["image"].size
-        pred_bbox = [px - IMAGE_PATCH_SIZE / w_orig, py - IMAGE_PATCH_SIZE / h_orig, px + IMAGE_PATCH_SIZE / w_orig, py + IMAGE_PATCH_SIZE / h_orig]
+        # overlap 계산 (원본 좌표계 사용)
+        pred_bbox = [px_orig - IMAGE_PATCH_SIZE, py_orig - IMAGE_PATCH_SIZE, 
+                    px_orig + IMAGE_PATCH_SIZE, py_orig + IMAGE_PATCH_SIZE]
         if do_boxes_overlap(pred_bbox, gt_bbox):
             ele["overlap_top1"] = 1
             ele["overlap_topk"] = 1
 
+        # topk 평가 (원본 좌표계로 변환)
         for px, py in topk_points[1:]:
-            if (x1 <= px <= x2) and (y1 <= py <= y2):
+            if RESIZE_RATIO < 1.00:
+                px_orig_k = px * w_resized / RESIZE_RATIO
+                py_orig_k = py * h_resized / RESIZE_RATIO
+            else:
+                px_orig_k = px * w_orig
+                py_orig_k = py * h_orig
+                
+            if (x1 <= px_orig_k <= x2) and (y1 <= py_orig_k <= y2):
                 ele["hit_topk"] = 1
-            pred_bbox = [px - IMAGE_PATCH_SIZE / w_orig, py - IMAGE_PATCH_SIZE / h_orig, px + IMAGE_PATCH_SIZE / w_orig, py + IMAGE_PATCH_SIZE / h_orig]
-            if do_boxes_overlap(pred_bbox, gt_bbox):
+            pred_bbox_k = [px_orig_k - IMAGE_PATCH_SIZE, py_orig_k - IMAGE_PATCH_SIZE, 
+                          px_orig_k + IMAGE_PATCH_SIZE, py_orig_k + IMAGE_PATCH_SIZE]
+            if do_boxes_overlap(pred_bbox_k, gt_bbox):
                 ele["overlap_topk"] = 1
         elapsed = inference_end - inference_start
 
@@ -413,6 +419,11 @@ if __name__ == "__main__":
     args.model_name_or_path = "microsoft/GUI-Actor-3B-Qwen2.5-VL"
     args.model_type = "qwen25vl"
 
+    # 전체 task 통계 변수 초기화
+    total_samples = 0
+    total_correct = 0
+    total_time = 0.0
+    total_tflops = 0.0
 
     print(TASKS)
     for task in TASKS:
@@ -421,7 +432,7 @@ if __name__ == "__main__":
             os.makedirs(save_path, exist_ok=True)
 
         # pred_path = PRED_PATH.format(save_dir=SAVE_DIR, task=task, max_pixels=MAX_PIXELS)
-        metric_path = METRIC_PATH.format(save_dir=SAVE_DIR, task=task, max_pixels=MAX_PIXELS)
+        metric_path = METRIC_PATH.format(save_dir=SAVE_DIR, task=task, resize_ratio=RESIZE_RATIO)
    
     
         print(f"Evaluating {args.model_name_or_path}...")
@@ -441,4 +452,65 @@ if __name__ == "__main__":
             with open(metric_path, "w") as f:
                 f.write(metric_info)
             print(f"Saved metric to {metric_path}")
+        
+        # 전체 task 통계에 누적
+        task_samples = len(results)
+        task_correct = sum(1 for ex in results if ex.get("hit_top1", 0) == 1)
+        
+        total_samples += task_samples
+        total_correct += task_correct
+        total_time += time_mean * task_samples  # 총 시간으로 계산
+        total_tflops += tflops_mean * task_samples  # 총 TFLOPs로 계산
+        
+        print(f"Task {task} completed: {task_correct}/{task_samples} accuracy = {task_correct/task_samples*100:.2f}%")
+    
+    # 모든 task 완료 후 전체 결과 계산 및 CSV 저장
+    print("\n📊 All Tasks Completed!")
+    
+    # 전체 평균 계산
+    avg_accuracy = (total_correct / total_samples * 100) if total_samples > 0 else 0
+    avg_time = (total_time / total_samples) if total_samples > 0 else 0
+    avg_tflops = (total_tflops / total_samples) if total_samples > 0 else 0
+    
+    print(f"Total Results:")
+    print(f"Total Samples: {total_samples}")
+    print(f"Total Correct: {total_correct}")
+    print(f"Average Accuracy: {avg_accuracy:.2f}%")
+    print(f"Average Time: {avg_time:.4f}s")
+    print(f"Average TFLOPs: {avg_tflops:.2f}")
+    
+    # CSV로 저장
+    results_csv_path = "../_results"
+    os.makedirs(results_csv_path, exist_ok=True)
+    csv_file_path = os.path.join(results_csv_path, "results_vanilla_eval.csv")
+    
+    # CSV 헤더 정의
+    csv_headers = [
+        "resize_ratio", "avg_accuracy", "avg_time", "avg_tflops", "total_samples", "timestamp"
+    ]
+    
+    # CSV 데이터 행 생성
+    csv_row = [
+        RESIZE_RATIO,
+        round(avg_accuracy, 2),
+        round(avg_time, 4),
+        round(avg_tflops, 2),
+        total_samples,
+        datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    ]
+    
+    # CSV 파일이 없으면 헤더와 함께 생성, 있으면 데이터 행만 추가
+    file_exists = os.path.exists(csv_file_path)
+    
+    with open(csv_file_path, 'a', newline='', encoding='utf-8') as csvfile:
+        writer = csv.writer(csvfile)
+        
+        # 파일이 없거나 비어있으면 헤더 추가
+        if not file_exists or os.path.getsize(csv_file_path) == 0:
+            writer.writerow(csv_headers)
+        
+        # 결과 행 추가
+        writer.writerow(csv_row)
+    
+    print(f"📝 Results saved to CSV: {csv_file_path}")
         
