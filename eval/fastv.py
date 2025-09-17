@@ -1,6 +1,6 @@
 import os
 os.environ["CUDA_DEVICE_ORDER"]="PCI_BUS_ID"
-os.environ["CUDA_VISIBLE_DEVICES"]= "2"  # 몇번 GPU 사용할지 ("0,1", "2" 등)
+os.environ["CUDA_VISIBLE_DEVICES"]= "0"  # 몇번 GPU 사용할지 ("0,1", "2" 등)
 device_map = "balanced"
 max_memory = {
     0: "75GiB",
@@ -156,7 +156,7 @@ def evaluate(model_name_or_path, model_type, use_placeholder, topk, task, device
         mobile_num += 1
 
         filename = example["img_filename"]
-        img_path = os.path.join("../data/screenspotv2_imgs", filename)
+        img_path = os.path.join("../data/screenspotv2_image", filename)
         if not os.path.exists(img_path):
             print("img not found", flush=True)
             input()
