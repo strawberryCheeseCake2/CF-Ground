@@ -8,9 +8,10 @@ import argparse
 parser = argparse.ArgumentParser()
 parser.add_argument('gpu', type=int, default=0, help='GPU number')
 parser.add_argument('--r', type=float, default=0.50, help='Stage 1 Resize ratio')
-parser.add_argument('--th', type=float, default=0.1, help='Stage 1 Crop threshold')
-parser.add_argument('--p', type=int, default=0, help='Stage 1 Crop Padding')
+parser.add_argument('--th', type=float, default=0.12, help='Stage 1 Crop threshold')
+parser.add_argument('--p', type=int, default=20, help='Stage 1 Crop Padding')
 parser.add_argument('--v', action='store_true', help='Whether to save visualization images')
+parser.add_argument('--mac', action='store_true', help='Whether to run on Mac (MPS)')
 args = parser.parse_args()
 
 os.environ["CUDA_DEVICE_ORDER"]="PCI_BUS_ID"
@@ -278,7 +279,6 @@ def run_stage1_attention_inference(original_image, instruction):
     # 이미지 고정 리사이즈
     resize_ratio = RESIZE_RATIO
     resized_w, resized_h = int(orig_w * resize_ratio), int(orig_h * resize_ratio)
-    print(f"🔧 Resized image: {orig_w}x{orig_h} -> {resized_w}x{resized_h} (ratio: {resize_ratio:.3f})")
     
     # 리사이즈된 이미지로 inference
     resized_image = original_image.resize((resized_w, resized_h))
@@ -434,7 +434,6 @@ def run_stage1_attention_based(original_image, instruction, gt_bbox):
     """새로운 간단한 Stage 1: 연결된 영역 기반 crop 생성"""
     
     # 1. 리사이즈하고 inference
-    print("🔍 Stage 1: Running attention-based inference...")
     s1_pred, resized_image = run_stage1_attention_inference(original_image, instruction)
     
     # 2. GT bbox도 리사이즈 비율에 맞춰 조정
@@ -493,20 +492,15 @@ if __name__ == '__main__':
 
     set_seed(SEED)
 
-    # Model Import (NVIDIA CUDA)
+    # Model Import
+    device_map = "mps" if args.mac else "balanced"
+
     model = Qwen2_5_VLForConditionalGenerationWithPointer.from_pretrained(
         MLLM_PATH, torch_dtype="auto", attn_implementation=ATTN_IMPL,
-        device_map="balanced",
+        device_map=device_map,
         # max_memory=max_memory, 
         low_cpu_mem_usage=True
     )
-    # Model Import (Mac)
-    # model = Qwen2_5_VLForConditionalGenerationWithPointer.from_pretrained(
-    #     MLLM_PATH, torch_dtype="auto", attn_implementation=ATTN_IMPL,
-    #     device_map="mps", # Mac
-    #     # max_memory=max_memory, 
-    #     low_cpu_mem_usage=False
-    # )
     tokenizer = AutoTokenizer.from_pretrained(MLLM_PATH)
     processor = AutoProcessor.from_pretrained(MLLM_PATH, max_pixels=MAX_PIXELS)
     prof = FlopsProfiler(model)
@@ -827,6 +821,8 @@ if __name__ == '__main__':
                 total_tflops_this = s1_tflops + s2_tflops  # Stage3는 FLOPs 제외
 
             num_attention_crops = len(s1_crop_list)
+            print(f"Task: {task}")
+            print(f"🖼️ Image: {filename} {orig_w}x{orig_h} (Resize Ratio : {s1_pred['resize_ratio']})")
             print(f"✂️  Attention Crops : {num_attention_crops}")
             print(f"🕖 Times - S1: {s1_time:.2f}s | S2: {s2_time:.2f}s | Total: {total_time:.2f}s")
             if TFOPS_PROFILING:
