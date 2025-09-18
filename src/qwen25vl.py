@@ -8,7 +8,7 @@ import argparse
 parser = argparse.ArgumentParser()
 parser.add_argument('gpu', type=int, default=0, help='GPU number')
 parser.add_argument('--r', type=float, default=0.50, help='Stage 1 Resize ratio')
-parser.add_argument('--th', type=float, default=0.12, help='Stage 1 Crop threshold')
+parser.add_argument('--th', type=float, default=0.11, help='Stage 1 Crop threshold')
 parser.add_argument('--p', type=int, default=20, help='Stage 1 Crop Padding')
 parser.add_argument('--v', action='store_true', help='Whether to save visualization images')
 parser.add_argument('--mac', action='store_true', help='Whether to run on Mac (MPS)')
@@ -41,7 +41,7 @@ ENSEMBLE_TOP_PATCHES = 100                          # Stage2에서 앙상블에 
 MAX_PIXELS = 3211264  # Process단에서 적용
 
 # csv에 기록할 method 이름
-method = "final_0917"
+method = "qwen25vl"
 
 memo = f"resize{RESIZE_RATIO:.2f}_region_thresh{REGION_THRESHOLD:.2f}_pad{BBOX_PADDING}"
 
@@ -50,7 +50,7 @@ memo = f"resize{RESIZE_RATIO:.2f}_region_thresh{REGION_THRESHOLD:.2f}_pad{BBOX_P
 SEED = 0
 
 # Dataset & Model
-MLLM_PATH = "microsoft/GUI-Actor-3B-Qwen2.5-VL"
+MLLM_PATH = "Qwen/Qwen2.5-VL-3B-Instruct"
 SCREENSPOT_IMGS = "../data/screenspotv2_image"       # input image 경로
 SCREENSPOT_JSON = "../data"                          # input image json파일 경로
 TASKS = ["mobile", "web", "desktop"]
@@ -88,9 +88,13 @@ from transformers import AutoProcessor, AutoTokenizer, set_seed
 # Project-Local Modules
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from util.iter_logger import init_iter_logger, append_iter_log  # log csv 기록 파일
-from gui_actor.modeling_qwen25vl import Qwen2_5_VLForConditionalGenerationWithPointer
-from gui_actor.inference import inference
-from gui_actor.multi_image_inference import multi_image_inference
+# from gui_actor.modeling_qwen25vl import Qwen2_5_VLForConditionalGenerationWithPointer
+# from gui_actor.inference import inference
+# from gui_actor.multi_image_inference import multi_image_inference
+# Qwen2.5-VL base classes (Transformers)
+from transformers import Qwen2_5_VLForConditionalGeneration
+from qwen_vl_utils import process_vision_info
+
 from util.visualize_util import visualize_stage1_attention_crops, visualize_stage2_multi_attention, visualize_stage3_point_ensemble
 if TFOPS_PROFILING:
     from deepspeed.profiling.flops_profiler import FlopsProfiler
@@ -109,17 +113,201 @@ class NpEncoder(json.JSONEncoder):
             return bool(obj)
         return super(NpEncoder, self).default(obj)
 
-def warm_up_model(model, tokenizer, processor):
-    print("🏋️‍♂️ Warming up the model...")
-    dummy_instruction = "This is a dummy instruction for warm-up."
-    dummy_image = Image.new("RGB", (1000, 1000), color=(255, 255, 255))  # 1000x1000 흰색 이미지
-    dummy_msgs = create_conversation_stage1(image=dummy_image, instruction=dummy_instruction, resize_ratio=1.0)
+# def warm_up_model(model, tokenizer, processor):
+#     print("🏋️‍♂️ Warming up the model...")
+#     dummy_instruction = "This is a dummy instruction for warm-up."
+#     dummy_image = Image.new("RGB", (1000, 1000), color=(255, 255, 255))  # 1000x1000 흰색 이미지
+#     dummy_msgs = create_conversation_stage1(image=dummy_image, instruction=dummy_instruction, resize_ratio=1.0)
     
-    # 예열용 inference 실행
-    for _ in range(3):  # 3번 반복
-        with torch.no_grad():
-            _ = inference(dummy_msgs, model, tokenizer, processor, use_placeholder=True, topk=3)
+#     # 예열용 inference 실행
+#     for _ in range(3):  # 3번 반복
+#         with torch.no_grad():
+#             _ = inference(dummy_msgs, model, tokenizer, processor, use_placeholder=True, topk=3)
+#     print("🏋️‍♂️ Warm-up complete!")
+
+def warm_up_model(model, processor, device):
+    print("🏋️‍♂️ Warming up the model...")
+    dummy_instruction = "Say: ready."
+    dummy_image = Image.new("RGB", (640, 640), color=(255, 255, 255))
+    msgs = [
+        {"role": "user", "content": [
+            {"type": "image", "image": dummy_image},
+            {"type": "text",  "text": dummy_instruction},
+        ]}
+    ]
+    # Qwen 권장 전처리 흐름
+    text = processor.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
+    image_inputs, video_inputs = process_vision_info(msgs)
+    inputs = processor(text=[text], images=image_inputs, videos=video_inputs,
+                       padding=True, return_tensors="pt").to(device)
+    with torch.no_grad():
+        _ = model.generate(**inputs, max_new_tokens=8)
     print("🏋️‍♂️ Warm-up complete!")
+
+# === Qwen attention-forward 기반 Stage1 추론 유틸 ===
+def _find_vision_spans(input_ids_1d, processor):
+    vs = processor.tokenizer.convert_tokens_to_ids("<|vision_start|>")
+    ve = processor.tokenizer.convert_tokens_to_ids("<|vision_end|>")
+    ids = input_ids_1d.tolist()
+    spans, i = [], 0
+    while True:
+        try:
+            s = ids.index(vs, i) + 1
+            e = ids.index(ve, s)
+            spans.append((s, e))
+            i = e + 1
+        except ValueError:
+            break
+    return spans
+
+def _safe_grid_hw(processor, image_inputs, span_len):
+    img_proc_out = processor.image_processor(images=image_inputs)
+    grid = img_proc_out["image_grid_thw"]
+    if hasattr(grid, "ndim") and grid.ndim == 3:
+        grid = grid[0]  # (num_imgs, 3)
+    t, h, w = map(int, grid[0])
+    for h2, w2 in [(h//2, w//2), (h, w)]:
+        if t * h2 * w2 == span_len:
+            return t, h2, w2
+    # 마지막 안전장치: span_len 기준 근사 추정
+    hw = max(1, span_len // max(1, t))
+    s = int(np.sqrt(hw))
+    for d in range(8):
+        for h2, w2 in [(s+d, s+d), (s+d, max(1, s-d))]:
+            if t * h2 * w2 == span_len:
+                return t, h2, w2
+    return t, hw, 1
+
+def _aggregate_att_map(attn_out, span, query_indices, layer_range, t, h2, w2):
+    st, end = span
+    maps = []
+    for li in layer_range:
+        if li < 0 or li >= len(attn_out.attentions):
+            continue
+        layer_att = attn_out.attentions[li]  # (B, H, Q, K)
+        for q in query_indices:
+            vec = layer_att[0, :, q, st:end].mean(dim=0).to(torch.float32).cpu().numpy()
+            m = vec.reshape(t, h2, w2).mean(axis=0)  # 시간 축 평균
+            maps.append(m)
+    if not maps:
+        return np.zeros((h2, w2), dtype=np.float32)
+    return np.mean(maps, axis=0).astype(np.float32)
+
+def _get_query_indices_after_last_vision(input_ids_1d, processor, tail=8):
+    ve = processor.tokenizer.convert_tokens_to_ids("<|vision_end|>")
+    pos = (input_ids_1d == ve).nonzero(as_tuple=False).flatten().tolist()
+    if not pos:
+        return [int(input_ids_1d.shape[0]-1)]
+    last = int(pos[-1])
+    seq_len = int(input_ids_1d.shape[0])
+    tail_idxs = list(range(last + 1, seq_len))
+    return tail_idxs[-tail:] if tail_idxs else [seq_len - 1]
+
+def qwen_attn_inference(conversation, model, processor, *, topk=1, layer_start=20, layer_end=31):
+    # 1) 템플릿+전처리
+    text = processor.apply_chat_template(conversation, tokenize=False, add_generation_prompt=True)
+    image_inputs, video_inputs = process_vision_info(conversation)
+    inputs = processor(text=[text], images=image_inputs, videos=video_inputs,
+                       padding=True, return_tensors="pt").to(model.device)
+
+    # 2) 비전 토큰 구간과 패치 그리드 파악
+    spans = _find_vision_spans(inputs["input_ids"][0], processor)
+    if not spans:
+        raise RuntimeError("vision span not found in input_ids")
+    span = spans[0]
+    span_len = int(span[1] - span[0])
+    t, h2, w2 = _safe_grid_hw(processor, image_inputs, span_len)
+
+    # 3) forward(attention) → 어텐션맵 집계
+    with torch.no_grad():
+        out = model(**inputs, output_attentions=True)
+    qidx = _get_query_indices_after_last_vision(inputs["input_ids"][0], processor, tail=8)
+    layer_range = range(layer_start, layer_end + 1)
+    att = _aggregate_att_map(out, span, qidx, layer_range, t, h2, w2)  # (h2, w2)
+
+    # 4) 맵에서 top-k 포인트 뽑기
+    flat = att.reshape(-1)
+    k = max(0, min(topk, flat.size))
+    pts, vals = [], []
+    if k > 0 and np.isfinite(flat).any():
+        idx = np.argpartition(flat, -k)[-k:]
+        idx = idx[np.argsort(flat[idx])[::-1]]
+        vmax = float(flat[idx[0]]) if k > 0 else 1.0
+        for ii in idx:
+            r, c = divmod(int(ii), w2)
+            x = (c + 0.5) / w2
+            y = (r + 0.5) / h2
+            pts.append((float(x), float(y)))
+            vals.append(float(flat[ii] / (vmax + 1e-8)))
+
+    # 5) GUI-Actor가 기대하는 키로 반환
+    return {
+        "n_width":  w2,
+        "n_height": h2,
+        "attn_scores": [att.flatten().tolist()],
+        "topk_points": pts,     # 정규화 좌표
+        "topk_values": vals,    # 정규화 점수(최대 1.0)
+    }
+
+def qwen_attn_multi_image_inference(
+    conversation, model, processor, *, topk=10, layer_start=20, layer_end=31
+):
+    # 템플릿/전처리
+    text = processor.apply_chat_template(conversation, tokenize=False, add_generation_prompt=True)
+    image_inputs, video_inputs = process_vision_info(conversation)
+    inputs = processor(text=[text], images=image_inputs, videos=video_inputs,
+                       padding=True, return_tensors="pt").to(model.device)
+
+    # 이미지별 비전 스팬
+    spans = _find_vision_spans(inputs["input_ids"][0], processor)
+    if not spans:
+        raise RuntimeError("vision span not found")
+
+    # 그리드 후보
+    img_proc_out = processor.image_processor(images=image_inputs)
+    grid = img_proc_out["image_grid_thw"]
+    if hasattr(grid, "ndim") and grid.ndim == 3:
+        grid = grid[0]  # (num_imgs,3)
+
+    with torch.no_grad():
+        out = model(**inputs, output_attentions=True)
+
+    qidx = _get_query_indices_after_last_vision(inputs["input_ids"][0], processor, tail=8)
+    layer_range = range(layer_start, layer_end + 1)
+
+    per_image = []
+    for i, span in enumerate(spans):
+        span_len = int(span[1] - span[0])
+        t, h, w = map(int, grid[i])
+        h2, w2 = int(h // 2), int(w // 2)
+        if t * h2 * w2 != span_len:
+            t, h2, w2 = _safe_grid_hw(processor, [image_inputs[i]], span_len)
+
+        att = _aggregate_att_map(out, span, qidx, layer_range, t, h2, w2)  # (h2,w2)
+        flat = att.reshape(-1)
+        kk = max(0, min(topk, flat.size))
+
+        pts, vals = [], []
+        if kk > 0 and np.isfinite(flat).any():
+            idx = np.argpartition(flat, -kk)[-kk:]
+            idx = idx[np.argsort(flat[idx])[::-1]]
+            vmax = float(flat[idx[0]]) if kk > 0 else 1.0
+            for ii in idx:
+                r, c = divmod(int(ii), w2)
+                x = (c + 0.5) / w2
+                y = (r + 0.5) / h2
+                pts.append((float(x), float(y)))
+                vals.append(float(flat[ii] / (vmax + 1e-8)))
+
+        per_image.append({
+            "index": i,
+            "topk_points": pts,     # 정규화 좌표
+            "topk_values": vals,    # 맵 기준 상대 점수
+            # 필요하면 여기서 per-image 어텐션맵 자체도 반환 가능
+        })
+
+    return {"per_image": per_image}
+
 
 def create_conversation_stage1(image, instruction, resize_ratio):
     conversation = [
@@ -283,8 +471,15 @@ def run_stage1_attention_inference(original_image, instruction):
     # 리사이즈된 이미지로 inference
     resized_image = original_image.resize((resized_w, resized_h))
     conversation = create_conversation_stage1(resized_image, instruction, resize_ratio)
-    pred = inference(conversation, model, tokenizer, processor, use_placeholder=True, topk=1)
-    
+    #! =================== multi image inference ===================
+    pred = qwen_attn_inference(
+        conversation, model, processor,
+        topk=1,               # crop은 한 점 기준이면 1
+        layer_start=20,       # 필요 시 28~31로 더 좁혀도 됨
+        layer_end=31
+    )
+
+    #! =================== multi image inference ===================
     # 결과에 리사이즈 정보 추가
     pred['resize_ratio'] = resize_ratio
     pred['original_size'] = (orig_w, orig_h)
@@ -378,9 +573,18 @@ def run_stage2_multi_image_inference(crop_list, instruction):
     conversation = create_conversation_stage2(crop_list, instruction)
     
     # multi image inference 실행 (각 이미지별 결과 반환)
-    pred = multi_image_inference(conversation, model, tokenizer, processor, use_placeholder=True, topk=10)
+    # pred = multi_image_inference(conversation, model, tokenizer, processor, use_placeholder=True, topk=10)
     
+
+    pred = qwen_attn_multi_image_inference(
+        conversation, model, processor,
+        topk=10,            # 이미지당 포인트 개수
+        layer_start=20,     # 3B 기준 후반 레이어 권장
+        layer_end=31
+    )
+
     return pred
+
 
 def convert_multi_image_results_to_original(multi_pred, crop_list):
     """multi_image_inference 결과를 원본 이미지 좌표로 변환"""
@@ -493,13 +697,21 @@ if __name__ == '__main__':
     set_seed(SEED)
 
     # Model Import
-    device_map = "mps" if args.mac else "balanced"
+    # device_map = "mps" if args.mac else "balanced"
 
-    model = Qwen2_5_VLForConditionalGenerationWithPointer.from_pretrained(
-        MLLM_PATH, torch_dtype="auto", attn_implementation=ATTN_IMPL,
+    # model = Qwen2_5_VLForConditionalGenerationWithPointer.from_pretrained(
+    #     MLLM_PATH, torch_dtype="auto", attn_implementation=ATTN_IMPL,
+    #     device_map=device_map,
+    #     # max_memory=max_memory, 
+    #     low_cpu_mem_usage=True
+    # )
+    device_map = "mps" if args.mac else "auto"
+    model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+        MLLM_PATH,
+        torch_dtype="auto",
+        attn_implementation=ATTN_IMPL,
         device_map=device_map,
-        # max_memory=max_memory, 
-        low_cpu_mem_usage=True
+        low_cpu_mem_usage=True,
     )
     tokenizer = AutoTokenizer.from_pretrained(MLLM_PATH)
     processor = AutoProcessor.from_pretrained(MLLM_PATH, max_pixels=MAX_PIXELS)
@@ -507,7 +719,9 @@ if __name__ == '__main__':
     if TFOPS_PROFILING:
         prof = FlopsProfiler(model)
 
-    warm_up_model(model, tokenizer, processor)
+    # warm_up_model(model, tokenizer, processor)
+    device = "mps" if args.mac else "cuda" if torch.cuda.is_available() else "cpu"
+    warm_up_model(model, processor, device)
 
     if TFOPS_PROFILING:
         prof.start_profile()

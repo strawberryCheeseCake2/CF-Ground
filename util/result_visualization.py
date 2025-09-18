@@ -12,7 +12,7 @@ def load_and_process_data(csv_path):
     df = pd.read_csv(csv_path)
     
     # 필요한 열만 선택
-    columns_needed = ['resize_ratio', 'region_threshold', 'bbox_padding', 
+    columns_needed = ['method', 'resize_ratio', 'region_threshold', 'bbox_padding', 
                      'stage3_accuracy', 'avg_total_tflops']
     
     # 선택한 열이 모두 존재하는지 확인
@@ -26,11 +26,14 @@ def load_and_process_data(csv_path):
     df_filtered = df_filtered.dropna()
     
     #! resize_ratio 0.20과 0.25 데이터 제외 (이유: 너무 낮은 비율로 인해 왜곡된 결과 발생)
-    df_filtered = df_filtered[~df_filtered['resize_ratio'].isin([0.20, 0.25, 0.35, 0.45])]
+    df_filtered = df_filtered[~df_filtered['resize_ratio'].isin([0.35, 0.45])]
 
     # 제일 잘 나오는 값들만 남기기
-    df_filtered = df_filtered[df_filtered['region_threshold'].isin([0, 0.12])]
-    df_filtered = df_filtered[df_filtered['bbox_padding'].isin([0, 20])]
+    # df_filtered = df_filtered[df_filtered['region_threshold'].isin([0, 0.11, 0.12])]
+    # df_filtered = df_filtered[df_filtered['bbox_padding'].isin([0, 20])]
+
+    # vanilla 제외
+    df_filtered = df_filtered[~(df_filtered['method'] == 'vanilla') & ~(df_filtered['method'] == 'v2')]
     
     #! =========================================================================
 

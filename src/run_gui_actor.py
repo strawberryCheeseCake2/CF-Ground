@@ -41,7 +41,7 @@ ENSEMBLE_TOP_PATCHES = 100                          # Stage2에서 앙상블에 
 MAX_PIXELS = 3211264  # Process단에서 적용
 
 # csv에 기록할 method 이름
-method = "final_0917"
+method = "final_0918"
 
 memo = f"resize{RESIZE_RATIO:.2f}_region_thresh{REGION_THRESHOLD:.2f}_pad{BBOX_PADDING}"
 
