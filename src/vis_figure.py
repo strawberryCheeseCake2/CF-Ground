@@ -8,8 +8,8 @@ import argparse
 parser = argparse.ArgumentParser()
 parser.add_argument('gpu', type=int, default=0, help='GPU number')
 parser.add_argument('--r', type=float, default=0.50, help='Stage 1 Resize ratio')
-parser.add_argument('--th', type=float, default=0.12, help='Stage 1 Crop threshold')
-parser.add_argument('--p', type=int, default=20, help='Stage 1 Crop Padding')
+parser.add_argument('--th', type=float, default=0.11, help='Stage 1 Crop threshold')
+parser.add_argument('--p', type=int, default=0, help='Stage 1 Crop Padding')
 parser.add_argument('--v', action='store_true', help='Whether to save visualization images')
 parser.add_argument('--mac', action='store_true', help='Whether to run on Mac (MPS)')
 args = parser.parse_args()
@@ -38,10 +38,11 @@ STAGE2_ENSEMBLE_RATIO = 1 - STAGE1_ENSEMBLE_RATIO   # Stage2 crop 가중치
 ENSEMBLE_TOP_PATCHES = 100                          # Stage2에서 앙상블에 사용할 상위 패치 개수 (Qwen2.5VL용)
 
 # 최대 PIXELS 제한
-MAX_PIXELS = 3211264  # Process단에서 적용
+# MAX_PIXELS = 3211264  # Process단에서 적용
+MAX_PIXELS = 1280*28*28  # Process단에서 적용
 
 # csv에 기록할 method 이름
-method = "final_0918"
+method = "figure_vis_12802828"
 
 memo = f"resize{RESIZE_RATIO:.2f}_region_thresh{REGION_THRESHOLD:.2f}_pad{BBOX_PADDING}"
 
@@ -53,15 +54,16 @@ SEED = 0
 MLLM_PATH = "microsoft/GUI-Actor-3B-Qwen2.5-VL"
 SCREENSPOT_IMGS = "../data/screenspotv2_image"       # input image 경로
 SCREENSPOT_JSON = "../data"                          # input image json파일 경로
-TASKS = ["mobile", "web", "desktop"]
-SAMPLE_RANGE = slice(None)
+# TASKS = ["mobile", "web", "desktop"]
+TASKS = ["mobile"]
+# SAMPLE_RANGE = slice(None)
+SAMPLE_RANGE = slice(312,313)  # Main Figure
 
 # Visualize & Logging
-VISUALIZE = args.v if args.v else False
+VISUALIZE = True
 VIS_ONLY_WRONG = False                                # True면 틀린 것만 시각화, False면 모든 것 시각화
 TFOPS_PROFILING = True
 MEMORY_VIS = False
-
 # Save Path
 SAVE_DIR = f"../attn_output/" + method + "/" + memo
 
@@ -91,7 +93,7 @@ from util.iter_logger import init_iter_logger, append_iter_log  # log csv 기록
 from gui_actor.modeling_qwen25vl import Qwen2_5_VLForConditionalGenerationWithPointer
 from gui_actor.inference import inference
 from gui_actor.multi_image_inference import multi_image_inference
-from util.visualize_util import visualize_stage1_attention_crops, visualize_stage2_multi_attention, visualize_stage3_point_ensemble
+from util.visualize_figure_util import visualize_stage1_attention_crops, visualize_stage2_multi_attention, visualize_stage3_point_ensemble
 if TFOPS_PROFILING:
     from deepspeed.profiling.flops_profiler import FlopsProfiler
 
@@ -274,7 +276,7 @@ def get_connected_region_bboxes_from_scores(
 
 def run_stage1_attention_inference(original_image, instruction):
     """Stage 1: 리사이즈하고 inference"""
-
+    
     orig_w, orig_h = original_image.size
     # 이미지 고정 리사이즈
     resize_ratio = RESIZE_RATIO
@@ -345,6 +347,7 @@ def find_connected_regions(pred_result, resized_image, resize_ratio):
         })
     
     # 점수 합이 높은 순서로 정렬
+    # TODO: 점수 최고 패치 기준으로 정렬 비교
     connected_regions.sort(key=lambda x: x['score'], reverse=True)
     
     return connected_regions
@@ -507,7 +510,7 @@ if __name__ == '__main__':
     if TFOPS_PROFILING:
         prof = FlopsProfiler(model)
 
-    warm_up_model(model, tokenizer, processor)
+    # warm_up_model(model, tokenizer, processor)
 
     if TFOPS_PROFILING:
         prof.start_profile()

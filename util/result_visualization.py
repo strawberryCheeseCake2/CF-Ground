@@ -24,17 +24,19 @@ def load_and_process_data(csv_path):
     
     # NaN 값 제거
     df_filtered = df_filtered.dropna()
-    
-    #! resize_ratio 0.20과 0.25 데이터 제외 (이유: 너무 낮은 비율로 인해 왜곡된 결과 발생)
-    df_filtered = df_filtered[~df_filtered['resize_ratio'].isin([0.35, 0.45])]
 
     # 제일 잘 나오는 값들만 남기기
-    # df_filtered = df_filtered[df_filtered['region_threshold'].isin([0, 0.11, 0.12])]
-    # df_filtered = df_filtered[df_filtered['bbox_padding'].isin([0, 20])]
+    df_filtered = df_filtered[df_filtered['region_threshold'].isin([0, 0.12, 88, 99])]
+    # df_filtered = df_filtered[df_filtered['bbox_padding'].isin([20,30,40,50])]
+    df_filtered = df_filtered[df_filtered['bbox_padding'].isin([0])]
+
+    df_filtered = df_filtered[(df_filtered['method'] == 'vanilla') | (df_filtered['method'] == 'final_0918')]
 
     # vanilla 제외
-    df_filtered = df_filtered[~(df_filtered['method'] == 'vanilla') & ~(df_filtered['method'] == 'v2')]
-    
+    # df_filtered = df_filtered[~(df_filtered['method'] == 'vanilla') & ~(df_filtered['method'] == 'v2') & ~(df_filtered['method'] == 'stage1')]
+    # df_filtered = df_filtered[~(df_filtered['method'] == 'qwen25vl')]
+
+
     #! =========================================================================
 
     return df_filtered
