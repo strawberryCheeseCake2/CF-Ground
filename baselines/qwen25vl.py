@@ -1,6 +1,4 @@
-'''
-Final version
-'''
+# GUI-Actor-3B + GOLD
 
 import os
 import argparse
@@ -8,8 +6,9 @@ import argparse
 parser = argparse.ArgumentParser()
 parser.add_argument('gpu', type=int, default=0, help='GPU number')
 parser.add_argument('--r', type=float, default=0.50, help='Stage 1 Resize ratio')
-parser.add_argument('--th', type=float, default=0.11, help='Stage 1 Crop threshold')
-parser.add_argument('--p', type=int, default=20, help='Stage 1 Crop Padding')
+parser.add_argument('--th', type=float, default=0.12, help='Stage 1 Crop threshold')
+parser.add_argument('--p', type=int, default=0, help='Stage 1 Crop Padding')
+parser.add_argument('--e', type=float, default=0.7, help='Ensemble ratio for Stage 1 (0~1)')
 parser.add_argument('--v', action='store_true', help='Whether to save visualization images')
 parser.add_argument('--mac', action='store_true', help='Whether to run on Mac (MPS)')
 args = parser.parse_args()
@@ -25,45 +24,44 @@ ATTN_IMPL = "eager"                      # attention implement "eager" "sdpa" "f
 RESIZE_RATIO = args.r
 
 # Crop Limitations
-MAX_CROPS = 3  # 최대 crop 개수
+MAX_CROPS = 3  # Maximum number of crops
 
 # Connected Region Based Cropping
-REGION_THRESHOLD = args.th              # 연결된 영역 검출을 위한 임계값 (0~1)  # TODO: 0.1 ~ 0.5 중 최적 찾기
-MIN_PATCHES = 1                         # 최소 패치 수 (너무 작은 영역 제거)
-BBOX_PADDING = args.p                   # bbox 상하좌우로 확장할 픽셀  # TODO: 0 ~ 50 중 최적 찾기
+REGION_THRESHOLD = args.th              # Threshold for connected region detection (0~1)
+MIN_PATCHES = 1                         # Minimum number of patches (remove too small regions)
+BBOX_PADDING = args.p                   # Pixels to expand bbox in all directions
 
 # Ensemble Hyperparameters
-STAGE1_ENSEMBLE_RATIO = 0.50                        # Stage1 attention 가중치
+STAGE1_ENSEMBLE_RATIO = args.e                      # Stage1 attention 가중치
 STAGE2_ENSEMBLE_RATIO = 1 - STAGE1_ENSEMBLE_RATIO   # Stage2 crop 가중치
-ENSEMBLE_TOP_PATCHES = 100                          # Stage2에서 앙상블에 사용할 상위 패치 개수 (Qwen2.5VL용)
 
-# 최대 PIXELS 제한
-MAX_PIXELS = 3211264  # Process단에서 적용
+# Maximum PIXELS limit (applied at Process level)
+MAX_PIXELS = 3211264
+# MAX_PIXELS = 1280*28*28
 
-# csv에 기록할 method 이름
-method = "qwen25vl"
-
-memo = f"resize{RESIZE_RATIO:.2f}_region_thresh{REGION_THRESHOLD:.2f}_pad{BBOX_PADDING}"
+# Experiment name to record in csv
+model_name = "gui-actor-3B+GOLD"
+experiment = "visualize"
+parameter = f"resize{RESIZE_RATIO:.2f}_maxpixel{MAX_PIXELS}_ensemble{STAGE1_ENSEMBLE_RATIO:.2f}"
+SAVE_DIR = f"../../attn_output/" + f"{model_name}/" + f"{experiment}/" + parameter
 
 #! Argument ==========================================================================================
 
 SEED = 0
 
 # Dataset & Model
-MLLM_PATH = "Qwen/Qwen2.5-VL-3B-Instruct"
-SCREENSPOT_IMGS = "../data/screenspotv2_image"       # input image 경로
-SCREENSPOT_JSON = "../data"                          # input image json파일 경로
+MLLM_PATH = "microsoft/GUI-Actor-3B-Qwen2.5-VL"
+SCREENSPOT_IMGS = "../../data/screenspotv2_image"
+SCREENSPOT_JSON = "../../data"
 TASKS = ["mobile", "web", "desktop"]
 SAMPLE_RANGE = slice(None)
 
 # Visualize & Logging
 VISUALIZE = args.v if args.v else False
-VIS_ONLY_WRONG = False                                # True면 틀린 것만 시각화, False면 모든 것 시각화
+VIS_ONLY_WRONG = False
 TFOPS_PROFILING = True
 MEMORY_VIS = False
 
-# Save Path
-SAVE_DIR = f"../attn_output/" + method + "/" + memo
 
 #! ==================================================================================================
 
@@ -84,6 +82,7 @@ from PIL import Image
 from tqdm import tqdm
 import torch
 from transformers import AutoProcessor, AutoTokenizer, set_seed
+from scipy.ndimage import gaussian_filter
 
 # Project-Local Modules
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -95,9 +94,14 @@ from util.iter_logger import init_iter_logger, append_iter_log  # log csv 기록
 from transformers import Qwen2_5_VLForConditionalGeneration
 from qwen_vl_utils import process_vision_info
 
+import matplotlib.pyplot as plt
 from util.visualize_util import visualize_stage1_attention_crops, visualize_stage2_multi_attention, visualize_stage3_point_ensemble
+from util.visualize_util_qwen25vl import draw_points_on_image
 if TFOPS_PROFILING:
     from deepspeed.profiling.flops_profiler import FlopsProfiler
+
+
+
 
 #! ==============================================================================================
 
@@ -125,26 +129,107 @@ class NpEncoder(json.JSONEncoder):
 #             _ = inference(dummy_msgs, model, tokenizer, processor, use_placeholder=True, topk=3)
 #     print("🏋️‍♂️ Warm-up complete!")
 
-def warm_up_model(model, processor, device):
-    print("🏋️‍♂️ Warming up the model...")
-    dummy_instruction = "Say: ready."
-    dummy_image = Image.new("RGB", (640, 640), color=(255, 255, 255))
-    msgs = [
-        {"role": "user", "content": [
-            {"type": "image", "image": dummy_image},
-            {"type": "text",  "text": dummy_instruction},
-        ]}
-    ]
-    # Qwen 권장 전처리 흐름
-    text = processor.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
-    image_inputs, video_inputs = process_vision_info(msgs)
-    inputs = processor(text=[text], images=image_inputs, videos=video_inputs,
-                       padding=True, return_tensors="pt").to(device)
-    with torch.no_grad():
-        _ = model.generate(**inputs, max_new_tokens=8)
-    print("🏋️‍♂️ Warm-up complete!")
+# def warm_up_model(model, processor, device):
+#     print("🏋️‍♂️ Warming up the model...")
+#     dummy_instruction = "Say: ready."
+#     dummy_image = Image.new("RGB", (640, 640), color=(255, 255, 255))
+#     msgs = [
+#         {"role": "user", "content": [
+#             {"type": "image", "image": dummy_image},
+#             {"type": "text",  "text": dummy_instruction},
+#         ]}
+#     ]
+#     # Qwen 권장 전처리 흐름
+#     text = processor.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
+#     image_inputs, video_inputs = process_vision_info(msgs)
+#     inputs = processor(text=[text], images=image_inputs, videos=video_inputs,
+#                        padding=True, return_tensors="pt").to(device)
+#     with torch.no_grad():
+#         _ = model.generate(**inputs, max_new_tokens=8)
+#     print("🏋️‍♂️ Warm-up complete!")
 
 # === Qwen attention-forward 기반 Stage1 추론 유틸 ===
+
+
+
+
+def calculate_iou(box1, box2):
+    """ 좌표계에 유의해야함
+    두 개의 바운딩 박스 간의 Intersection over Union (IoU)를 계산합니다.
+
+    Args:
+        box1 (list): 첫 번째 바운딩 박스. 형식: [x1, y1, x2, y2]
+        box2 (list): 두 번째 바운딩 박스. 형식: [x1, y1, x2, y2]
+
+    Returns:
+        float: 0과 1 사이의 IoU 값.
+    """
+    # 교차 영역(intersection)의 좌표 계산
+    inter_x1 = max(box1[0], box2[0])
+    inter_y1 = max(box1[1], box2[1])
+    inter_x2 = min(box1[2], box2[2])
+    inter_y2 = min(box1[3], box2[3])
+
+    # 교차 영역의 너비와 높이 계산 (겹치지 않으면 0이 됨)
+    intersection_width = max(0, inter_x2 - inter_x1)
+    intersection_height = max(0, inter_y2 - inter_y1)
+
+    # 교차 영역의 넓이 계산
+    intersection_area = intersection_width * intersection_height
+
+    # 각 바운딩 박스의 넓이 계산
+    box1_area = (box1[2] - box1[0]) * (box1[3] - box1[1])
+    box2_area = (box2[2] - box2[0]) * (box2[3] - box2[1])
+
+    # 합집합(union) 영역의 넓이 계산
+    union_area = box1_area + box2_area - intersection_area
+
+    # IoU 계산 (0으로 나누는 경우 방지)
+    iou = intersection_area / union_area if union_area > 0 else 0.0
+    
+    return iou
+
+
+
+def calculate_iou_with_union_of_boxes(gt_box, pred_boxes):
+    """
+    하나의 정답 바운딩 박스와 여러 개의 예측 바운딩 박스들의 '합집합 영역' 간의 IoU를 계산합니다.
+    """
+    if not pred_boxes:
+        return 0.0
+    all_boxes = [gt_box] + pred_boxes
+    x_min = min(box[0] for box in all_boxes)
+    y_min = min(box[1] for box in all_boxes)
+    x_max = max(box[2] for box in all_boxes)
+    y_max = max(box[3] for box in all_boxes)
+    canvas_width = int(x_max - x_min)
+    canvas_height = int(y_max - y_min)
+    if canvas_width <= 0 or canvas_height <= 0:
+        return 0.0
+    gt_mask = np.zeros((canvas_height, canvas_width), dtype=np.uint8)
+    pred_mask = np.zeros((canvas_height, canvas_width), dtype=np.uint8)
+    gt_x1, gt_y1, gt_x2, gt_y2 = [int(c - offset) for c, offset in zip(gt_box, [x_min, y_min, x_min, y_min])]
+    gt_mask[gt_y1:gt_y2, gt_x1:gt_x2] = 1
+    for box in pred_boxes:
+        pred_x1, pred_y1, pred_x2, pred_y2 = [int(c - offset) for c, offset in zip(box, [x_min, y_min, x_min, y_min])]
+        pred_mask[pred_y1:pred_y2, pred_x1:pred_x2] = 1
+    intersection_area = np.sum(np.logical_and(gt_mask, pred_mask))
+    union_mask = np.logical_or(gt_mask, pred_mask)
+    union_area = np.sum(union_mask)
+    iou = intersection_area / union_area if union_area > 0 else 0.0
+    return iou
+
+
+
+
+
+
+
+
+
+
+
+
 def _find_vision_spans(input_ids_1d, processor):
     vs = processor.tokenizer.convert_tokens_to_ids("<|vision_start|>")
     ve = processor.tokenizer.convert_tokens_to_ids("<|vision_end|>")
@@ -160,23 +245,16 @@ def _find_vision_spans(input_ids_1d, processor):
             break
     return spans
 
-def _safe_grid_hw(processor, image_inputs, span_len):
+def get_h2w2(processor, image_inputs, span_len):
     img_proc_out = processor.image_processor(images=image_inputs)
     grid = img_proc_out["image_grid_thw"]
+    
     if hasattr(grid, "ndim") and grid.ndim == 3:
         grid = grid[0]  # (num_imgs, 3)
     t, h, w = map(int, grid[0])
-    for h2, w2 in [(h//2, w//2), (h, w)]:
-        if t * h2 * w2 == span_len:
-            return t, h2, w2
-    # 마지막 안전장치: span_len 기준 근사 추정
-    hw = max(1, span_len // max(1, t))
-    s = int(np.sqrt(hw))
-    for d in range(8):
-        for h2, w2 in [(s+d, s+d), (s+d, max(1, s-d))]:
-            if t * h2 * w2 == span_len:
-                return t, h2, w2
-    return t, hw, 1
+    h2, w2 = h // 2, w // 2
+    return t, h2, w2
+
 
 def _aggregate_att_map(attn_out, span, query_indices, layer_range, t, h2, w2):
     st, end = span
@@ -189,9 +267,8 @@ def _aggregate_att_map(attn_out, span, query_indices, layer_range, t, h2, w2):
             vec = layer_att[0, :, q, st:end].mean(dim=0).to(torch.float32).cpu().numpy()
             m = vec.reshape(t, h2, w2).mean(axis=0)  # 시간 축 평균
             maps.append(m)
-    if not maps:
-        return np.zeros((h2, w2), dtype=np.float32)
-    return np.mean(maps, axis=0).astype(np.float32)
+
+    return np.mean(maps, axis=0)
 
 def _get_query_indices_after_last_vision(input_ids_1d, processor, tail=8):
     ve = processor.tokenizer.convert_tokens_to_ids("<|vision_end|>")
@@ -203,7 +280,21 @@ def _get_query_indices_after_last_vision(input_ids_1d, processor, tail=8):
     tail_idxs = list(range(last + 1, seq_len))
     return tail_idxs[-tail:] if tail_idxs else [seq_len - 1]
 
-def qwen_attn_inference(conversation, model, processor, *, topk=1, layer_start=20, layer_end=31):
+
+def gaussian_blur_att(att: np.ndarray, sigma: float = 1.0, mode: str = "reflect"):
+    """
+    att: (H, W) numpy array
+    sigma: 가우시안 표준편차(픽셀 단위)
+    mode: 가장자리 패딩 방식
+    """
+    att_b = gaussian_filter(att.astype(np.float32), sigma=sigma, mode=mode)
+    # 필요 시 0~1 정규화
+    vmax = att_b.max()
+    if np.isfinite(vmax) and vmax > 0:
+        att_b = att_b / vmax
+    return att_b
+
+def qwen_attn_inference(conversation, model, processor, *, topk=1, layer_start=20, layer_end=31, vis_dir=None):
     # 1) 템플릿+전처리
     text = processor.apply_chat_template(conversation, tokenize=False, add_generation_prompt=True)
     image_inputs, video_inputs = process_vision_info(conversation)
@@ -216,7 +307,7 @@ def qwen_attn_inference(conversation, model, processor, *, topk=1, layer_start=2
         raise RuntimeError("vision span not found in input_ids")
     span = spans[0]
     span_len = int(span[1] - span[0])
-    t, h2, w2 = _safe_grid_hw(processor, image_inputs, span_len)
+    t, h2, w2 = get_h2w2(processor, image_inputs, span_len)
 
     # 3) forward(attention) → 어텐션맵 집계
     with torch.no_grad():
@@ -224,6 +315,15 @@ def qwen_attn_inference(conversation, model, processor, *, topk=1, layer_start=2
     qidx = _get_query_indices_after_last_vision(inputs["input_ids"][0], processor, tail=8)
     layer_range = range(layer_start, layer_end + 1)
     att = _aggregate_att_map(out, span, qidx, layer_range, t, h2, w2)  # (h2, w2)
+
+    if VISUALIZE and vis_dir:
+        num_imgs = 1
+        fig, axes = plt.subplots(1, num_imgs, figsize=(4*num_imgs, 4))
+        ax = axes
+        ax.set_title(conversation[1]["content"][1]["payload"])
+        im = ax.imshow(att, cmap="viridis", interpolation="nearest")
+        conversation[1]["content"][0]["image"].save(f"{vis_dir}/original.png")
+        fig.savefig(f"{vis_dir}/s1_att.png")
 
     # 4) 맵에서 top-k 포인트 뽑기
     flat = att.reshape(-1)
@@ -250,7 +350,7 @@ def qwen_attn_inference(conversation, model, processor, *, topk=1, layer_start=2
     }
 
 def qwen_attn_multi_image_inference(
-    conversation, model, processor, *, topk=10, layer_start=20, layer_end=31
+    conversation, model, processor, *, topk=10, layer_start=20, layer_end=31, vis_dir=None
 ):
     # 템플릿/전처리
     text = processor.apply_chat_template(conversation, tokenize=False, add_generation_prompt=True)
@@ -275,17 +375,32 @@ def qwen_attn_multi_image_inference(
     qidx = _get_query_indices_after_last_vision(inputs["input_ids"][0], processor, tail=8)
     layer_range = range(layer_start, layer_end + 1)
 
+    if VISUALIZE:
+      num_imgs = len(spans)
+      fig, axes = plt.subplots(1, num_imgs, figsize=(4*num_imgs, 4))
+
+
     per_image = []
     for i, span in enumerate(spans):
         span_len = int(span[1] - span[0])
         t, h, w = map(int, grid[i])
         h2, w2 = int(h // 2), int(w // 2)
-        if t * h2 * w2 != span_len:
-            t, h2, w2 = _safe_grid_hw(processor, [image_inputs[i]], span_len)
+        # if t * h2 * w2 != span_len:
+        #     t, h2, w2 = _safe_grid_hw(processor, [image_inputs[i]], span_len)
 
         att = _aggregate_att_map(out, span, qidx, layer_range, t, h2, w2)  # (h2,w2)
+
+        # sigma = max(0.5, min(h2, w2) / 20.0)
+        # att = gaussian_blur_att(att, sigma=sigma)
+
+        
+        
         flat = att.reshape(-1)
         kk = max(0, min(topk, flat.size))
+
+
+        
+            
 
         pts, vals = [], []
         if kk > 0 and np.isfinite(flat).any():
@@ -299,17 +414,32 @@ def qwen_attn_multi_image_inference(
                 pts.append((float(x), float(y)))
                 vals.append(float(flat[ii] / (vmax + 1e-8)))
 
+        if VISUALIZE and vis_dir:
+            ax = axes[i] if num_imgs>1 else axes
+            ax.set_title(f"crop_{i}")
+            im = ax.imshow(att, cmap="viridis", interpolation="nearest")
+            ax.axis("off")
+
+            raw_crop_img =  conversation[1]["content"][i]["image"]
+            point_vis = draw_points_on_image(raw_crop_img, pts, vals, color=(255, 0, 0))
+            point_vis.save(f"{vis_dir}/original_{i}.png")
+
         per_image.append({
             "index": i,
             "topk_points": pts,     # 정규화 좌표
             "topk_values": vals,    # 맵 기준 상대 점수
             # 필요하면 여기서 per-image 어텐션맵 자체도 반환 가능
         })
+    
+
+    if VISUALIZE and vis_dir:
+        fig.savefig(f"{vis_dir}/s2_att.png")
 
     return {"per_image": per_image}
 
 
 def create_conversation_stage1(image, instruction, resize_ratio):
+    
     conversation = [
         {
             "role": "system",
@@ -322,9 +452,10 @@ def create_conversation_stage1(image, instruction, resize_ratio):
                         # 기존 content
                         "You are a GUI agent. Given a screenshot of the current GUI and a human instruction, "
                         "your task is to locate the screen element that corresponds to the instruction. "
-                        "You should output a PyAutoGUI action that performs a click on the correct position. "
-                        "To indicate the click location, we will use some special tokens, which is used to refer to a visual patch later. "
-                        "For example, you can output: pyautogui.click(<your_special_token_here>)."
+                        
+                        # "You should output a PyAutoGUI action that performs a click on the correct position. "
+                        # "To indicate the click location, we will use some special tokens, which is used to refer to a visual patch later. "
+                        # "For example, you can output: pyautogui.click(<your_special_token_here>)."
                     ),
                 }
             ]
@@ -338,7 +469,8 @@ def create_conversation_stage1(image, instruction, resize_ratio):
                 },
                 {
                     "type": "text",
-                    "text": instruction,
+                    "text": f"Where should you tap to {instruction}?",
+                    "payload": instruction
                 }
             ],
         },
@@ -460,7 +592,7 @@ def get_connected_region_bboxes_from_scores(
     out.sort(key=lambda x: x["score_sum"], reverse=True)
     return out
 
-def run_stage1_attention_inference(original_image, instruction):
+def run_stage1_attention_inference(original_image, instruction, vis_dir=None):
     """Stage 1: 리사이즈하고 inference"""
 
     orig_w, orig_h = original_image.size
@@ -476,7 +608,8 @@ def run_stage1_attention_inference(original_image, instruction):
         conversation, model, processor,
         topk=1,               # crop은 한 점 기준이면 1
         layer_start=20,       # 필요 시 28~31로 더 좁혀도 됨
-        layer_end=31
+        layer_end=31,
+        vis_dir=s1_dir
     )
 
     #! =================== multi image inference ===================
@@ -566,7 +699,7 @@ def create_crops_from_connected_regions(regions, original_image):
     
     return crops
 
-def run_stage2_multi_image_inference(crop_list, instruction):
+def run_stage2_multi_image_inference(crop_list, instruction, vis_dir=None):
     """Stage 2: multi image inference - 각 crop별로 개별 inference"""
     
     # multi image inference용 대화 생성
@@ -580,7 +713,8 @@ def run_stage2_multi_image_inference(crop_list, instruction):
         conversation, model, processor,
         topk=10,            # 이미지당 포인트 개수
         layer_start=20,     # 3B 기준 후반 레이어 권장
-        layer_end=31
+        layer_end=31,
+        vis_dir=vis_dir
     )
 
     return pred
@@ -634,11 +768,11 @@ def convert_multi_image_results_to_original(multi_pred, crop_list):
     
     return all_candidates
 
-def run_stage1_attention_based(original_image, instruction, gt_bbox):
+def run_stage1_attention_based(original_image, instruction, gt_bbox, vis_dir=None):
     """새로운 간단한 Stage 1: 연결된 영역 기반 crop 생성"""
     
     # 1. 리사이즈하고 inference
-    s1_pred, resized_image = run_stage1_attention_inference(original_image, instruction)
+    s1_pred, resized_image = run_stage1_attention_inference(original_image, instruction, vis_dir)
     
     # 2. GT bbox도 리사이즈 비율에 맞춰 조정
     resize_ratio = s1_pred['resize_ratio']
@@ -653,6 +787,8 @@ def run_stage1_attention_based(original_image, instruction, gt_bbox):
     crops = create_crops_from_connected_regions(regions, original_image)
     
     num_crops = len(crops)
+
+
     
     return s1_pred, crops, num_crops, resized_image, scaled_gt_bbox
 
@@ -721,7 +857,7 @@ if __name__ == '__main__':
 
     # warm_up_model(model, tokenizer, processor)
     device = "mps" if args.mac else "cuda" if torch.cuda.is_available() else "cpu"
-    warm_up_model(model, processor, device)
+    # warm_up_model(model, processor, device)
 
     if TFOPS_PROFILING:
         prof.start_profile()
@@ -745,12 +881,14 @@ if __name__ == '__main__':
     total_s3_time = 0.0
     total_s1_tflops = 0.0
     total_s2_tflops = 0.0
+    total_iou_top1_sum = 0.0
+    total_iou_union_sum = 0.0
 
     # CSV 헤더 정의 (모든 task에서 공통 사용)
     csv_headers = [
         "method",
         "resize_ratio", "region_threshold", "bbox_padding",
-        "total_samples", "crop_accuracy", "stage1_accuracy", "stage2_accuracy", "stage3_accuracy",
+        "total_samples", "crop_accuracy", "avg_iou_top1", "avg_iou_union", "stage1_accuracy", "stage2_accuracy", "stage3_accuracy",
         "avg_stage1_time", "avg_stage2_time", "avg_stage3_time", "avg_total_time",
         "avg_stage1_tflops", "avg_stage2_tflops", "avg_total_tflops",
         "timestamp"
@@ -766,12 +904,14 @@ if __name__ == '__main__':
             headers=[  # 순서 그대로 들어감
                 "idx", "orig_w", "orig_h", "resize_ratio",
                 "num_crop", "crop_hit",
+                "iou_top1", "iou_union",
                 "s1_time", "s1_tflops", "s1_hit", 
                 "s2_time", "s2_tflops", "s2_hit", 
                 "s3_time", "s3_hit",
                 "total_time", "total_tflops",
                 "crop_acc_uptonow", "s1_acc_uptonow", "s2_acc_uptonow", "s3_acc_uptonow",
-                "filename", "instruction"
+                "filename", "instruction",
+                "iou"
             ],
             write_md=False, use_fsync=True, use_lock=True
         )
@@ -788,6 +928,8 @@ if __name__ == '__main__':
         s1_time_sum = s2_time_sum = s3_time_sum = 0.0
         s1_tflops_sum = s2_tflops_sum = 0.0
         crop_success_count = stage1_success_count = stage2_success_count = stage3_success_count = 0
+        iou_top1_sum = 0.0
+        iou_union_sum = 0.0
         
         # data_source별 통계 변수 초기화
         data_source_stats = {}
@@ -821,6 +963,18 @@ if __name__ == '__main__':
             # data_source 정보 추출 (없으면 "unknown"으로 기본값 설정)
             data_source = item.get("data_source", "unknown")
 
+
+            if VISUALIZE:
+                inst_dir_name = re.sub(r'\W+', '_', instruction).strip('_')
+                inst_dir = os.path.join(save_dir, "seg", filename_wo_ext, inst_dir_name)
+                s1_dir = os.path.join(inst_dir, "stage1") 
+                s2_dir = os.path.join(inst_dir, "stage2")
+                os.makedirs(s1_dir, exist_ok=True)
+                os.makedirs(s2_dir, exist_ok=True)
+            else:
+                inst_dir = s1_dir = s2_dir = None
+            print(s1_dir)
+
             #! ==================================================================
             #! Stage 1 | Attention-based Crop Generation
             #! ==================================================================
@@ -833,7 +987,8 @@ if __name__ == '__main__':
             s1_pred, s1_crop_list, num_crops, resized_image, scaled_gt_bbox = run_stage1_attention_based(
                 original_image=original_image,
                 instruction=instruction,
-                gt_bbox=original_bbox
+                gt_bbox=original_bbox,
+                vis_dir=s1_dir
             )
 
             s1_end = time.time()
@@ -875,6 +1030,22 @@ if __name__ == '__main__':
             if crop_success:
                 crop_success_count += 1
 
+            # IoU 계산
+            iou_top1 = 0.0
+            iou_union = 0.0
+            if s1_crop_list: # 크롭이 하나 이상 생성되었을 경우
+                # 1. 가장 점수가 높은 크롭 1개와 정답 bbox 간의 IoU
+                top1_crop_bbox = s1_crop_list[0]['bbox']
+                iou_top1 = calculate_iou(top1_crop_bbox, original_bbox)
+
+                # 2. 모든 크롭 리스트를 합친 영역과 정답 bbox 간의 IoU
+                all_crop_bboxes = [crop['bbox'] for crop in s1_crop_list]
+                iou_union = calculate_iou_with_union_of_boxes(original_bbox, all_crop_bboxes)
+            
+            # IoU 통계 누적
+            iou_top1_sum += iou_top1
+            iou_union_sum += iou_union
+
             #! ==================================================================
             #! [Stage 2] Crop Inference
             #! ==================================================================
@@ -886,7 +1057,7 @@ if __name__ == '__main__':
             s2_inference_start = time.time()
             
             # 멀티 이미지로 inference
-            s2_pred = run_stage2_multi_image_inference(s1_crop_list, instruction)
+            s2_pred = run_stage2_multi_image_inference(s1_crop_list, instruction, vis_dir=s2_dir)
 
             # Stage2 multi-image 결과를 원본 좌표로 변환
             s2_all_candidates = convert_multi_image_results_to_original(s2_pred, s1_crop_list)
@@ -1062,7 +1233,9 @@ if __name__ == '__main__':
                     'stage1_success_count': 0,
                     'crop_success_count': 0,
                     'stage2_success_count': 0,
-                    'stage3_success_count': 0
+                    'stage3_success_count': 0,
+                    'iou_top1_sum': 0.0,
+                    'iou_union_sum': 0.0
                 }
             
             stats = data_source_stats[data_source]
@@ -1082,6 +1255,8 @@ if __name__ == '__main__':
                 stats['stage2_success_count'] += 1
             if stage3_success:
                 stats['stage3_success_count'] += 1
+            stats['iou_top1_sum'] += iou_top1
+            stats['iou_union_sum'] += iou_union
 
             up2now_s1_score = stage1_success_count / num_action * 100
             up2now_crop_score = crop_success_count / num_action * 100
@@ -1100,6 +1275,8 @@ if __name__ == '__main__':
                 resize_ratio=s1_pred['resize_ratio'],
                 num_crop=num_attention_crops,
                 crop_hit=crop_hit,
+                iou_top1=f"{iou_top1:.4f}",
+                iou_union=f"{iou_union:.4f}",
                 s1_time=f"{s1_time:.3f}",
                 s1_tflops=f"{s1_tflops:.2f}",
                 s1_hit=s1_hit,
@@ -1128,6 +1305,8 @@ if __name__ == '__main__':
                 'data_source': data_source,
                 'num_crop': num_attention_crops,
                 'crop_success': crop_success,
+                'iou_top1': iou_top1,
+                'iou_union': iou_union,
                 'stage1_success': s1_success,
                 'stage2_success': stage2_success,
                 'stage3_success': stage3_success,
@@ -1163,6 +1342,8 @@ if __name__ == '__main__':
             "task": task,
             "total_samples": num_action,
             "crop_accuracy": crop_success_count / num_action * 100,
+            "avg_iou_top1": iou_top1_sum / num_action,
+            "avg_iou_union": iou_union_sum / num_action,
             "stage1_accuracy": stage1_success_count / num_action * 100,
             "stage2_accuracy": stage2_success_count / num_action * 100,
             "stage3_accuracy": stage3_success_count / num_action * 100,
@@ -1199,6 +1380,8 @@ if __name__ == '__main__':
                     "data_source": ds,
                     "total_samples": stats['num_action'],
                     "crop_accuracy": stats['crop_success_count'] / stats['num_action'] * 100,
+                    "avg_iou_top1": stats['iou_top1_sum'] / stats['num_action'],
+                    "avg_iou_union": stats['iou_union_sum'] / stats['num_action'],
                     "stage1_accuracy": stats['stage1_success_count'] / stats['num_action'] * 100,
                     "stage2_accuracy": stats['stage2_success_count'] / stats['num_action'] * 100,
                     "stage3_accuracy": stats['stage3_success_count'] / stats['num_action'] * 100,
@@ -1227,17 +1410,19 @@ if __name__ == '__main__':
             json.dump(data_source_metrics, dsf, ensure_ascii=False, indent=4)
 
         # 전체 결과를 CSV 파일에 한 줄 추가
-        results_csv_path = "../_results"
+        results_csv_path = "../../_results"
         os.makedirs(results_csv_path, exist_ok=True)
         csv_file_path = os.path.join(results_csv_path, f"results_{task}.csv")
         
         # CSV 데이터 행 생성
         import datetime
         csv_row = [
-            method,
+            model_name, experiment,
             RESIZE_RATIO, REGION_THRESHOLD, BBOX_PADDING,
             num_action, 
             round(metrics['crop_accuracy'], 2),
+            round(metrics['avg_iou_top1'], 4),
+            round(metrics['avg_iou_union'], 4),
             round(metrics['stage1_accuracy'], 2),
             round(metrics['stage2_accuracy'], 2), 
             round(metrics['stage3_accuracy'], 2),
@@ -1278,6 +1463,8 @@ if __name__ == '__main__':
         total_s3_time += s3_time_sum
         total_s1_tflops += s1_tflops_sum
         total_s2_tflops += s2_tflops_sum
+        total_iou_top1_sum += iou_top1_sum
+        total_iou_union_sum += iou_union_sum
 
         # 최종 결과 출력
         print("=" * 60)
@@ -1301,6 +1488,8 @@ if __name__ == '__main__':
     total_stage1_success_rate = total_stage1_success / total_samples
     total_stage2_success_rate = total_stage2_success / total_samples
     total_stage3_success_rate = total_stage3_success / total_samples
+    avg_iou_top1 = total_iou_top1_sum / total_samples
+    avg_iou_union = total_iou_union_sum / total_samples
     
     # 전체 평균 시간
     avg_s1_time = total_s1_time / total_samples
@@ -1327,14 +1516,16 @@ if __name__ == '__main__':
     print(f"Total avg All Stage TFLOPS: {avg_total_tflops:.4f}")
     
     # 전체 결과를 CSV로 저장
-    cumulative_csv_path = os.path.join("../_results", "results_all.csv")
+    cumulative_csv_path = os.path.join("../../_results", "results_all.csv")
     
     # 전체 결과 CSV 행 생성
     cumulative_csv_row = [
-        method,
+        model_name, experiment,
         RESIZE_RATIO, REGION_THRESHOLD, BBOX_PADDING,
         total_samples,
         round(total_crop_success_rate * 100, 2),
+        round(avg_iou_top1, 4),
+        round(avg_iou_union, 4),
         round(total_stage1_success_rate * 100, 2),
         round(total_stage2_success_rate * 100, 2),
         round(total_stage3_success_rate * 100, 2),

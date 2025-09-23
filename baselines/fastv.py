@@ -1,56 +1,81 @@
 import os
 os.environ["CUDA_DEVICE_ORDER"]="PCI_BUS_ID"
-os.environ["CUDA_VISIBLE_DEVICES"] = "3"
+os.environ["CUDA_VISIBLE_DEVICES"]= "0"  # 몇번 GPU 사용할지 ("0,1", "2" 등)
 device_map = "balanced"
+max_memory = {
+    0: "75GiB",
+    # 1: "75GiB",
+    # 2: "75GiB",
+    "cpu": "120GiB",  # 남는 건 CPU 오프로딩xs
+}
 
 import torch
-
+from copy import deepcopy
 import json
 import argparse
 import time
-import csv
-import datetime
+import sys
+
+from PIL import Image
 from tqdm import tqdm
 from datasets import load_dataset
-from transformers import AutoProcessor, set_seed
-from PIL import Image
-import sys
+from transformers import AutoProcessor, set_seed, GenerationConfig
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from gui_actor.constants import chat_template
 from gui_actor.modeling import Qwen2VLForConditionalGenerationWithPointer
-from gui_actor.modeling_qwen25vl import Qwen2_5_VLForConditionalGenerationWithPointer
-from gui_actor.inference import inference, ForceFollowTokensLogitsProcessor
+# from gui_actor.modeling_qwen25vl import Qwen2_5_VLForConditionalGenerationWithPointer
+from gui_actor.modeling_fastv import Qwen2_5_VLForConditionalGenerationWithPointer
+# from gui_actor.inference import inference, ForceFollowTokensLogitsProcessor
+from gui_actor.fastv_inference import inference, ForceFollowTokensLogitsProcessor
 from gui_actor.utils import do_boxes_overlap
 from gui_actor.constants import DEFAULT_POINTER_PAD_TOKEN, DEFAULT_POINTER_END_TOKEN
+from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import Qwen2_5_VLAttention, Qwen2_5_VLSdpaAttention
+from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import Qwen2_5_VLForConditionalGeneration
 
-from copy import deepcopy
+
+from deepspeed.profiling.flops_profiler import get_model_profile
+from deepspeed.profiling.flops_profiler import FlopsProfiler
+
 
 #!=================================================================================
+# from thop import profile  # FLOPs 측정
 import numpy as np
-from deepspeed.profiling.flops_profiler import FlopsProfiler
 #!=================================================================================
 
 IMAGE_PATCH_SIZE =14
+RATIO = 1.0
 
-RESIZE_RATIO=0.6
-
-MAX_PIXELS=3211264
 set_seed(0)
-SAVE_DIR = "../attn_output/vanilla_eval"
+# MAX_PIXELS = 3200 * 1800
+# MAX_PIXELS = 1920 * 1080
+MAX_PIXELS = 3211264
+# MAX_PIXELS = 1280 * 28 * 28
 
-PRED_PATH = "{save_dir}/{task}_{resize_ratio}_preds.json"
-METRIC_PATH = "{save_dir}/{task}_{resize_ratio}_metrics.txt"
+SAVE_DIR = "../../output/fastv"
+CALC_FLOPS = True
+
+# 버리는 비율
+FASTV_R = 0.5
+# FASTV_R = 0.7
+
+PRED_PATH = "{save_dir}/{FASTV_R}/{task}_{max_pixels}_preds.json"
+METRIC_PATH = "{save_dir}/{FASTV_R}/{task}_{max_pixels}_metrics.txt"
 
 TASKS = ["mobile", "web", "desktop"]
-# TASKS = ["mobile"]
-# TASKS = ["web"]
-# TASKS = ["desktop"]
 
 #!=================================================================================
 
-def calc_acc(score_list):
-    return sum(score_list) / len(score_list) if len(score_list) != 0 else 0
+
+def resize_image(image, resize_to_pixels=MAX_PIXELS):
+    image_width, image_height = image.size
+    if (resize_to_pixels is not None) and ((image_width * image_height) != resize_to_pixels):
+        resize_ratio = (resize_to_pixels / (image_width * image_height)) ** 0.5
+        image_width_resized, image_height_resized = int(image_width * resize_ratio), int(image_height * resize_ratio)
+        image = image.resize((image_width_resized, image_height_resized))
+    return image, image_width_resized, image_height_resized 
+
+#!=================================================================================
 
 def normalize_bbox(bbox_x1y1x2y2, img_width, img_height):
     # if bbox_x1y1x2y2 is not normalized to [0, 1], normalize it
@@ -64,7 +89,10 @@ def normalize_bbox(bbox_x1y1x2y2, img_width, img_height):
         y2 = y2 / img_height
         return x1, y1, x2, y2
 
-def evaluate(model_name_or_path, model_type, use_placeholder, topk, task, device_map):
+def calc_acc(score_list):
+    return sum(score_list) / len(score_list) if len(score_list) != 0 else 0
+
+def evaluate(model_name_or_path, model_type, use_placeholder, topk, task, device_map, max_memory=max_memory):
     # initialize model
     data_processor = AutoProcessor.from_pretrained(model_name_or_path, max_pixels=MAX_PIXELS)
     tokenizer = data_processor.tokenizer
@@ -77,7 +105,8 @@ def evaluate(model_name_or_path, model_type, use_placeholder, topk, task, device
             model_name_or_path,
             torch_dtype=torch.bfloat16,
             device_map=device_map,
-            attn_implementation="eager",
+            max_memory=max_memory,
+            attn_implementation="flash_attention_2",
             do_sample=False
         ).eval()
         grounding_system_message = "You are a GUI agent. You are given a task and a screenshot of the screen. You need to perform a series of pyautogui actions to complete the task."
@@ -85,11 +114,11 @@ def evaluate(model_name_or_path, model_type, use_placeholder, topk, task, device
         print(f"Loading model with Qwen2.5-VL backbone from {model_name_or_path}")
         model = Qwen2_5_VLForConditionalGenerationWithPointer.from_pretrained(
             model_name_or_path,
-            # torch_dtype=torch.bfloat16,
-            torch_dtype="auto",
+            torch_dtype=torch.bfloat16,
             # device_map=device_map,
             device_map="auto",
-            attn_implementation="eager",
+            max_memory=max_memory,
+            attn_implementation="eager",  #!
             do_sample=False
         ).eval()
         grounding_system_message = "You are a GUI agent. Given a screenshot of the current GUI and a human instruction, your task is to locate the screen element that corresponds to the instruction. You should output a PyAutoGUI action that performs a click on the correct position. To indicate the click location, we will use some special tokens, which is used to refer to a visual patch later. For example, you can output: pyautogui.click(<your_special_token_here>)."
@@ -103,66 +132,63 @@ def evaluate(model_name_or_path, model_type, use_placeholder, topk, task, device
             tokenizer.encode(DEFAULT_POINTER_END_TOKEN)[0]
         ]
     )
-
-    dataset = json.load(open(os.path.join("../data", f"screenspot_{task}_v2.json"), 'r'))
+    
+    
+    
+    dataset = json.load(open(os.path.join("../../data", f"screenspot_{task}_v2.json"), 'r'))
 
     results = []
-    score_list = []
 
     inference_time_sum = 0.0
-    iter = 0
-    correct_count = 0
+    mobile_num = 0
 
-    #! =======================================================
-    prof = FlopsProfiler(model)
-    prof.start_profile()
-    total_flops = 0.0
-    #! =======================================================
+    score_list = []
+    correct_predictions = 0  # 정확한 예측 횟수
+    total_predictions = 0    # 전체 예측 횟수
+    
+    if CALC_FLOPS:
+        prof = FlopsProfiler(model)
+        prof.start_profile()
+    tflops_sum = 0.0
 
     for j, example in tqdm(enumerate(dataset)):
-        iter += 1
-        
+
+        mobile_num += 1
+
         filename = example["img_filename"]
-        img_path = os.path.join("../data/screenspotv2_image", filename)
+        img_path = os.path.join("../../data/screenspotv2_image", filename)
         if not os.path.exists(img_path):
             print("img not found", flush=True)
             input()
 
-        original_image = Image.open(img_path).convert("RGB")
-        w_orig, h_orig = original_image.size
 
-        # 리사이즈 처리
-        if RESIZE_RATIO < 1.00:
-            print(f"Resized image from ({w_orig}, {h_orig})", end=" -> ")
-            w_resized, h_resized = int(w_orig * RESIZE_RATIO), int(h_orig * RESIZE_RATIO)
-            resized_image = original_image.resize((w_resized, h_resized))
-            print(f"({w_resized}, {h_resized}) (ratio: {RESIZE_RATIO})")
-            img = deepcopy(resized_image)
-        else:
-            img = deepcopy(original_image)
-            w_resized, h_resized = w_orig, h_orig
+        print(img_path)
+
+        original_image = Image.open(img_path).convert("RGB")
+        w_orig, h_orig = original_image.size 
+
+        img = deepcopy(original_image)
+        w_resized, h_resized = w_orig, h_orig 
+        # if w_orig * h_orig > MAX_PIXELS:
+        #   img, w_resized, h_resized = resize_image(original_image)
         
-        # GT bbox를 리사이즈 비율에 맞춰 조정
         gt_bbox = example["bbox"]
         gt_bbox = [gt_bbox[0], gt_bbox[1], gt_bbox[0] + gt_bbox[2], gt_bbox[1] + gt_bbox[3]]
         
-        # GT bbox를 리사이즈된 좌표계로 변환
-        if RESIZE_RATIO < 1.00:
-            gt_bbox_resized = [coord * RESIZE_RATIO for coord in gt_bbox]
-        else:
-            gt_bbox_resized = gt_bbox.copy()
-
         ele = {
             "file_name": example["img_filename"],
             "data_type": example["data_type"],
+            # "domain": domain_dict[example["data_source"]],
             "instruction": example["instruction"],
-            "img_size": [w_resized, h_resized],  # 리사이즈된 이미지 크기 사용
-            "bbox_x1y1x2y2": example["bbox"],
+            "img_size": [w_orig, h_orig],
+            "bbox_x1y1x2y2": normalize_bbox(example["bbox"], w_orig, h_orig),
             "hit_top1": 0,
             "overlap_top1": 0,
             "hit_topk": 0,
             "overlap_topk": 0,
         }
+
+
 
         conversation = [
             {
@@ -191,91 +217,91 @@ def evaluate(model_name_or_path, model_type, use_placeholder, topk, task, device
             },
         ]
 
-        #! =======================================================
-        prof.reset_profile()
-        #! =======================================================
 
+
+
+        if CALC_FLOPS:
+            prof.reset_profile()
+        
         inference_start = time.time()
-        pred = inference(conversation, model, tokenizer, data_processor, logits_processor=logits_processor_pointer, use_placeholder=use_placeholder, topk=topk)
-        inference_end = time.time() 
 
-        #! =======================================================
-        tflops = prof.get_total_flops()
-        tflops /= 1e12
-        print()
-        print(f"TFLOPs: {tflops}")
-        total_flops += tflops
-        #! =======================================================
+        pred = inference(conversation, model, tokenizer, 
+            data_processor, logits_processor=logits_processor_pointer, 
+            use_placeholder=use_placeholder, topk=3, fastv_r=FASTV_R)
+        inference_end = time.time() 
+        
+        if CALC_FLOPS:
+            flops = prof.get_total_flops()
+            tflops = flops/1e12
+            print(f"Total: {tflops:.2f} TFLOPs")
+            tflops_sum += tflops
 
         topk_points = pred["topk_points"]
         
+        # gt_bbox = ele["bbox_x1y1x2y2"]
+        
         # compute the metrics
         px, py = topk_points[0]
-        
-        # 예측 좌표를 원본 좌표계로 되돌리기
-        if RESIZE_RATIO < 1.00:
-            px_orig = px * w_resized / RESIZE_RATIO  # 리사이즈된 좌표를 원본 좌표로 변환
-            py_orig = py * h_resized / RESIZE_RATIO
-        else:
-            px_orig = px * w_orig
-            py_orig = py * h_orig
+        px, py = px * w_orig, py * h_orig
+        x1, y1, x2, y2 = gt_bbox
 
-        print(f"Predicted (resized): ({px * w_resized}, {py * h_resized})")
-        print(f"Predicted (original): ({px_orig}, {py_orig})")
-        print(f"GT bbox (original): {gt_bbox}")
+        total_predictions += 1  # 전체 예측 횟수 증가
         
-        x1, y1, x2, y2 = gt_bbox  # 원본 좌표계의 GT bbox 사용
-
-        if (x1 <= px_orig <= x2) and (y1 <= py_orig <= y2):
+        if (x1 <= px <= x2) and (y1 <= py <= y2):
             ele["hit_top1"] = 1
             ele["hit_topk"] = 1
             score_list.append(1)
-            print("correct")
-            correct_count += 1
+            correct_predictions += 1  # 정확한 예측 횟수 증가
         else: 
-            print("wrong")
             score_list.append(0)
-        print(f"up2now: {calc_acc(score_list)}")
+        
+        # 현재까지의 정확도 출력
+        current_accuracy = correct_predictions / total_predictions * 100
+        print(f"Sample {j+1}/{len(dataset)} | Correct: {correct_predictions}/{total_predictions} | Accuracy: {current_accuracy:.2f}%")
 
-        # overlap 계산 (원본 좌표계 사용)
-        pred_bbox = [px_orig - IMAGE_PATCH_SIZE, py_orig - IMAGE_PATCH_SIZE, 
-                    px_orig + IMAGE_PATCH_SIZE, py_orig + IMAGE_PATCH_SIZE]
+        # w, h = example["image"].size
+        pred_bbox = [px - IMAGE_PATCH_SIZE / w_orig, py - IMAGE_PATCH_SIZE / h_orig, px + IMAGE_PATCH_SIZE / w_orig, py + IMAGE_PATCH_SIZE / h_orig]
         if do_boxes_overlap(pred_bbox, gt_bbox):
             ele["overlap_top1"] = 1
             ele["overlap_topk"] = 1
 
-        # topk 평가 (원본 좌표계로 변환)
         for px, py in topk_points[1:]:
-            if RESIZE_RATIO < 1.00:
-                px_orig_k = px * w_resized / RESIZE_RATIO
-                py_orig_k = py * h_resized / RESIZE_RATIO
-            else:
-                px_orig_k = px * w_orig
-                py_orig_k = py * h_orig
-                
-            if (x1 <= px_orig_k <= x2) and (y1 <= py_orig_k <= y2):
+            if (x1 <= px <= x2) and (y1 <= py <= y2):
                 ele["hit_topk"] = 1
-            pred_bbox_k = [px_orig_k - IMAGE_PATCH_SIZE, py_orig_k - IMAGE_PATCH_SIZE, 
-                          px_orig_k + IMAGE_PATCH_SIZE, py_orig_k + IMAGE_PATCH_SIZE]
-            if do_boxes_overlap(pred_bbox_k, gt_bbox):
+            pred_bbox = [px - IMAGE_PATCH_SIZE / w_orig, py - IMAGE_PATCH_SIZE / h_orig, px + IMAGE_PATCH_SIZE / w_orig, py + IMAGE_PATCH_SIZE / h_orig]
+            if do_boxes_overlap(pred_bbox, gt_bbox):
                 ele["overlap_topk"] = 1
         elapsed = inference_end - inference_start
 
         inference_time_sum += elapsed
         print(f"elapsed: {elapsed}")
 
-        print("----------------------------\n")
-
         results.append(ele)
     
-    print()
-    print(f"mean tflops: {total_flops / iter}")
-    print(f"total time: {inference_time_sum}")
-    print(f"mean time: {inference_time_sum / iter}")
-    print("iter:", iter)
-    print("correct_count:", correct_count)
+    # 태스크별 최종 통계 계산
+    final_accuracy = correct_predictions / total_predictions * 100 if total_predictions > 0 else 0
+    mean_inference_time = inference_time_sum / mobile_num if mobile_num > 0 else 0
+    mean_tflops = tflops_sum / mobile_num if mobile_num > 0 else 0
+    
+    print(f"\n{'='*60}")
+    print(f"Task '{task}' Results:")
+    print(f"{'='*60}")
+    print(f"Total samples: {total_predictions}")
+    print(f"Correct predictions: {correct_predictions}")
+    print(f"Accuracy: {final_accuracy:.2f}%")
+    print(f"Mean inference time: {mean_inference_time:.4f}s")
+    print(f"Mean TFLOPs: {mean_tflops:.4f}")
+    print(f"{'='*60}")
 
-    return results, (inference_time_sum / iter), (total_flops / iter)
+    #! =======================================================
+    # 평균 GFLOPs 콘솔 출력
+    # if mobile_num > 0 and total_flops > 0:
+    #     avg_gflops = (total_flops / mobile_num) / 1e9
+    #     print(f"Avg FLOPs (GFLOPs): {avg_gflops:.2f}")
+    #! =======================================================
+
+
+    return results, mean_inference_time, mean_tflops, final_accuracy, correct_predictions, total_predictions
 
 
 def get_metric(list_of_examples, time_mean, tflops_mean,
@@ -387,19 +413,9 @@ def get_metric(list_of_examples, time_mean, tflops_mean,
         metric_info += ("\t".join(row) + "\n")
     print(metric_info)
     print(time_mean)
-    
-    # 간단한 정확도 계산 추가
-    total_samples = len(list_of_examples)
-    correct_samples = sum(1 for ex in list_of_examples if ex.get("hit_top1", 0) == 1)
-    accuracy = (correct_samples / total_samples * 100) if total_samples > 0 else 0
-    
-    metric_info += f"\nAccuracy: {correct_samples}/{total_samples} = {accuracy:.4f}%"
-    metric_info += f"\nTime: {time_mean}"
-    metric_info += f"\nTFLOPS: {tflops_mean}"
-
     print(tflops_mean)
+    metric_info += "\nTime: " + str(time_mean) + "\nTFLOPS: " + str(tflops_mean)
     return metric_info
-
 
 
 """
@@ -419,98 +435,108 @@ if __name__ == "__main__":
     args.model_name_or_path = "microsoft/GUI-Actor-3B-Qwen2.5-VL"
     args.model_type = "qwen25vl"
 
-    # 전체 task 통계 변수 초기화
-    total_samples = 0
+    # 전체 태스크 결과를 저장할 리스트
+    all_task_results = []
     total_correct = 0
-    total_time = 0.0
-    total_tflops = 0.0
+    total_samples = 0
+    total_time_sum = 0.0
+    total_tflops_sum = 0.0
 
-    print(TASKS)
     for task in TASKS:
         save_path = SAVE_DIR
         if not os.path.exists(save_path):
             os.makedirs(save_path, exist_ok=True)
+        pred_path = PRED_PATH.format(save_dir=SAVE_DIR, FASTV_R=FASTV_R, task=task, max_pixels=MAX_PIXELS)
+        metric_path = METRIC_PATH.format(save_dir=SAVE_DIR, FASTV_R=FASTV_R, task=task, max_pixels=MAX_PIXELS)
 
-        # pred_path = PRED_PATH.format(save_dir=SAVE_DIR, task=task, max_pixels=MAX_PIXELS)
-        metric_path = METRIC_PATH.format(save_dir=SAVE_DIR, task=task, resize_ratio=RESIZE_RATIO)
-   
-    
-        print(f"Evaluating {args.model_name_or_path}...")
-        results, time_mean, tflops_mean = evaluate(
-          args.model_name_or_path, 
-          args.model_type, 
-          args.use_placeholder, 
-          args.topk,
-          task=task,
-          device_map=device_map)
-        # with open(pred_path, "w") as f:
-        #     json.dump(results, f)
-        # print(f"Saved {len(results)} predictions to {pred_path}")
+        print(f"\n🔄 Evaluating {args.model_name_or_path} on {task} task...")
+        results, time_mean, tflops_mean, accuracy, correct_count, total_count = evaluate(
+            args.model_name_or_path, args.model_type, args.use_placeholder, 
+            args.topk, task=task, device_map=device_map
+        )
+        
+        # 태스크별 결과 저장
+        task_result = {
+            'task': task,
+            'accuracy': accuracy,
+            'correct_predictions': correct_count,
+            'total_samples': total_count,
+            'mean_inference_time': time_mean,
+            'mean_tflops': tflops_mean
+        }
+        all_task_results.append(task_result)
+        
+        # 전체 통계에 누적
+        total_correct += correct_count
+        total_samples += total_count
+        total_time_sum += time_mean
+        total_tflops_sum += tflops_mean
+        
+        # 예측 결과 저장
+        with open(pred_path, "w") as f:
+            json.dump(results, f)
+        print(f"✅ Saved {len(results)} predictions to {pred_path}")
 
+        # 태스크별 성능 요약 저장
+        task_summary_path = pred_path.replace('_preds.json', '_task_summary.txt')
+        with open(task_summary_path, 'w') as f:
+            f.write(f"Task: {task}\n")
+            f.write(f"FastV Ratio: {FASTV_R}\n")
+            f.write(f"Max Pixels: {MAX_PIXELS}\n")
+            f.write(f"Accuracy: {accuracy:.2f}%\n")
+            f.write(f"Correct Predictions: {correct_count}/{total_count}\n")
+            f.write(f"Mean Inference Time: {time_mean:.4f}s\n")
+            f.write(f"Mean TFLOPs: {tflops_mean:.4f}\n")
+        print(f"✅ Saved task summary to {task_summary_path}")
+
+        # 기존 상세 메트릭 저장
         if not os.path.exists(metric_path):
             metric_info = get_metric(list_of_examples=results, time_mean=time_mean, tflops_mean=tflops_mean)
             with open(metric_path, "w") as f:
                 f.write(metric_info)
-            print(f"Saved metric to {metric_path}")
-        
-        # 전체 task 통계에 누적
-        task_samples = len(results)
-        task_correct = sum(1 for ex in results if ex.get("hit_top1", 0) == 1)
-        
-        total_samples += task_samples
-        total_correct += task_correct
-        total_time += time_mean * task_samples  # 총 시간으로 계산
-        total_tflops += tflops_mean * task_samples  # 총 TFLOPs로 계산
-        
-        print(f"Task {task} completed: {task_correct}/{task_samples} accuracy = {task_correct/task_samples*100:.2f}%")
+            print(f"✅ Saved detailed metrics to {metric_path}")
+
+    # 전체 요약 결과 출력
+    overall_accuracy = total_correct / total_samples * 100 if total_samples > 0 else 0
+    avg_time = total_time_sum / len(TASKS) if len(TASKS) > 0 else 0
+    avg_tflops = total_tflops_sum / len(TASKS) if len(TASKS) > 0 else 0
     
-    # 모든 task 완료 후 전체 결과 계산 및 CSV 저장
-    print("\n📊 All Tasks Completed!")
-    
-    # 전체 평균 계산
-    avg_accuracy = (total_correct / total_samples * 100) if total_samples > 0 else 0
-    avg_time = (total_time / total_samples) if total_samples > 0 else 0
-    avg_tflops = (total_tflops / total_samples) if total_samples > 0 else 0
-    
-    print(f"Total Results:")
+    print(f"\n{'='*80}")
+    print(f"🎉 OVERALL RESULTS (FastV Ratio: {FASTV_R})")
+    print(f"{'='*80}")
     print(f"Total Samples: {total_samples}")
     print(f"Total Correct: {total_correct}")
-    print(f"Average Accuracy: {avg_accuracy:.2f}%")
-    print(f"Average Time: {avg_time:.4f}s")
-    print(f"Average TFLOPs: {avg_tflops:.2f}")
+    print(f"Overall Accuracy: {overall_accuracy:.2f}%")
+    print(f"Average Inference Time: {avg_time:.4f}s")
+    print(f"Average TFLOPs: {avg_tflops:.4f}")
+    print(f"{'='*80}")
     
-    # CSV로 저장
-    results_csv_path = "../_results"
-    os.makedirs(results_csv_path, exist_ok=True)
-    csv_file_path = os.path.join(results_csv_path, "results_vanilla_eval.csv")
+    print(f"📊 Task-wise Results:")
+    for task_result in all_task_results:
+        print(f"  {task_result['task']}: {task_result['accuracy']:.2f}% "
+              f"({task_result['correct_predictions']}/{task_result['total_samples']}) | "
+              f"Time: {task_result['mean_inference_time']:.4f}s | "
+              f"TFLOPs: {task_result['mean_tflops']:.4f}")
     
-    # CSV 헤더 정의
-    csv_headers = [
-        "resize_ratio", "avg_accuracy", "avg_time", "avg_tflops", "total_samples", "timestamp"
-    ]
-    
-    # CSV 데이터 행 생성
-    csv_row = [
-        RESIZE_RATIO,
-        round(avg_accuracy, 2),
-        round(avg_time, 4),
-        round(avg_tflops, 2),
-        total_samples,
-        datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    ]
-    
-    # CSV 파일이 없으면 헤더와 함께 생성, 있으면 데이터 행만 추가
-    file_exists = os.path.exists(csv_file_path)
-    
-    with open(csv_file_path, 'a', newline='', encoding='utf-8') as csvfile:
-        writer = csv.writer(csvfile)
+    # 전체 요약을 파일에 저장
+    overall_summary_path = os.path.join(SAVE_DIR, f"overall_summary_fastv_{FASTV_R}.txt")
+    with open(overall_summary_path, 'w') as f:
+        f.write(f"FastV Performance Summary (Ratio: {FASTV_R})\n")
+        f.write(f"{'='*50}\n\n")
+        f.write(f"Overall Results:\n")
+        f.write(f"Total Samples: {total_samples}\n")
+        f.write(f"Total Correct: {total_correct}\n")
+        f.write(f"Overall Accuracy: {overall_accuracy:.2f}%\n")
+        f.write(f"Average Inference Time: {avg_time:.4f}s\n")
+        f.write(f"Average TFLOPs: {avg_tflops:.4f}\n\n")
         
-        # 파일이 없거나 비어있으면 헤더 추가
-        if not file_exists or os.path.getsize(csv_file_path) == 0:
-            writer.writerow(csv_headers)
-        
-        # 결과 행 추가
-        writer.writerow(csv_row)
+        f.write(f"Task-wise Results:\n")
+        for task_result in all_task_results:
+            f.write(f"Task: {task_result['task']}\n")
+            f.write(f"  Accuracy: {task_result['accuracy']:.2f}%\n")
+            f.write(f"  Correct/Total: {task_result['correct_predictions']}/{task_result['total_samples']}\n")
+            f.write(f"  Mean Inference Time: {task_result['mean_inference_time']:.4f}s\n")
+            f.write(f"  Mean TFLOPs: {task_result['mean_tflops']:.4f}\n\n")
     
-    print(f"📝 Results saved to CSV: {csv_file_path}")
-        
+    print(f"\n💾 Overall summary saved to: {overall_summary_path}")
+    print(f"{'='*80}")
