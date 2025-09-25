@@ -8,8 +8,8 @@ import argparse
 parser = argparse.ArgumentParser()
 parser.add_argument('gpu', type=int, default=0, help='GPU number')
 parser.add_argument('--r', type=float, default=0.50, help='Stage 1 Resize ratio')
-parser.add_argument('--th', type=float, default=0.11, help='Stage 1 Crop threshold')
-parser.add_argument('--p', type=int, default=20, help='Stage 1 Crop Padding')
+parser.add_argument('--th', type=float, default=0.12, help='Stage 1 Crop threshold')
+parser.add_argument('--p', type=int, default=0, help='Stage 1 Crop Padding')
 parser.add_argument('--v', action='store_true', help='Whether to save visualization images')
 parser.add_argument('--mac', action='store_true', help='Whether to run on Mac (MPS)')
 args = parser.parse_args()
@@ -35,8 +35,8 @@ MIN_PATCHES = 1                         # 최소 패치 수 (너무 작은 영�
 BBOX_PADDING = args.p                   # bbox 상하좌우로 확장할 픽셀  # TODO: 0 ~ 50 중 최적 찾기
 
 # Ensemble Hyperparameters
-STAGE1_ENSEMBLE_RATIO = 0.50                        # Stage1 attention 가중치
-STAGE2_ENSEMBLE_RATIO = 1 - STAGE1_ENSEMBLE_RATIO   # Stage2 crop 가중치
+STAGE1_ENSEMBLE_RATIO = 0.50                        # Stage1 attention weight
+STAGE2_ENSEMBLE_RATIO = 1 - STAGE1_ENSEMBLE_RATIO   # Stage2 crop weight
 ENSEMBLE_TOP_PATCHES = 100                          # Stage2에서 앙상블에 사용할 상위 패치 개수 (Qwen2.5VL용)
 
 # 최대 PIXELS 제한
@@ -54,8 +54,8 @@ SEED = 0
 
 # Dataset & Model
 MLLM_PATH = "Qwen/Qwen2.5-VL-3B-Instruct"
-SCREENSPOT_IMGS = "../../data/screenspotv2_image"       # input image 경로
-SCREENSPOT_JSON = "../../data"                          # input image json파일 경로
+SCREENSPOT_IMGS = "../data/screenspotv2_image"       # input image 경로
+SCREENSPOT_JSON = "../data"                          # input image json파일 경로
 TASKS = ["mobile", "web", "desktop"]
 SAMPLE_RANGE = slice(None)
 # SAMPLE_RANGE = slice(0, 10)
@@ -70,7 +70,7 @@ STAGE1_VIS = False
 STAGE2_VIS = False
 
 # Save Path
-SAVE_DIR = f"../../attn_output/" + method + "/" + memo
+SAVE_DIR = f"../attn_output/" + method + "/" + memo
 
 #! ==================================================================================================
 
@@ -253,9 +253,9 @@ def create_conversation(image, instruction, resize_ratio=1.0):
                 {
                     "type": "text",
                     "text": (
-                        # 추가 content
+                        # Additional prompt
                         # f"This is a resized screenshot of the whole GUI, scaled by {resize_ratio}. "
-                        # 기존 content
+                        # previous prompt
                         "You are a GUI agent. Given a screenshot of the current GUI and a human instruction, "
                         "your task is to locate the screen element that corresponds to the instruction. "
                         

@@ -1,4 +1,6 @@
-# GUI-Actor-3B + GOLD
+'''
+Final version
+'''
 
 import os
 import argparse
@@ -8,11 +10,12 @@ parser.add_argument('gpu', type=int, default=0, help='GPU number')
 parser.add_argument('--r', type=float, default=0.50, help='Stage 1 Resize ratio')
 parser.add_argument('--th', type=float, default=0.12, help='Stage 1 Crop threshold')
 parser.add_argument('--p', type=int, default=0, help='Stage 1 Crop Padding')
-parser.add_argument('--e', type=float, default=0.7, help='Ensemble ratio for Stage 1 (0~1)')
 parser.add_argument('--v', action='store_true', help='Whether to save visualization images')
 parser.add_argument('--mac', action='store_true', help='Whether to run on Mac (MPS)')
 args = parser.parse_args()
 
+
+args.mac = False
 os.environ["CUDA_DEVICE_ORDER"]="PCI_BUS_ID"
 os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu)
 
@@ -24,44 +27,49 @@ ATTN_IMPL = "eager"                      # attention implement "eager" "sdpa" "f
 RESIZE_RATIO = args.r
 
 # Crop Limitations
-MAX_CROPS = 3  # Maximum number of crops
+MAX_CROPS = 3  # 최대 crop 개수
 
 # Connected Region Based Cropping
-REGION_THRESHOLD = args.th              # Threshold for connected region detection (0~1)
-MIN_PATCHES = 1                         # Minimum number of patches (remove too small regions)
-BBOX_PADDING = args.p                   # Pixels to expand bbox in all directions
+REGION_THRESHOLD = args.th              # 연결된 영역 검출을 위한 임계값 (0~1)  # TODO: 0.1 ~ 0.5 중 최적 찾기
+MIN_PATCHES = 1                         # 최소 패치 수 (너무 작은 영역 제거)
+BBOX_PADDING = args.p                   # bbox 상하좌우로 확장할 픽셀  # TODO: 0 ~ 50 중 최적 찾기
 
 # Ensemble Hyperparameters
-STAGE1_ENSEMBLE_RATIO = args.e                      # Stage1 attention weight
-STAGE2_ENSEMBLE_RATIO = 1 - STAGE1_ENSEMBLE_RATIO   # Stage2 crop weight
+STAGE1_ENSEMBLE_RATIO = 0.70                        # Stage1 attention 가중치
+STAGE2_ENSEMBLE_RATIO = 1 - STAGE1_ENSEMBLE_RATIO   # Stage2 crop 가중치
+ENSEMBLE_TOP_PATCHES = 100                          # Stage2에서 앙상블에 사용할 상위 패치 개수 (Qwen2.5VL용)
 
-# Maximum PIXELS limit (applied at Process level)
-MAX_PIXELS = 3211264
-# MAX_PIXELS = 1280*28*28
+# 최대 PIXELS 제한
+MAX_PIXELS = 3211264  # Process단에서 적용
 
-# Experiment name to record in csv
-model_name = "gui-actor-3B+GOLD"
-experiment = "_"
-parameter = f"resize{RESIZE_RATIO:.2f}_maxpixel{MAX_PIXELS}_ensemble{STAGE1_ENSEMBLE_RATIO:.2f}"
-SAVE_DIR = f"../attn_output/" + f"{model_name}/" + f"{experiment}/" + parameter
+# csv에 기록할 method 이름
+method = "qwen25vl_text+GOLD"
+
+memo = f"resize{RESIZE_RATIO:.2f}_region_thresh{REGION_THRESHOLD:.2f}_pad{BBOX_PADDING}_ensemble{STAGE1_ENSEMBLE_RATIO:.2f}"
+
 
 #! Argument ==========================================================================================
 
 SEED = 0
 
 # Dataset & Model
-MLLM_PATH = "microsoft/GUI-Actor-3B-Qwen2.5-VL"
-SCREENSPOT_IMGS = "../data/screenspotv2_image"
-SCREENSPOT_JSON = "../data"
+MLLM_PATH = "Qwen/Qwen2.5-VL-3B-Instruct"
+SCREENSPOT_IMGS = "../data/screenspotv2_image"       # input image 경로
+SCREENSPOT_JSON = "../data"                          # input image json파일 경로
 TASKS = ["mobile", "web", "desktop"]
 SAMPLE_RANGE = slice(None)
 
 # Visualize & Logging
 VISUALIZE = args.v if args.v else False
-VIS_ONLY_WRONG = False
+VIS_ONLY_WRONG = False                                # True면 틀린 것만 시각화, False면 모든 것 시각화
 TFOPS_PROFILING = True
 MEMORY_VIS = False
 
+STAGE1_VIS = True
+STAGE2_VIS = True
+
+# Save Path
+SAVE_DIR = f"../attn_output/" + method + "/" + memo
 
 #! ==================================================================================================
 
@@ -71,10 +79,10 @@ import sys
 import time
 import re
 import json
+import logging
+logging.disable(logging.CRITICAL)  # 모든 로깅 호출 무력화
 from typing import Dict, List
 from collections import deque
-import logging
-logging.disable(logging.CRITICAL)
 
 # Third-Party Libraries
 import numpy as np
@@ -82,14 +90,21 @@ from PIL import Image
 from tqdm import tqdm
 import torch
 from transformers import AutoProcessor, AutoTokenizer, set_seed
+from scipy.ndimage import gaussian_filter
 
 # Project-Local Modules
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from util.iter_logger import init_iter_logger, append_iter_log
-from gui_actor.modeling_qwen25vl import Qwen2_5_VLForConditionalGenerationWithPointer
-from gui_actor.inference import inference
-from gui_actor.multi_image_inference import multi_image_inference
+from util.iter_logger import init_iter_logger, append_iter_log  # log csv 기록 파일
+# from gui_actor.modeling_qwen25vl import Qwen2_5_VLForConditionalGenerationWithPointer
+# from gui_actor.inference import inference
+# from gui_actor.multi_image_inference import multi_image_inference
+# Qwen2.5-VL base classes (Transformers)
+from transformers import Qwen2_5_VLForConditionalGeneration
+from qwen_vl_utils import process_vision_info
+
+import matplotlib.pyplot as plt
 from util.visualize_util import visualize_stage1_attention_crops, visualize_stage2_multi_attention, visualize_stage3_point_ensemble
+from util.visualize_util_qwen25vl import draw_points_on_image
 if TFOPS_PROFILING:
     from deepspeed.profiling.flops_profiler import FlopsProfiler
 
@@ -107,17 +122,388 @@ class NpEncoder(json.JSONEncoder):
             return bool(obj)
         return super(NpEncoder, self).default(obj)
 
-def warm_up_model(model, tokenizer, processor):
+# Text-based grounding functions from text_qwen25vl.py
+def _cast(n: str):
+    return int(n) if n.isdigit() or (n.startswith(('+', '-')) and n[1:].isdigit()) else float(n)
+
+def parse_coord(text: str):
+    """문자열에서 (x, y) 또는 [x, y] 좌표를 모두 추출해 (x, y) 튜플 리스트로 반환."""
+    coords = []
+    PATTERN = re.compile(
+        r"""
+        [\(\[]                 # 여는 괄호 '(' 또는 '['
+        \s*
+        (?P<x>[+-]?\d+(?:\.\d+)?)   # x: 정수 또는 소수
+        \s*,\s*
+        (?P<y>[+-]?\d+(?:\.\d+)?)   # y: 정수 또는 소수
+        \s*
+        [\)\]]                 # 닫는 괄호 ')' 또는 ']'
+        """,
+        re.VERBOSE,
+    )
+    for m in PATTERN.finditer(text):
+        x = _cast(m.group('x'))
+        y = _cast(m.group('y'))
+        coords.append((x, y))
+    
+    if coords:
+        return coords[0]
+    else:
+        raise ValueError("좌표를 찾지 못했습니다.")
+
+def denormalize_point(norm_point, orig_w, orig_h):
+    new_x = norm_point[0] * orig_w
+    new_y = norm_point[1] * orig_h
+    return [new_x, new_y]
+
+def normalize_point(denorm_point, orig_w, orig_h):
+    x, y = denorm_point[0], denorm_point[1]
+    if 0 <= x <= 1 and 0 <= y <= 1:
+        return [x, y]
+    new_x = x / orig_w
+    new_y = y / orig_h
+    return [new_x, new_y]
+
+# def warm_up_model(model, tokenizer, processor):
+#     print("🏋️‍♂️ Warming up the model...")
+#     dummy_instruction = "This is a dummy instruction for warm-up."
+#     dummy_image = Image.new("RGB", (1000, 1000), color=(255, 255, 255))  # 1000x1000 흰색 이미지
+#     dummy_msgs = create_conversation_stage1(image=dummy_image, instruction=dummy_instruction, resize_ratio=1.0)
+    
+#     # 예열용 inference 실행
+#     for _ in range(3):  # 3번 반복
+#         with torch.no_grad():
+#             _ = inference(dummy_msgs, model, tokenizer, processor, use_placeholder=True, topk=3)
+#     print("🏋️‍♂️ Warm-up complete!")
+
+def warm_up_model(model, processor, device):
     print("🏋️‍♂️ Warming up the model...")
-    dummy_instruction = "This is a dummy instruction for warm-up."
-    dummy_image = Image.new("RGB", (1000, 1000), color=(255, 255, 255))
-    dummy_msgs = create_conversation_stage1(image=dummy_image, instruction=dummy_instruction, resize_ratio=1.0)
-    for _ in range(3):
-        with torch.no_grad():
-            _ = inference(dummy_msgs, model, tokenizer, processor, use_placeholder=True, topk=3)
+    dummy_instruction = "Say: ready."
+    dummy_image = Image.new("RGB", (640, 640), color=(255, 255, 255))
+    msgs = [
+        {"role": "user", "content": [
+            {"type": "image", "image": dummy_image},
+            {"type": "text",  "text": dummy_instruction},
+        ]}
+    ]
+    # Qwen 권장 전처리 흐름
+    text = processor.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
+    image_inputs, video_inputs = process_vision_info(msgs)
+    inputs = processor(text=[text], images=image_inputs, videos=video_inputs,
+                       padding=True, return_tensors="pt").to(device)
+    with torch.no_grad():
+        _ = model.generate(**inputs, max_new_tokens=8)
     print("🏋️‍♂️ Warm-up complete!")
 
+# === Qwen attention-forward 기반 Stage1 추론 유틸 ===
+def _find_vision_spans(input_ids_1d, processor):
+    vs = processor.tokenizer.convert_tokens_to_ids("<|vision_start|>")
+    ve = processor.tokenizer.convert_tokens_to_ids("<|vision_end|>")
+    ids = input_ids_1d.tolist()
+    spans, i = [], 0
+    while True:
+        try:
+            s = ids.index(vs, i) + 1
+            e = ids.index(ve, s)
+            spans.append((s, e))
+            i = e + 1
+        except ValueError:
+            break
+    return spans
+
+def get_h2w2(processor, image_inputs, span_len):
+    img_proc_out = processor.image_processor(images=image_inputs)
+    grid = img_proc_out["image_grid_thw"]
+    
+    if hasattr(grid, "ndim") and grid.ndim == 3:
+        grid = grid[0]  # (num_imgs, 3)
+    t, h, w = map(int, grid[0])
+    h2, w2 = h // 2, w // 2
+    return t, h2, w2
+
+
+def _aggregate_att_map(attn_out, span, query_indices, layer_range, t, h2, w2):
+    st, end = span
+    maps = []
+    for li in layer_range:
+        if li < 0 or li >= len(attn_out.attentions):
+            continue
+        layer_att = attn_out.attentions[li]  # (B, H, Q, K)
+        for q in query_indices:
+            vec = layer_att[0, :, q, st:end].mean(dim=0).to(torch.float32).cpu().numpy()
+            m = vec.reshape(t, h2, w2).mean(axis=0)  # 시간 축 평균
+            maps.append(m)
+
+    return np.mean(maps, axis=0)
+
+def _get_query_indices_after_last_vision(input_ids_1d, processor, tail=8):
+    ve = processor.tokenizer.convert_tokens_to_ids("<|vision_end|>")
+    pos = (input_ids_1d == ve).nonzero(as_tuple=False).flatten().tolist()
+    if not pos:
+        return [int(input_ids_1d.shape[0]-1)]
+    last = int(pos[-1])
+    seq_len = int(input_ids_1d.shape[0])
+    tail_idxs = list(range(last + 1, seq_len))
+    return tail_idxs[-tail:] if tail_idxs else [seq_len - 1]
+
+
+def gaussian_blur_att(att: np.ndarray, sigma: float = 1.0, mode: str = "reflect"):
+    """
+    att: (H, W) numpy array
+    sigma: 가우시안 표준편차(픽셀 단위)
+    mode: 가장자리 패딩 방식
+    """
+    att_b = gaussian_filter(att.astype(np.float32), sigma=sigma, mode=mode)
+    # 필요 시 0~1 정규화
+    vmax = att_b.max()
+    if np.isfinite(vmax) and vmax > 0:
+        att_b = att_b / vmax
+    return att_b
+
+def qwen_attn_inference(conversation, model, processor, *, topk=1, layer_start=20, layer_end=31, vis_dir=None):
+    # 1) 템플릿+전처리
+    text = processor.apply_chat_template(conversation, tokenize=False, add_generation_prompt=True)
+    image_inputs, video_inputs = process_vision_info(conversation)
+    inputs = processor(text=[text], images=image_inputs, videos=video_inputs,
+                       padding=True, return_tensors="pt").to(model.device)
+
+    # 2) 비전 토큰 구간과 패치 그리드 파악
+    spans = _find_vision_spans(inputs["input_ids"][0], processor)
+    if not spans:
+        raise RuntimeError("vision span not found in input_ids")
+    span = spans[0]
+    span_len = int(span[1] - span[0])
+    t, h2, w2 = get_h2w2(processor, image_inputs, span_len)
+
+    # 3) forward(attention) → 어텐션맵 집계
+    with torch.no_grad():
+        out = model(**inputs, output_attentions=True)
+    qidx = _get_query_indices_after_last_vision(inputs["input_ids"][0], processor, tail=8)
+    layer_range = range(layer_start, layer_end + 1)
+    att = _aggregate_att_map(out, span, qidx, layer_range, t, h2, w2)  # (h2, w2)
+
+    if STAGE1_VIS and vis_dir:
+        num_imgs = 1
+        fig, axes = plt.subplots(1, num_imgs, figsize=(4*num_imgs, 4))
+        ax = axes
+        ax.set_title(conversation[1]["content"][1]["payload"])
+        im = ax.imshow(att, cmap="viridis", interpolation="nearest")
+        conversation[1]["content"][0]["image"].save(f"{vis_dir}/original.png")
+        fig.savefig(f"{vis_dir}/s1_att.png")
+
+    # 4) 맵에서 top-k 포인트 뽑기
+    flat = att.reshape(-1)
+    k = max(0, min(topk, flat.size))
+    pts, vals = [], []
+    if k > 0 and np.isfinite(flat).any():
+        idx = np.argpartition(flat, -k)[-k:]
+        idx = idx[np.argsort(flat[idx])[::-1]]
+        vmax = float(flat[idx[0]]) if k > 0 else 1.0
+        for ii in idx:
+            r, c = divmod(int(ii), w2)
+            x = (c + 0.5) / w2
+            y = (r + 0.5) / h2
+            pts.append((float(x), float(y)))
+            vals.append(float(flat[ii] / (vmax + 1e-8)))
+
+    # 5) GUI-Actor가 기대하는 키로 반환
+    return {
+        "n_width":  w2,
+        "n_height": h2,
+        "attn_scores": [att.flatten().tolist()],
+        "topk_points": pts,     # 정규화 좌표
+        "topk_values": vals,    # 정규화 점수(최대 1.0)
+    }
+
+def qwen_text_grounding_inference(image, instruction, model, processor, tokenizer):
+    """Qwen의 text 기반 grounding을 사용하여 단일 이미지에서 점 예측, 실패시 attention 기반 fallback"""
+    
+    # ScreenSpot 방식의 대화 생성 (text_qwen25vl.py 참고)
+    _SCREENSPOT_SYSTEM = "Based on the screenshot of the page, I give a text description and you give its corresponding location."
+    _SYSTEM_point_int = "The coordinate represents a clickable location [x, y] for an element, which is a relative coordinate on the screenshot, scaled from 1 to 1000."
+    
+    system_prompt = _SCREENSPOT_SYSTEM + ' ' + _SYSTEM_point_int
+    
+    conversation = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": system_prompt},
+                {"type": "image", "image": image},
+                {"type": "text", "text": instruction}
+            ],
+        }
+    ]
+    
+    # Qwen inference
+    text = processor.apply_chat_template(
+        conversation, tokenize=False, add_generation_prompt=True
+    )
+    image_inputs, video_inputs = process_vision_info(conversation)
+    
+    inputs = processor(
+        text=text,
+        images=image_inputs,
+        videos=video_inputs,
+        padding=True,
+        return_tensors="pt",
+    )
+    
+    inputs = inputs.to(model.device)
+    
+    generated_ids = model.generate(**inputs, max_new_tokens=128, do_sample=False)
+    generated_ids_trimmed = [
+        out_ids[len(in_ids) :] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
+    ]
+    response = processor.batch_decode(
+        generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
+    )
+    
+    if isinstance(response, list):
+        response = response[0]
+    
+    # 먼저 text grounding 시도
+    try:
+        coord = parse_coord(response)
+        orig_w, orig_h = image.size
+        norm_coord = normalize_point(denorm_point=coord, orig_w=orig_w, orig_h=orig_h)
+        
+        # 점수는 1.0으로 설정 (text grounding에서는 점수 정보가 없음)
+        return {
+            'topk_points': [norm_coord],
+            'topk_values': [1.0],
+            'raw_response': response,
+            'method': 'text_grounding'
+        }
+    except Exception as e:
+        # Text grounding 실패시 attention 기반 fallback 사용
+        print(f"⚠️ Text grounding failed, using attention fallback: '{response[:50]}...', error: {str(e)}")
+        
+        try:
+            # Attention 기반 추론을 위한 대화 생성
+            attn_conversation = [
+                {
+                    "role": "system", 
+                    "content": [{"type": "text", "text": "You are a GUI agent. Given a screenshot and instruction, locate the element."}]
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image", "image": image},
+                        {"type": "text", "text": f"Where should you tap to {instruction}?", "payload": instruction}
+                    ],
+                }
+            ]
+            
+            # Attention 기반 추론 수행 (qwen_attn_inference 사용)
+            attn_result = qwen_attn_inference(
+                conversation=attn_conversation, 
+                model=model, 
+                processor=processor,
+                topk=10,  # 여러 점 추출
+                layer_start=20, 
+                layer_end=31, 
+                vis_dir=None
+            )
+            
+            # Attention 결과에서 topk 점들을 반환
+            topk_points = attn_result.get('topk_points', [])
+            topk_values = attn_result.get('topk_values', [])
+            
+            if topk_points:
+                return {
+                    'topk_points': topk_points[:10],  # 최대 10개
+                    'topk_values': topk_values[:10],
+                    'raw_response': response,
+                    'error': str(e),
+                    'method': 'attention_fallback'
+                }
+            else:
+                # Attention도 실패한 경우
+                return {
+                    'topk_points': [],
+                    'topk_values': [],
+                    'raw_response': response,
+                    'error': str(e),
+                    'method': 'failed'
+                }
+                
+        except Exception as attn_e:
+            print(f"⚠️ Attention fallback also failed: {str(attn_e)}")
+            return {
+                'topk_points': [],
+                'topk_values': [],
+                'raw_response': response,
+                'error': f"Text: {str(e)}, Attention: {str(attn_e)}",
+                'method': 'failed'
+            }
+
+def qwen_multi_image_grounding_inference(
+    crop_list, instruction, model, processor, tokenizer, *, topk=10, vis_dir=None
+):
+    """각 crop에 대해 Qwen text grounding을 수행"""
+    
+    per_image = []
+    
+    for i, crop_info in enumerate(crop_list):
+        crop_image = crop_info['img']
+        
+        # 각 crop에 대해 text grounding 수행
+        result = qwen_text_grounding_inference(
+            image=crop_image,
+            instruction=instruction,
+            model=model,
+            processor=processor,
+            tokenizer=tokenizer
+        )
+        
+        # 결과 처리 (text grounding 또는 attention fallback)
+        points = result['topk_points']
+        values = result['topk_values']
+        method = result.get('method', 'unknown')
+        
+        # topk개까지 확장
+        extended_points = []
+        extended_values = []
+        
+        if points:  # 성공적으로 점을 찾은 경우
+            if method == 'attention_fallback':
+                # Attention fallback의 경우 이미 여러 점이 있을 수 있음
+                extended_points = points[:topk]
+                extended_values = values[:len(extended_points)]
+            else:
+                # Text grounding의 경우 1개 점을 확장
+                for j in range(min(topk, 10)):  # 최대 10개까지
+                    if j < len(points):
+                        extended_points.append(points[j])
+                        extended_values.append(values[j])
+                    else:
+                        # 같은 점을 반복하되 점수는 조금씩 감소
+                        extended_points.append(points[0])
+                        extended_values.append(values[0] * (0.9 ** (j - len(points) + 1)))
+        
+        per_image.append({
+            "index": i,
+            "topk_points": extended_points,
+            "topk_values": extended_values,
+            "raw_response": result.get('raw_response', ''),
+            "error": result.get('error', None),
+            "method": result.get('method', 'unknown')
+        })
+        
+        if STAGE2_VIS and vis_dir:
+            # 시각화 코드 (method에 따라 다른 색상)
+            if extended_points:
+                color = (0, 255, 0) if method == 'text_grounding' else (255, 165, 0) if method == 'attention_fallback' else (255, 0, 0)
+                point_vis = draw_points_on_image(crop_image, extended_points[:3], extended_values[:3], color=color)
+                method_suffix = f"_{method}" if method != 'unknown' else ""
+                point_vis.save(f"{vis_dir}/crop_{i}_grounding{method_suffix}.png")
+    
+    return {"per_image": per_image}
+
+
 def create_conversation_stage1(image, instruction, resize_ratio):
+    
     conversation = [
         {
             "role": "system",
@@ -125,14 +511,15 @@ def create_conversation_stage1(image, instruction, resize_ratio):
                 {
                     "type": "text",
                     "text": (
-                        # Additional prompt
+                        # 추가 content
                         f"This is a resized screenshot of the whole GUI, scaled by {resize_ratio}. "
-                        # previous prompt
+                        # 기존 content
                         "You are a GUI agent. Given a screenshot of the current GUI and a human instruction, "
                         "your task is to locate the screen element that corresponds to the instruction. "
-                        "You should output a PyAutoGUI action that performs a click on the correct position. "
-                        "To indicate the click location, we will use some special tokens, which is used to refer to a visual patch later. "
-                        "For example, you can output: pyautogui.click(<your_special_token_here>)."
+                        
+                        # "You should output a PyAutoGUI action that performs a click on the correct position. "
+                        # "To indicate the click location, we will use some special tokens, which is used to refer to a visual patch later. "
+                        # "For example, you can output: pyautogui.click(<your_special_token_here>)."
                     ),
                 }
             ]
@@ -146,7 +533,8 @@ def create_conversation_stage1(image, instruction, resize_ratio):
                 },
                 {
                     "type": "text",
-                    "text": instruction,
+                    "text": f"Where should you tap to {instruction}?",
+                    "payload": instruction
                 }
             ],
         },
@@ -168,9 +556,9 @@ def create_conversation_stage2(crop_list, instruction):
                 {
                     "type": "text",
                     "text": (
-                        # Additional prompt
+                        # 추가 content
                         f"This is a list of {len(crop_list)} cropped screenshots of the GUI, each showing a part of the GUI. "
-                        # previous prompt
+                        # 기존 content
                         "You are a GUI agent. Given a screenshot of the current GUI and a human instruction, "
                         "your task is to locate the screen element that corresponds to the instruction. "
                         "You should output a PyAutoGUI action that performs a click on the correct position. "
@@ -190,31 +578,35 @@ def create_conversation_stage2(crop_list, instruction):
 def get_connected_region_bboxes_from_scores(
     image_result: Dict,
     threshold: float,
-    min_patches: int
+    min_patches: int = 1
 ) -> List[Dict]:
-    # 1) thresholding
+    '''
+    간단한 버전: attention * threshold 넘는 부분들을 8방향 연결로 합쳐서 box 생성
+    '''
+    # 1) 입력 파싱 및 임계값 계산
     attn_scores_1d = np.array(image_result["attn_scores"][0], dtype=np.float32)
     n_w = int(image_result["n_width"])
     n_h = int(image_result["n_height"])
     attn = attn_scores_1d.reshape(n_h, n_w)
     
     vmax = float(attn.max()) if attn.size > 0 else 0.0
-    thr_val = float(vmax * threshold)
+    thr_val = float(vmax * threshold) if threshold <= 1.0 else float(threshold)
     
-    # 2) make mask
+    # 2) 기준 넘는 패치들 마스크 생성
     mask = (attn >= thr_val)
-
-    # 3) BFS to find connected regions
+    
+    # 3) BFS로 연결된 영역들 찾기
     visited = np.zeros_like(mask, dtype=bool)
     regions = []
-    neighbors = [(di, dj) for di in (-1,0,1) for dj in (-1,0,1) if not (di==0 and dj==0)]  # 8 directions
-    # neighbors = [(-1,0), (1,0), (0,-1), (0,1)]  # 4 neighbors Ablation
-
+    neighbors = [(di, dj) for di in (-1,0,1) for dj in (-1,0,1) if not (di==0 and dj==0)]  # 8방향
+    # neighbors =   # TODO: 4방향 비교
+    
     for y in range(n_h):
         for x in range(n_w):
             if not mask[y, x] or visited[y, x]:
                 continue
-
+                
+            # BFS로 연결된 영역 찾기
             region = [(y, x)]
             queue = deque([(y, x)])
             visited[y, x] = True
@@ -231,8 +623,8 @@ def get_connected_region_bboxes_from_scores(
             
             if len(region) >= min_patches:
                 regions.append(region)
-
-    # 4) calculate bbox and scores for each region
+    
+    # 4) 각 영역의 bbox와 점수 계산
     out = []
     for region in regions:
         ys = [p[0] for p in region]
@@ -240,15 +632,16 @@ def get_connected_region_bboxes_from_scores(
         y_min, y_max = min(ys), max(ys)
         x_min, x_max = min(xs), max(xs)
         
+        # 정규화된 bbox
         l = x_min / n_w
         t = y_min / n_h  
         r = (x_max + 1) / n_w
         b = (y_max + 1) / n_h
         
+        # 점수 계산
         region_scores = attn[ys, xs]
         score_sum = float(region_scores.sum())
         score_mean = float(region_scores.mean())
-        score_max = float(region_scores.max())
         
         out.append({
             "bbox": [l, t, r, b],
@@ -256,72 +649,43 @@ def get_connected_region_bboxes_from_scores(
             "size": int(len(region)),
             "score_sum": score_sum,
             "score_mean": score_mean,
-            "score_max": score_max,
             "score_norm": score_sum / (vmax * len(region) + 1e-9),
         })
     
-    # 5) sort by score_sum
+    # 5) 점수순 정렬
     out.sort(key=lambda x: x["score_sum"], reverse=True)
-
     return out
 
-def run_stage1_attention_inference(original_image, instruction):
-    """Stage 1: resize and inference"""
+def run_stage1_attention_inference(original_image, instruction, vis_dir=None):
+    """Stage 1: 리사이즈하고 inference"""
 
     orig_w, orig_h = original_image.size
+    # 이미지 고정 리사이즈
     resize_ratio = RESIZE_RATIO
     resized_w, resized_h = int(orig_w * resize_ratio), int(orig_h * resize_ratio)
+    
+    # 리사이즈된 이미지로 inference
     resized_image = original_image.resize((resized_w, resized_h))
-    
     conversation = create_conversation_stage1(resized_image, instruction, resize_ratio)
-    pred = inference(conversation, model, tokenizer, processor, use_placeholder=True, topk=1)
-    
+    #! =================== multi image inference ===================
+    pred = qwen_attn_inference(
+        conversation, model, processor,
+        topk=1,               # crop은 한 점 기준이면 1
+        layer_start=20,       # 필요 시 28~31로 더 좁혀도 됨
+        layer_end=31,
+        vis_dir=s1_dir
+    )
+
+    #! =================== multi image inference ===================
+    # 결과에 리사이즈 정보 추가
     pred['resize_ratio'] = resize_ratio
     pred['original_size'] = (orig_w, orig_h)
     pred['resized_size'] = resized_image.size
     
     return pred, resized_image
 
-def remove_contained_bboxes(regions):
-    """Remove completely contained bboxes (keep only larger bboxes)"""
-    if len(regions) <= 1:
-        return regions
-
-    filtered_regions = []
-    
-    for i, region in enumerate(regions):
-        bbox_i = region['bbox_padded']  # [left, top, right, bottom]
-        is_contained = False
-        
-        # Compare with already filtered regions
-        for filtered_region in filtered_regions:
-            bbox_f = filtered_region['bbox_padded']
-            
-            # Check if region is completely contained in filtered_region
-            if (bbox_f[0] <= bbox_i[0] and  # left
-                bbox_f[1] <= bbox_i[1] and  # top  
-                bbox_f[2] >= bbox_i[2] and  # right
-                bbox_f[3] >= bbox_i[3]):    # bottom
-                is_contained = True
-                break
-            
-            # Check if filtered_region is completely contained in region (found larger region)
-            elif (bbox_i[0] <= bbox_f[0] and  # left
-                  bbox_i[1] <= bbox_f[1] and  # top
-                  bbox_i[2] >= bbox_f[2] and  # right
-                  bbox_i[3] >= bbox_f[3]):    # bottom
-                # Found larger region, so remove existing one and add new one
-                filtered_regions.remove(filtered_region)
-                break
-        
-        # Add only if not contained
-        if not is_contained:
-            filtered_regions.append(region)
-    
-    return filtered_regions
-
 def find_connected_regions(pred_result, resized_image, resize_ratio):
-    """Find connected regions from attention"""
+    """어텐션에서 연결된 영역들 찾기"""
 
     regions = get_connected_region_bboxes_from_scores(
         image_result=pred_result,
@@ -333,59 +697,52 @@ def find_connected_regions(pred_result, resized_image, resize_ratio):
     orig_w = resized_w / resize_ratio
     orig_h = resized_h / resize_ratio
     
-    # Convert each region to original image size and compose information
+    # 각 영역을 원본 이미지 크기로 변환하고 정보 구성
     connected_regions = []
     for i, region in enumerate(regions):
-        # Convert normalized bbox to resized image pixel coordinates
-        l, t, r, b = region["bbox"]  # Normalized coordinates (0~1)
+        # 정규화된 bbox를 리사이즈된 이미지 픽셀 좌표로 변환
+        l, t, r, b = region["bbox"]  # 정규화된 좌표 (0~1)
         
-        # Pixel coordinates in resized image
+        # 리사이즈된 이미지에서의 픽셀 좌표
         resized_left = l * resized_w
         resized_top = t * resized_h
         resized_right = r * resized_w
         resized_bottom = b * resized_h
         
-        # Convert to original image size
+        # 원본 이미지 크기로 변환
         orig_left = resized_left / resize_ratio
         orig_top = resized_top / resize_ratio
         orig_right = resized_right / resize_ratio
         orig_bottom = resized_bottom / resize_ratio
         
-        # Apply padding to bbox
+        # bbox에 패딩 적용
         padded_left = max(0, int(orig_left - BBOX_PADDING))
         padded_top = max(0, int(orig_top - BBOX_PADDING))
         padded_right = min(orig_w, int(orig_right + BBOX_PADDING))
         padded_bottom = min(orig_h, int(orig_bottom + BBOX_PADDING))
         
-        # Calculate region center point (based on bbox before padding)
+        # 영역 중심점 계산 (패딩 적용 전 bbox 기준)
         center_x = (orig_left + orig_right) / 2
         center_y = (orig_top + orig_bottom) / 2
         
         connected_regions.append({
             'center_x': center_x,
             'center_y': center_y,
-            'score_sum': region["score_sum"],  # Sum of scores within region
-            'score_mean': region["score_mean"],  # Average score within region
-            'score_max': region["score_max"],  # Maximum score within region
-            'size': region["size"],  # Number of patches
-            'bbox_original': [int(orig_left), int(orig_top), int(orig_right), int(orig_bottom)],  # bbox before padding
-            'bbox_padded': [padded_left, padded_top, padded_right, padded_bottom],  # bbox after padding (for actual cropping)
-            'region_info': region  # Original region information
+            'score': region["score_sum"],  # 영역 내 점수 합
+            'score_mean': region["score_mean"],  # 영역 내 점수 평균
+            'size': region["size"],  # 패치 수
+            'bbox_original': [int(orig_left), int(orig_top), int(orig_right), int(orig_bottom)],  # 패딩 전 bbox
+            'bbox_padded': [padded_left, padded_top, padded_right, padded_bottom],  # 패딩 후 bbox (실제 크롭용)
+            'region_info': region  # 원본 영역 정보
         })
     
-    # Sort by sum of scores within region (descending)
-    connected_regions.sort(key=lambda x: x['score_sum'], reverse=True)
-
-    # Sort by maximum score within region (descending)
-    # connected_regions.sort(key=lambda x: x['score_max'], reverse=True)
-
-    # Remove completely contained bboxes (keep only larger bboxes)
-    connected_regions = remove_contained_bboxes(connected_regions)
+    # 점수 합이 높은 순서로 정렬
+    connected_regions.sort(key=lambda x: x['score'], reverse=True)
     
     return connected_regions
 
 def create_crops_from_connected_regions(regions, original_image):
-    """Crop directly from original image based on connected regions"""
+    """연결된 영역들을 기반으로 원본 이미지에서 직접 crop"""
     
     if not regions:
         return []
@@ -393,30 +750,40 @@ def create_crops_from_connected_regions(regions, original_image):
     crops = []
     
     for i, region in enumerate(regions):
-        bbox = region['bbox_padded']  # Use bbox with padding applied
+        bbox = region['bbox_padded']  # 패딩이 적용된 bbox 사용
         crop_img = original_image.crop(bbox)
         
         crops.append({
             'img': crop_img,
             'bbox': bbox,
-            'score': region['score_sum'],
+            'score': region['score'],
             'id': i + 1,
-            'region_info': region  # Include original region information
+            'region_info': region  # 원본 영역 정보 포함
         })
     
     return crops
 
-def run_stage2_multi_image_inference(crop_list, instruction):
-    """Stage 2: multi image inference"""
-    conversation = create_conversation_stage2(crop_list, instruction)
-    pred = multi_image_inference(conversation, model, tokenizer, processor, use_placeholder=True, topk=10)
+def run_stage2_multi_image_inference(crop_list, instruction, vis_dir=None):
+    """Stage 2: Qwen text-based grounding - 각 crop별로 text grounding 수행"""
     
+    # Qwen의 text grounding을 각 crop에 대해 수행
+    pred = qwen_multi_image_grounding_inference(
+        crop_list=crop_list,
+        instruction=instruction,
+        model=model,
+        processor=processor,
+        tokenizer=tokenizer,
+        topk=10,  # 각 crop당 상위 10개 점 (실제로는 1개 점을 확장)
+        vis_dir=vis_dir
+    )
+
     return pred
 
+
 def convert_multi_image_results_to_original(multi_pred, crop_list):
-    """Convert multi_image_inference results to original image coordinates"""
+    """text grounding 결과를 원본 이미지 좌표로 변환"""
     
-    # Convert each crop's results to original coordinates
+    # 각 crop별 결과를 원본 좌표로 변환
     converted_results = []
     all_candidates = []
     
@@ -429,23 +796,32 @@ def convert_multi_image_results_to_original(multi_pred, crop_list):
         crop_width = crop_bbox[2] - crop_bbox[0]
         crop_height = crop_bbox[3] - crop_bbox[1]
         
-        # Convert topk results of the image to original coordinates
+        # text grounding 결과에서 점들과 점수 추출
+        topk_points = img_result.get('topk_points', [])
+        topk_values = img_result.get('topk_values', [])
+        
+        # 해당 이미지의 결과들을 원본 좌표로 변환
         crop_candidates = []
-        for point_idx, (point, score) in enumerate(zip(img_result['topk_points'], img_result['topk_values'])):
-            # Convert normalized coordinates to pixel coordinates within crop
+        for point_idx, (point, score) in enumerate(zip(topk_points, topk_values)):
+            if not point:  # 빈 점인 경우 스킵
+                continue
+                
+            # 정규화된 좌표를 crop 내 픽셀 좌표로 변환
             crop_x = point[0] * crop_width
             crop_y = point[1] * crop_height
             
-            # Convert crop coordinates to original image coordinates
+            # crop 좌표를 원본 이미지 좌표로 변환
             original_x = crop_bbox[0] + crop_x
             original_y = crop_bbox[1] + crop_y
             
             candidate = {
                 'point': [original_x, original_y],
-                'score': score,
+                'score': float(score),
                 'crop_id': crop_info['id'],
                 'crop_bbox': crop_bbox,
-                'rank_in_crop': point_idx
+                'rank_in_crop': point_idx,
+                'raw_response': img_result.get('raw_response', ''),
+                'error': img_result.get('error', None)
             }
             crop_candidates.append(candidate)
             all_candidates.append(candidate)
@@ -453,58 +829,62 @@ def convert_multi_image_results_to_original(multi_pred, crop_list):
         converted_results.append({
             'crop_id': crop_info['id'],
             'crop_bbox': crop_bbox,
-            'candidates': crop_candidates
+            'candidates': crop_candidates,
+            'raw_response': img_result.get('raw_response', ''),
+            'error': img_result.get('error', None)
         })
     
-    # Sort all candidates by score
+    # 모든 후보들을 점수순으로 정렬
     all_candidates.sort(key=lambda x: x['score'], reverse=True)
     
     return all_candidates
 
-def run_stage1_attention_based(original_image, instruction, gt_bbox):
-    """New simple Stage 1: Connected region-based crop generation"""
+def run_stage1_attention_based(original_image, instruction, gt_bbox, vis_dir=None):
+    """새로운 간단한 Stage 1: 연결된 영역 기반 crop 생성"""
     
-    # 1. Resize and inference
-    s1_pred, resized_image = run_stage1_attention_inference(original_image, instruction)
+    # 1. 리사이즈하고 inference
+    s1_pred, resized_image = run_stage1_attention_inference(original_image, instruction, vis_dir)
     
-    # 2. Adjust GT bbox according to resize ratio
+    # 2. GT bbox도 리사이즈 비율에 맞춰 조정
     resize_ratio = s1_pred['resize_ratio']
     scaled_gt_bbox = [coord * resize_ratio for coord in gt_bbox]
     
-    # 3. Find connected regions
+    # 3. 연결된 영역들 찾기
     regions = find_connected_regions(s1_pred, resized_image, resize_ratio)
 
     regions = regions[:MAX_CROPS]
     
-    # 5. Generate crops directly from original image
+    # 5. 원본 이미지에서 직접 crop 생성
     crops = create_crops_from_connected_regions(regions, original_image)
     
     num_crops = len(crops)
+
+
     
     return s1_pred, crops, num_crops, resized_image, scaled_gt_bbox
 
 def get_stage1_score_at_point(point, s1_attn_scores, s1_n_width, s1_n_height, original_size, resize_ratio):
-    """Calculate Stage1 attention score at specific point"""
+    """특정 점에서의 Stage1 어텐션 점수를 계산"""
     
     orig_w, orig_h = original_size
     point_x, point_y = point
     
-    # Convert original coordinates to resized coordinates
+    # 원본 좌표를 리사이즈된 좌표로 변환
     resized_x = point_x * resize_ratio
     resized_y = point_y * resize_ratio
     
-    # Convert resized coordinates to patch coordinates
+    # 리사이즈된 좌표를 패치 좌표로 변환
     resized_w = orig_w * resize_ratio
     resized_h = orig_h * resize_ratio
     
     patch_x = int((resized_x / resized_w) * s1_n_width)
     patch_y = int((resized_y / resized_h) * s1_n_height)
     
-    # Check if patch coordinates are within valid range
+    # 패치 좌표가 유효한 범위 내인지 확인
     patch_x = max(0, min(patch_x, s1_n_width - 1))
     patch_y = max(0, min(patch_y, s1_n_height - 1))
     
-    # Return attention score of the corresponding patch
+    # 해당 패치의 어텐션 점수 반환
     patch_idx = patch_y * s1_n_width + patch_x
     if patch_idx < len(s1_attn_scores):
         return float(s1_attn_scores[patch_idx])
@@ -512,7 +892,7 @@ def get_stage1_score_at_point(point, s1_attn_scores, s1_n_width, s1_n_height, or
         return 0.0
 
 def point_in_bbox(point, bbox):
-    """Check if point is inside bbox"""
+    """점이 bbox 안에 있는지 확인"""
     if point is None or bbox is None:
         return False
     return bbox[0] <= point[0] <= bbox[2] and bbox[1] <= point[1] <= bbox[3]
@@ -524,13 +904,21 @@ if __name__ == '__main__':
     set_seed(SEED)
 
     # Model Import
-    device_map = "mps" if args.mac else "balanced"
+    # device_map = "mps" if args.mac else "balanced"
 
-    model = Qwen2_5_VLForConditionalGenerationWithPointer.from_pretrained(
-        MLLM_PATH, torch_dtype="auto", attn_implementation=ATTN_IMPL,
+    # model = Qwen2_5_VLForConditionalGenerationWithPointer.from_pretrained(
+    #     MLLM_PATH, torch_dtype="auto", attn_implementation=ATTN_IMPL,
+    #     device_map=device_map,
+    #     # max_memory=max_memory, 
+    #     low_cpu_mem_usage=True
+    # )
+    device_map = "mps" if args.mac else "auto"
+    model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+        MLLM_PATH,
+        torch_dtype="auto",
+        attn_implementation=ATTN_IMPL,
         device_map=device_map,
-        # max_memory=max_memory, 
-        low_cpu_mem_usage=True
+        low_cpu_mem_usage=True,
     )
     tokenizer = AutoTokenizer.from_pretrained(MLLM_PATH)
     processor = AutoProcessor.from_pretrained(MLLM_PATH, max_pixels=MAX_PIXELS)
@@ -538,12 +926,14 @@ if __name__ == '__main__':
     if TFOPS_PROFILING:
         prof = FlopsProfiler(model)
 
-    warm_up_model(model, tokenizer, processor)
+    # warm_up_model(model, tokenizer, processor)
+    device = "mps" if args.mac else "cuda" if torch.cuda.is_available() else "cpu"
+    warm_up_model(model, processor, device)
 
     if TFOPS_PROFILING:
         prof.start_profile()
 
-    # Generate unique name if save_dir folder already exists (save_dir -> save_dir_1 -> save_dir_2)
+    # save_dir 폴더명이 이미 존재하면 고유한 이름 생성 (save_dir -> save_dir_1 -> save_dir_2)
     save_dir = SAVE_DIR
     suffix = 0
     while os.path.exists(save_dir):
@@ -551,7 +941,7 @@ if __name__ == '__main__':
         save_dir = f"{SAVE_DIR}_{suffix}"
     os.makedirs(save_dir)
 
-    # Initialize overall task statistics variables
+    # 전체 task 통계 변수 초기화
     total_samples = 0
     total_crop_success = 0
     total_stage1_success = 0
@@ -563,10 +953,10 @@ if __name__ == '__main__':
     total_s1_tflops = 0.0
     total_s2_tflops = 0.0
 
-    # Define CSV headers (commonly used across all tasks)
+    # CSV 헤더 정의 (모든 task에서 공통 사용)
     csv_headers = [
-        "model_name", "experiment",
-        "resize_ratio", "region_threshold", "bbox_padding","ensemble_ratio",
+        "method",
+        "resize_ratio", "region_threshold", "bbox_padding",
         "total_samples", "crop_accuracy", "stage1_accuracy", "stage2_accuracy", "stage3_accuracy",
         "avg_stage1_time", "avg_stage2_time", "avg_stage3_time", "avg_total_time",
         "avg_stage1_tflops", "avg_stage2_tflops", "avg_total_tflops",
@@ -575,12 +965,12 @@ if __name__ == '__main__':
 
     # Process
     for task in TASKS:
-        # Create separate log file for each task
+        # 각 task별로 별도의 로그 파일 생성
         init_iter_logger(  
             save_dir=save_dir,
             csv_name=f"iter_log_{task}.csv",
             md_name=f"iter_log_{task}.md",
-            headers=[  # Entered in order
+            headers=[  # 순서 그대로 들어감
                 "idx", "orig_w", "orig_h", "resize_ratio",
                 "num_crop", "crop_hit",
                 "s1_time", "s1_tflops", "s1_hit", 
@@ -599,15 +989,22 @@ if __name__ == '__main__':
 
         print("Num of sample: " + str(len(screenspot_data)), flush=True)
 
-        # Initialize statistics variables
+        # 통계 변수 초기화
         task_res = []
         num_action = 0
         s1_time_sum = s2_time_sum = s3_time_sum = 0.0
         s1_tflops_sum = s2_tflops_sum = 0.0
         crop_success_count = stage1_success_count = stage2_success_count = stage3_success_count = 0
         
-        # Initialize statistics variables by data_source
+        # data_source별 통계 변수 초기화
         data_source_stats = {}
+        
+        # Stage2 method 통계 초기화
+        method_stats = {
+            'text_grounding': 0,
+            'attention_fallback': 0,
+            'failed': 0
+        }
 
         if MEMORY_VIS:
             memory_dir = os.path.join(save_dir, "gpu_usage", task)
@@ -620,7 +1017,7 @@ if __name__ == '__main__':
 
             print("\n\n----------------------\n")
             
-            # Load file and data
+            # 파일 및 데이터 로드
             filename = item["img_filename"]
             filename_wo_ext, ext = os.path.splitext(filename)
             img_path = os.path.join(SCREENSPOT_IMGS, filename)
@@ -635,8 +1032,20 @@ if __name__ == '__main__':
 
             orig_w, orig_h = original_image.size
 
-            # Extract data_source information (default to "unknown" if not present)
+            # data_source 정보 추출 (없으면 "unknown"으로 기본값 설정)
             data_source = item.get("data_source", "unknown")
+
+
+            if any([STAGE1_VIS, STAGE2_VIS]):
+                inst_dir_name = re.sub(r'\W+', '_', instruction).strip('_')
+                inst_dir = os.path.join(save_dir, "seg", filename_wo_ext, inst_dir_name)
+                s1_dir = os.path.join(inst_dir, "stage1") 
+                s2_dir = os.path.join(inst_dir, "stage2")
+                os.makedirs(s1_dir, exist_ok=True)
+                os.makedirs(s2_dir, exist_ok=True)
+            else:
+                inst_dir = s1_dir = s2_dir = None
+            print(s1_dir)
 
             #! ==================================================================
             #! Stage 1 | Attention-based Crop Generation
@@ -650,7 +1059,8 @@ if __name__ == '__main__':
             s1_pred, s1_crop_list, num_crops, resized_image, scaled_gt_bbox = run_stage1_attention_based(
                 original_image=original_image,
                 instruction=instruction,
-                gt_bbox=original_bbox
+                gt_bbox=original_bbox,
+                vis_dir=s1_dir
             )
 
             s1_end = time.time()
@@ -659,12 +1069,12 @@ if __name__ == '__main__':
             if TFOPS_PROFILING:
                 s1_tflops = prof.get_total_flops() / 1e12
 
-            # Check Stage1 Grounding success (actual prediction result)
+            # Stage1 Grounding 성공 여부 확인 (실제 예측 결과)
             s1_success = False
             s1_original_point = None
             if s1_pred and "topk_points" in s1_pred and s1_pred["topk_points"]:
-                s1_predicted_point = s1_pred["topk_points"][0]  # Normalized coordinates (0~1)
-                # Convert normalized coordinates to original image pixel coordinates
+                s1_predicted_point = s1_pred["topk_points"][0]  # 정규화된 좌표 (0~1)
+                # 정규화된 좌표를 원본 이미지 픽셀 좌표로 변환
                 s1_original_point = [
                     s1_predicted_point[0] * original_image.size[0],
                     s1_predicted_point[1] * original_image.size[1]
@@ -675,7 +1085,7 @@ if __name__ == '__main__':
             if s1_success:
                 stage1_success_count += 1
 
-            # Check if GT bbox and crop bbox overlap (success if intersection exists)
+            # GT bbox와 crop bbox가 겹치는지 확인 (교집합이 있으면 성공)
             crop_success = False
             for crop in s1_crop_list:
                 crop_bbox = crop["bbox"]
@@ -702,15 +1112,29 @@ if __name__ == '__main__':
 
             s2_inference_start = time.time()
             
-            # Multi-image inference
-            s2_pred = run_stage2_multi_image_inference(s1_crop_list, instruction)
+            # 멀티 이미지로 inference
+            s2_pred = run_stage2_multi_image_inference(s1_crop_list, instruction, vis_dir=s2_dir)
 
-            # Convert Stage2 multi-image results to original coordinates
+            # Stage2 multi-image 결과를 원본 좌표로 변환
             s2_all_candidates = convert_multi_image_results_to_original(s2_pred, s1_crop_list)
             
-            # Check Stage2 success
-            s2_corrected_point = s2_all_candidates[0]['point']  # Highest point
-            stage2_success = point_in_bbox(s2_corrected_point, original_bbox)
+            # Stage2 method 통계 업데이트
+            for img_result in s2_pred.get('per_image', []):
+                method = img_result.get('method', 'unknown')
+                if method in method_stats:
+                    method_stats[method] += 1
+                elif method == 'unknown':
+                    method_stats['failed'] += 1
+            
+            # Stage2 성공 여부 확인
+            if s2_all_candidates:
+                s2_corrected_point = s2_all_candidates[0]['point']  # 최고점
+                stage2_success = point_in_bbox(s2_corrected_point, original_bbox)
+            else:
+                # Stage2에서 결과를 얻지 못한 경우
+                s2_corrected_point = None
+                stage2_success = False
+                print(f"⚠️ Stage2 failed to get any candidates for item {j}")
 
             s2_inference_end = time.time()
             s2_time = s2_inference_end - s2_inference_start
@@ -730,36 +1154,40 @@ if __name__ == '__main__':
             stage3_success = False
             
             s3_start = time.time()
-            # Stage1 attention information
+            # Stage1 어텐션 정보
             s1_attn_scores = np.array(s1_pred['attn_scores'][0])
             s1_n_width = s1_pred['n_width']
             s1_n_height = s1_pred['n_height']
             s1_resize_ratio = s1_pred['resize_ratio']
             
-            # Get Stage1 attention maximum score
+            # Stage1 attention 최고점수 구하기
             s1_max_score = float(max(s1_attn_scores)) if len(s1_attn_scores) > 0 else 1.0
             
-            # Get Stage2 topk candidate maximum score
-            s2_topk_scores = [candidate['score'] for candidate in s2_all_candidates]
-            s2_max_score = max(s2_topk_scores)
+            # Stage2에서 topk 후보 최고점수 구하기
+            if s2_all_candidates:
+                s2_topk_scores = [candidate['score'] for candidate in s2_all_candidates]
+                s2_max_score = max(s2_topk_scores)
+            else:
+                s2_topk_scores = []
+                s2_max_score = 1.0  # 기본값
 
-            # Calculate ensemble score for each Stage2 topk point
+            # 각 Stage2 topk 점에 대해 앙상블 점수 계산
             ensemble_candidates = []
             
             for i, candidate in enumerate(s2_all_candidates):
                 s2_original_point = candidate['point']
                 
-                # Calculate Stage1 score at that point (normalized value)
+                # 해당 점에서의 Stage1 점수 계산 (정규화된 값)
                 s1_raw_score = get_stage1_score_at_point(
                     s2_original_point, s1_attn_scores, s1_n_width, s1_n_height, 
                     original_image.size, s1_resize_ratio
                 )
 
-                # Normalize each score based on maximum
+                # 각 점수 최고점 기준으로 정규화
                 s1_score = s1_raw_score / s1_max_score
                 s2_score = candidate['score'] / s2_max_score
                 
-                # Calculate ensemble score
+                # 앙상블 점수 계산
                 ensemble_score = STAGE1_ENSEMBLE_RATIO * s1_score + STAGE2_ENSEMBLE_RATIO * s2_score
                 
                 ensemble_candidates.append({
@@ -769,21 +1197,31 @@ if __name__ == '__main__':
                     's2_score': s2_score,
                     'crop_id': candidate['crop_id'],
                     'rank_in_crop': candidate['rank_in_crop'],
-                    's2_rank': i + 1  # Rank within topk
+                    's2_rank': i + 1  # topk 내에서의 순위
                 })
             
-            # Select point with highest score
-            best_candidate = max(ensemble_candidates, key=lambda x: x['score'])
-            s3_ensemble_point = best_candidate['point']
+            # 최고 점수를 가진 점 선택
+            if ensemble_candidates:
+                best_candidate = max(ensemble_candidates, key=lambda x: x['score'])
+                s3_ensemble_point = best_candidate['point']
+                # 앙상블 결과로 성공 여부 확인
+                stage3_success = point_in_bbox(s3_ensemble_point, original_bbox)
+            else:
+                # 앙상블 후보가 없는 경우 Stage1 결과 사용
+                if s1_pred.get('topk_points') and len(s1_pred['topk_points']) > 0:
+                    s1_point = s1_pred['topk_points'][0]  # 정규화된 좌표
+                    orig_w, orig_h = original_image.size
+                    s3_ensemble_point = [s1_point[0] * orig_w, s1_point[1] * orig_h]
+                else:
+                    s3_ensemble_point = None
+                stage3_success = False if s3_ensemble_point is None else point_in_bbox(s3_ensemble_point, original_bbox)
+                print(f"⚠️ Stage3 ensemble failed, using Stage1 result for item {j}")
 
             s3_end = time.time()
             s3_time = s3_end - s3_start
             
-            # Save candidates for visualization
+            # 시각화를 위해 후보들 저장
             s3_ensemble_candidates = ensemble_candidates
-            
-            # Check success with ensemble result
-            stage3_success = point_in_bbox(s3_ensemble_point, original_bbox)
             
             s3_hit = "✅" if stage3_success else "❌"
             if stage3_success:
@@ -794,7 +1232,6 @@ if __name__ == '__main__':
             #! ==================================================================
             
             if VISUALIZE and (not VIS_ONLY_WRONG or not stage3_success):
-            # if VISUALIZE and (not VIS_ONLY_WRONG or not stage3_success) and num_crops >= 2:
                 inst_dir_name = re.sub(r'\W+', '_', instruction).strip('_')
                 result_folder = "correct" if stage3_success else "incorrect"
                 inst_dir = os.path.join(save_dir, f"{task}_visualize_{result_folder}", f"{num_action}_{inst_dir_name}")
@@ -811,8 +1248,8 @@ if __name__ == '__main__':
                     s1_predicted_point=s1_original_point
                 )
                 
-                # Stage2 Multi-Image visualization
-                if s2_pred and s1_crop_list:  # Visualize only when Stage2 results exist
+                # Stage2 Multi-Image 시각화
+                if s2_pred and s1_crop_list:  # Stage2 결과가 있을 때만 시각화
                     visualize_stage2_multi_attention(
                         s2_pred=s2_pred,
                         crop_list=s1_crop_list,
@@ -822,7 +1259,7 @@ if __name__ == '__main__':
                         predicted_point=s2_corrected_point
                     )
                 
-                # Stage3 ensemble visualization
+                # Stage3 앙상블 시각화
                 visualize_stage3_point_ensemble(
                     s3_ensemble_candidates=s3_ensemble_candidates if 's3_ensemble_candidates' in locals() else [],
                     original_image=original_image,
@@ -842,17 +1279,17 @@ if __name__ == '__main__':
             #! [Common Processing]
             #! ==================================================================
             
-            # Update common statistics
+            # 공통 통계 업데이트
             s1_time_sum += s1_time
             s2_time_sum += s2_time
             s3_time_sum += s3_time
             s1_tflops_sum += s1_tflops
             s2_tflops_sum += s2_tflops
                 
-            # Performance logging
+            # 성능 로깅
             total_time = s1_time + s2_time
             if TFOPS_PROFILING:
-                total_tflops_this = s1_tflops + s2_tflops
+                total_tflops_this = s1_tflops + s2_tflops  # Stage3는 FLOPs 제외
 
             num_attention_crops = len(s1_crop_list)
             print(f"Task: {task}")
@@ -867,7 +1304,7 @@ if __name__ == '__main__':
             #! [Statistics & Logging]
             #! ==================================================================
 
-            # Update statistics by data_source
+            # data_source별 통계 업데이트
             if data_source not in data_source_stats:
                 data_source_stats[data_source] = {
                     'num_action': 0,
@@ -910,7 +1347,7 @@ if __name__ == '__main__':
             print(f"Up2Now Stage2 Accuracy: {up2now_s2_score:.2f}%")
             print(f"Up2Now Stage3 Ensemble Accuracy: {up2now_s3_ensemble_score:.2f}%")
 
-            # Iter log - Improved logging
+            # Iter log - 개선된 로깅
             append_iter_log(
                 idx=j+1,
                 orig_w=original_image.size[0],
@@ -936,7 +1373,7 @@ if __name__ == '__main__':
                 instruction=instruction[:50] + "..." if len(instruction) > 50 else instruction
             )
 
-            # JSON recording - Core information only
+            # JSON 기록 - 핵심 정보만
             item_res = {
                 'filename': filename,
                 'orig_w': original_image.size[0],
@@ -971,12 +1408,12 @@ if __name__ == '__main__':
             task_res.append(item_res)
 
         #! ==================================================
-        # Organize results Json
+        # 결과 Json 정리
         os.makedirs(os.path.join(save_dir, "json"), exist_ok=True)
         with open(os.path.join(save_dir, "json", dataset), "w") as f:
             json.dump(task_res, f, indent=4, ensure_ascii=False, cls=NpEncoder)
 
-        # Calculate final performance metrics
+        # 최종 성능 메트릭 계산
         metrics = {
             "task": task,
             "total_samples": num_action,
@@ -1008,7 +1445,7 @@ if __name__ == '__main__':
         with open(os.path.join(save_dir, f"results_{task}.json"), "w") as mf:
             json.dump(metrics, mf, ensure_ascii=False, indent=4)
 
-        # Save metrics by data_source
+        # data_source별 메트릭 저장
         data_source_metrics = {}
         for ds, stats in data_source_stats.items():
             if stats['num_action'] > 0:
@@ -1044,16 +1481,16 @@ if __name__ == '__main__':
         with open(os.path.join(save_dir, f"source_results_{task}.json"), "w") as dsf:
             json.dump(data_source_metrics, dsf, ensure_ascii=False, indent=4)
 
-        # Add one line with overall results to CSV file
+        # 전체 결과를 CSV 파일에 한 줄 추가
         results_csv_path = "../_results"
         os.makedirs(results_csv_path, exist_ok=True)
-        csv_file_path = os.path.join(results_csv_path, f"result_{task}.csv")
+        csv_file_path = os.path.join(results_csv_path, f"results_{task}.csv")
         
-        # Generate CSV data row
+        # CSV 데이터 행 생성
         import datetime
         csv_row = [
-            model_name, experiment,
-            RESIZE_RATIO, REGION_THRESHOLD, BBOX_PADDING,STAGE1_ENSEMBLE_RATIO,
+            method,
+            RESIZE_RATIO, REGION_THRESHOLD, BBOX_PADDING,
             num_action, 
             round(metrics['crop_accuracy'], 2),
             round(metrics['stage1_accuracy'], 2),
@@ -1069,23 +1506,32 @@ if __name__ == '__main__':
             datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         ]
         
-        # Create with header if CSV file doesn't exist, add only data row if it exists
+        # CSV 파일이 없으면 헤더와 함께 생성, 있으면 데이터 행만 추가
         import csv
         file_exists = os.path.exists(csv_file_path)
         
         with open(csv_file_path, 'a', newline='', encoding='utf-8') as csvfile:
             writer = csv.writer(csvfile)
             
-            # Add header if file doesn't exist or is empty
+            # 파일이 없거나 비어있으면 헤더 추가
             if not file_exists or os.path.getsize(csv_file_path) == 0:
                 writer.writerow(csv_headers)
             
-            # Add data row
+            # 데이터 행 추가
             writer.writerow(csv_row)
         
         print(f"📝 Results saved to CSV: {csv_file_path}")
 
-        # Accumulate to overall task statistics
+        # Stage2 Method 통계 출력
+        total_attempts = sum(method_stats.values())
+        if total_attempts > 0:
+            print(f"\n🔍 [{task.upper()}] Stage2 Method Statistics:")
+            print(f"Text Grounding: {method_stats['text_grounding']} ({method_stats['text_grounding']/total_attempts*100:.1f}%)")
+            print(f"Attention Fallback: {method_stats['attention_fallback']} ({method_stats['attention_fallback']/total_attempts*100:.1f}%)")
+            print(f"Failed: {method_stats['failed']} ({method_stats['failed']/total_attempts*100:.1f}%)")
+            print(f"Fallback Rate: {(method_stats['attention_fallback']+method_stats['failed'])/total_attempts*100:.1f}%")
+
+        # 전체 task 통계에 누적
         total_samples += num_action
         total_crop_success += crop_success_count
         total_stage1_success += stage1_success_count
@@ -1097,7 +1543,7 @@ if __name__ == '__main__':
         total_s1_tflops += s1_tflops_sum
         total_s2_tflops += s2_tflops_sum
 
-        # Output final results
+        # 최종 결과 출력
         print("=" * 60)
         print(f"📊 Final Results for {task}:")
         print(f"Total Samples: {num_action}")
@@ -1114,19 +1560,19 @@ if __name__ == '__main__':
 
     print("\n📊 All Task Done!")
 
-    # Calculate and save overall results
+    # 전체 결과 계산 및 저장
     total_crop_success_rate = total_crop_success / total_samples
     total_stage1_success_rate = total_stage1_success / total_samples
     total_stage2_success_rate = total_stage2_success / total_samples
     total_stage3_success_rate = total_stage3_success / total_samples
     
-    # Overall average time
+    # 전체 평균 시간
     avg_s1_time = total_s1_time / total_samples
     avg_s2_time = total_s2_time / total_samples
     avg_s3_time = total_s3_time / total_samples
     avg_total_time = (total_s1_time + total_s2_time + total_s3_time) / total_samples
     
-    # Overall average TFLOPS
+    # 전체 평균 TFLOPS
     avg_s1_tflops = total_s1_tflops / total_samples
     avg_s2_tflops = total_s2_tflops / total_samples
     avg_total_tflops = (total_s1_tflops + total_s2_tflops) / total_samples
@@ -1144,13 +1590,13 @@ if __name__ == '__main__':
     print(f"Total avg Stage2 TFLOPS: {avg_s2_tflops:.4f}")
     print(f"Total avg All Stage TFLOPS: {avg_total_tflops:.4f}")
     
-    # Save overall results to CSV
-    cumulative_csv_path = os.path.join("../_results", "result_all.csv")
+    # 전체 결과를 CSV로 저장
+    cumulative_csv_path = os.path.join("../_results", "results_all.csv")
     
-    # Generate overall results CSV row
+    # 전체 결과 CSV 행 생성
     cumulative_csv_row = [
-        model_name, experiment,
-        RESIZE_RATIO, REGION_THRESHOLD, BBOX_PADDING,STAGE1_ENSEMBLE_RATIO,
+        method,
+        RESIZE_RATIO, REGION_THRESHOLD, BBOX_PADDING,
         total_samples,
         round(total_crop_success_rate * 100, 2),
         round(total_stage1_success_rate * 100, 2),
@@ -1166,16 +1612,17 @@ if __name__ == '__main__':
         datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     ]
     
+    # CSV 파일이 없으면 헤더와 함께 생성, 있으면 데이터 행만 추가
     file_exists = os.path.exists(cumulative_csv_path)
     
     with open(cumulative_csv_path, 'a', newline='', encoding='utf-8') as csvfile:
         writer = csv.writer(csvfile)
         
-        # Add header if file doesn't exist or is empty
+        # 파일이 없거나 비어있으면 헤더 추가
         if not file_exists or os.path.getsize(cumulative_csv_path) == 0:
             writer.writerow(csv_headers)
         
-        # Add overall results row
+        # 전체 결과 행 추가
         writer.writerow(cumulative_csv_row)
 
     print(f"📝 Total Results : {cumulative_csv_path}")

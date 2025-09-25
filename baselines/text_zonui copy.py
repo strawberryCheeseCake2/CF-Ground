@@ -41,19 +41,21 @@ ENSEMBLE_TOP_PATCHES = 100                          # Stage2에서 앙상블에 
 
 # 최대 PIXELS 제한
 MAX_PIXELS = 3211264  # Process단에서 적용
+MIN_PIXELS = 256*28*28  # zonui 논문 세팅 그대로
+# MAX_PIXELS = 1003520  # Process단에서 적용
 
 # csv에 기록할 method 이름
-method = "osatlas"
+method = "text_zonui"
 
 # memo = f"resize{RESIZE_RATIO:.2f}_region_thresh{REGION_THRESHOLD:.2f}_pad{BBOX_PADDING}"
-memo = f"text_baseline"
+memo = f"text_baseline_10000000000_maxpixels{MAX_PIXELS}_minpixels{MIN_PIXELS}"
 
 #! Argument ==========================================================================================
 
 SEED = 0
 
 # Dataset & Model
-MLLM_PATH = "OS-Copilot/OS-Atlas-Base-4B"
+MLLM_PATH = "zonghanHZH/ZonUI-3B"
 SCREENSPOT_IMGS = "../data/screenspotv2_image"       # input image 경로
 SCREENSPOT_JSON = "../data"                          # input image json파일 경로
 TASKS = ["mobile", "web", "desktop"]
@@ -71,11 +73,6 @@ STAGE2_VIS = False
 
 # Save Path
 SAVE_DIR = f"../attn_output/" + method + "/" + memo
-
-
-
-IMAGENET_MEAN = (0.485, 0.456, 0.406)
-IMAGENET_STD = (0.229, 0.224, 0.225)
 
 #! ==================================================================================================
 
@@ -100,11 +97,8 @@ import numpy as np
 from PIL import Image
 from tqdm import tqdm
 import torch
-from transformers import AutoProcessor, AutoTokenizer, set_seed, AutoModel
+from transformers import AutoProcessor, AutoTokenizer, set_seed
 from scipy.ndimage import gaussian_filter
-from torchvision.transforms.functional import InterpolationMode
-import torch
-import torchvision.transforms as T
 
 # Project-Local Modules
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -113,8 +107,9 @@ from util.iter_logger import init_iter_logger, append_iter_log  # log csv 기록
 # from gui_actor.inference import inference
 # from gui_actor.multi_image_inference import multi_image_inference
 # Qwen2.5-VL base classes (Transformers)
-# from transformers import Qwen2_5_VLForConditionalGeneration
+from transformers import Qwen2_5_VLForConditionalGeneration
 from qwen_vl_utils import process_vision_info
+from transformers.generation import GenerationConfig
 
 import matplotlib.pyplot as plt
 from util.visualize_util import visualize_stage1_attention_crops, visualize_stage2_multi_attention, visualize_stage3_point_ensemble
@@ -122,81 +117,10 @@ from util.visualize_util_qwen25vl import draw_points_on_image
 if TFOPS_PROFILING:
     from deepspeed.profiling.flops_profiler import FlopsProfiler
 
-#! =============================================[InternVL]==========================================
-def build_transform(input_size):
-    MEAN, STD = IMAGENET_MEAN, IMAGENET_STD
-    transform = T.Compose([
-        T.Lambda(lambda img: img.convert('RGB') if img.mode != 'RGB' else img),
-        T.Resize((input_size, input_size), interpolation=InterpolationMode.BICUBIC),
-        T.ToTensor(),
-        T.Normalize(mean=MEAN, std=STD)
-    ])
-    return transform
-
-def find_closest_aspect_ratio(aspect_ratio, target_ratios, width, height, image_size):
-    best_ratio_diff = float('inf')
-    best_ratio = (1, 1)
-    area = width * height
-    for ratio in target_ratios:
-        target_aspect_ratio = ratio[0] / ratio[1]
-        ratio_diff = abs(aspect_ratio - target_aspect_ratio)
-        if ratio_diff < best_ratio_diff:
-            best_ratio_diff = ratio_diff
-            best_ratio = ratio
-        elif ratio_diff == best_ratio_diff:
-            if area > 0.5 * image_size * image_size * ratio[0] * ratio[1]:
-                best_ratio = ratio
-    return best_ratio
-
-def dynamic_preprocess(image, min_num=1, max_num=12, image_size=448, use_thumbnail=False):
-    orig_width, orig_height = image.size
-    aspect_ratio = orig_width / orig_height
-
-    # calculate the existing image aspect ratio
-    target_ratios = set(
-        (i, j) for n in range(min_num, max_num + 1) for i in range(1, n + 1) for j in range(1, n + 1) if
-        i * j <= max_num and i * j >= min_num)
-    target_ratios = sorted(target_ratios, key=lambda x: x[0] * x[1])
-
-    # find the closest aspect ratio to the target
-    target_aspect_ratio = find_closest_aspect_ratio(
-        aspect_ratio, target_ratios, orig_width, orig_height, image_size)
-
-    # calculate the target width and height
-    target_width = image_size * target_aspect_ratio[0]
-    target_height = image_size * target_aspect_ratio[1]
-    blocks = target_aspect_ratio[0] * target_aspect_ratio[1]
-
-    # resize the image
-    resized_img = image.resize((target_width, target_height))
-    processed_images = []
-    for i in range(blocks):
-        box = (
-            (i % (target_width // image_size)) * image_size,
-            (i // (target_width // image_size)) * image_size,
-            ((i % (target_width // image_size)) + 1) * image_size,
-            ((i // (target_width // image_size)) + 1) * image_size
-        )
-        # split the image
-        split_img = resized_img.crop(box)
-        processed_images.append(split_img)
-    assert len(processed_images) == blocks
-    if use_thumbnail and len(processed_images) != 1:
-        thumbnail_img = image.resize((image_size, image_size))
-        processed_images.append(thumbnail_img)
-    return processed_images, target_width, target_height
-
-def load_image(image, input_size=448, max_num=12):
-    # image = Image.open(image_file).convert('RGB')
-    # image = image.convert('RGB')
-    transform = build_transform(input_size=input_size)
-    images, target_width, target_height = dynamic_preprocess(image, image_size=input_size, use_thumbnail=True, max_num=max_num)
-    pixel_values = [transform(image) for image in images]
-    pixel_values = torch.stack(pixel_values)
-    return pixel_values, target_width, target_height
-
+from transformers.models.qwen2_vl.image_processing_qwen2_vl_fast import smart_resize
 
 #! ==============================================================================================
+
 class NpEncoder(json.JSONEncoder):
     def default(self, obj):
         if isinstance(obj, np.integer):
@@ -209,36 +133,7 @@ class NpEncoder(json.JSONEncoder):
             return bool(obj)
         return super(NpEncoder, self).default(obj)
 
-
-_SCREENSPOT_SYSTEM = "Based on the screenshot of the page, I give a text description and you give its corresponding location."
-_SYSTEM_point = "The coordinate represents a clickable location [x, y] for an element, which is a relative coordinate on the screenshot, scaled from 0 to 1."
-_SYSTEM_point_int = "The coordinate represents a clickable location [x, y] for an element, which is a relative coordinate on the screenshot, scaled from 1 to 1000."
-
-_SCREENSPOT_USER = '<|image_1|>{system}{element}'
-
-def screenspot_to_qwen(element_name, image, xy_int=True):
-    transformed_data = []
-    user_content = []
-
-    if xy_int:
-        system_prompt = _SCREENSPOT_SYSTEM + ' ' + _SYSTEM_point_int
-    else:
-        system_prompt = _SCREENSPOT_SYSTEM + ' ' + _SYSTEM_point
-
-    '{system}<|image_1|>{element}'
-    user_content.append({"type": "text", "text": system_prompt})
-    user_content.append({"type": "image", "image": image})
-    
-    user_content.append({"type": "text",  "text": element_name})
-
-    # question = _SCREENSPOT_USER.format(system=_SCREENSPOT_SYSTEM, element=element_name)
-    transformed_data.append(
-                {
-                    "role": "user",
-                    "content": user_content,
-                },
-            )
-    return transformed_data
+_SYSTEM = "Based on the screenshot of the page, I give a text description and you give its corresponding location. The coordinate represents a clickable location [x, y] for an element."
 
 
 def warm_up_model(model, processor, device):
@@ -365,26 +260,55 @@ def create_conversation(image, instruction, resize_ratio=1.0):
     ]
     return conversation
 
-def inference(image, instruction):
+def inference(converstaion):
+    text = processor.apply_chat_template(
+        converstaion, tokenize=False, add_generation_prompt=True
+    )
+    image_inputs, video_inputs = process_vision_info(converstaion)
 
-        # set the max number of tiles in `max_num`
-    pixel_values, target_width, target_height = load_image(image=image, max_num=16)
-    pixel_values = pixel_values.to(torch.bfloat16).cuda()
-    generation_config = dict(max_new_tokens=1024, do_sample=False)
-    
-    question = (f"In the screenshot of this {task} screen,"
-                "please give me the coordinates of the element I want to click on"
-                f"according to my instructions(with point).\n\"{instruction} link\"")
-    
-    response, history = model.chat(tokenizer, pixel_values, question, generation_config, history=None, return_history=True)
-    print(f'User: {question}\nAssistant: {response}')
-    return response, target_width, target_height
+    inputs = processor(
+        text=text,
+        images=image_inputs,
+        videos=video_inputs,
+        padding=True,
+        return_tensors="pt",
+    )
+
+    inputs = inputs.to(model.device)
+
+    generated_ids = model.generate(**inputs, max_new_tokens=128, do_sample=False)
+    generated_ids_trimmed = [
+        out_ids[len(in_ids) :] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
+    ]
+    response = processor.batch_decode(
+        generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
+    )
+
+    return response
 
 
 def run_model(image, instruction):
     # conversation = create_conversation(image=image, instruction=instruction)
-    # conversation = screenspot_to_qwen(element_name=instruction, image=image)
-    response, target_width, target_height = inference(image=image, instruction=instruction)
+    
+    # conversation = screenspot_to_qwen(element_name=instruction, image=image) # 메세지 생성
+
+    _SYSTEM = "Based on the screenshot of the page, I give a text description and you give its corresponding location. The coordinate represents a clickable location [x, y] for an element."
+
+    conversation = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": _SYSTEM},
+                {"type": "image", "image": image, "min_pixels": MIN_PIXELS, "max_pixels": MAX_PIXELS},
+                {"type": "text", "text": instruction}
+            ],
+        }
+    ]
+
+
+
+
+    response = inference(conversation)
     print(response)
     print(type(response))
     if isinstance(response, list):
@@ -395,7 +319,7 @@ def run_model(image, instruction):
         print(coord)
 
         orig_w, orig_h = image.size
-        norm_coord = normalize_point(denorm_point=coord, orig_w=1000, orig_h=1000)
+        norm_coord = normalize_point(denorm_point=coord, orig_w=orig_w, orig_h=orig_h)
         denorm_coord = denormalize_point(norm_point=norm_coord, orig_w=orig_w, orig_h=orig_h)
     except:
         norm_coord = None
@@ -408,7 +332,7 @@ def run_model(image, instruction):
     print(norm_coord)
     # print(denorm_coord)
 
-    return pred, target_width, target_height
+    return pred
 
 
 def point_in_bbox(point, bbox):
@@ -425,34 +349,31 @@ if __name__ == '__main__':
 
 
     device_map = "mps" if args.mac else "auto"
-    # model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-    #     MLLM_PATH,
-    #     torch_dtype="auto",
-    #     attn_implementation=ATTN_IMPL,
-    #     device_map=device_map,
-    #     low_cpu_mem_usage=True,
-    # )
-    # path = 'OS-Copilot/OS-Atlas-Base-4B'
-    model = AutoModel.from_pretrained(
+    model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
         MLLM_PATH,
-        torch_dtype=torch.bfloat16,
+        torch_dtype="auto",
         attn_implementation=ATTN_IMPL,
         device_map=device_map,
         low_cpu_mem_usage=True,
-        trust_remote_code=True,
     )
-    
-    model.eval()
+    tokenizer = AutoTokenizer.from_pretrained(MLLM_PATH)
+    processor = AutoProcessor.from_pretrained(MLLM_PATH)
 
-    tokenizer = AutoTokenizer.from_pretrained(MLLM_PATH, trust_remote_code=True, use_fast=False)
-    processor = AutoProcessor.from_pretrained(MLLM_PATH, max_pixels=MAX_PIXELS, trust_remote_code=True)
+
+
+    generation_config = GenerationConfig.from_pretrained("zonghanHZH/ZonUI-3B", trust_remote_code=True)
+    generation_config.max_length = 4096
+    generation_config.do_sample = False
+    generation_config.temperature = 0.0
+    model.generation_config = generation_config
+
     
     if TFOPS_PROFILING:
         prof = FlopsProfiler(model)
 
     # warm_up_model(model, tokenizer, processor)
     device = "mps" if args.mac else "cuda" if torch.cuda.is_available() else "cpu"
-    # warm_up_model(model, processor, device)
+    warm_up_model(model, processor, device)
 
     if TFOPS_PROFILING:
         prof.start_profile()
@@ -541,7 +462,26 @@ if __name__ == '__main__':
             if not os.path.exists(img_path):
                 continue
 
+
+            ### 이미지 불러오고 리사이즈 까지
             original_image = Image.open(img_path).convert("RGB")
+
+            resized_height, resized_width = smart_resize(
+                original_image.height,
+                original_image.width,
+                factor=processor.image_processor.patch_size * processor.image_processor.merge_size,
+                min_pixels=MIN_PIXELS,
+                max_pixels=MAX_PIXELS,
+            )
+            resized_image = original_image.resize((resized_width, resized_height))
+            ##########
+
+
+
+
+
+
+
             instruction = item["instruction"]
             original_bbox = item["bbox"]
             original_bbox = [original_bbox[0], original_bbox[1], 
@@ -580,7 +520,51 @@ if __name__ == '__main__':
             # s1_pred, s1_crop_list, num_crops, resized_image, scaled_gt_bbox 
             # inference
 
-            s1_pred, target_width, target_height = run_model(image=original_image, instruction=instruction)
+            s1_pred = run_model(image=resized_image , instruction=instruction)
+
+
+
+            #             # Process input
+            # text = processor.apply_chat_template(
+            #     messages, tokenize=False, add_generation_prompt=True,
+            # )
+
+            # inputs = processor(
+            #     text=[text],
+            #     images=[resized_image],
+            #     return_tensors="pt",
+            #     training=False
+            # ).to("cuda")
+
+            # # Generate prediction
+            # generated_ids = model.generate(**inputs)
+            # generated_ids_trimmed = [
+            #     out_ids[len(in_ids) :] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
+            # ]
+            # output_text = processor.batch_decode(
+            #     generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
+            # )[0].strip()
+
+            # # print(f"Raw output: {output_text}")
+
+            # # Parse coordinates
+            # try:
+            #     coordinates = ast.literal_eval(output_text)
+            #     if len(coordinates) == 2:
+            #         click_xy = [coord / resized_width if i == 0 else coord / resized_height 
+            #                 for i, coord in enumerate(coordinates)]
+            #     else:
+            #         raise ValueError("Unexpected coordinate format")
+            #     absolute_x = click_xy[0] * image.width
+            #     absolute_y = click_xy[1] * image.height
+                
+            #     print(f"Normalized coordinates: {click_xy}")
+            #     print(f"Predicted text: {absolute_x}, {absolute_y}")
+
+            # except Exception as e:
+            #     print(f"Error parsing coordinates: {e}")
+
+
             
 
             s1_end = time.time()
@@ -596,22 +580,13 @@ if __name__ == '__main__':
                 # s1_predicted_point = s1_pred["topk_points"][0]  # 정규화된 좌표 (0~1)
                 s1_predicted_point = s1_pred["top_point"]  # 정규화된 좌표 (0~1)
                 # 정규화된 좌표를 원본 이미지 픽셀 좌표로 변환
-                # s1_original_point = [
-                #     s1_predicted_point[0] * original_image.size[0],
-                #     s1_predicted_point[1] * original_image.size[1]
-                # ]
-                # print(s1_original_point)
-                # print(original_bbox)
-                # s1_success = point_in_bbox(s1_original_point, original_bbox)
-                x1, y1, x2, y2 = original_bbox
-
-                norm_x1, norm_y1, norm_x2, norm_y2 = x1 / orig_w, y1 / orig_h, x2 / orig_w, y2 / orig_h
-                norm_bbox = [norm_x1, norm_y1, norm_x2, norm_y2]
-
-                print("check")
-                print(norm_bbox)
-                print(s1_predicted_point)
-                s1_success = point_in_bbox(s1_predicted_point, norm_bbox)
+                s1_original_point = [
+                    s1_predicted_point[0] * original_image.size[0],
+                    s1_predicted_point[1] * original_image.size[1]
+                ]
+                print(s1_original_point)
+                print(original_bbox)
+                s1_success = point_in_bbox(s1_original_point, original_bbox)
             
             s1_hit = "✅" if s1_success else "❌"
             if s1_success:

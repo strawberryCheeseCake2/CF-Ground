@@ -41,8 +41,8 @@ MIN_PATCHES = 1                         # 최소 패치 수 (너무 작은 영�
 BBOX_PADDING = args.p                   # bbox 상하좌우로 확장할 픽셀  # TODO: 0 ~ 50 중 최적 찾기
 
 # Ensemble Hyperparameters
-STAGE1_ENSEMBLE_RATIO = 0.50                        # Stage1 attention 가중치
-STAGE2_ENSEMBLE_RATIO = 1 - STAGE1_ENSEMBLE_RATIO   # Stage2 crop 가중치
+STAGE1_ENSEMBLE_RATIO = 0.50                        # Stage1 attention weight
+STAGE2_ENSEMBLE_RATIO = 1 - STAGE1_ENSEMBLE_RATIO   # Stage2 crop weight
 ENSEMBLE_TOP_PATCHES = 100                          # Stage2에서 앙상블에 사용할 상위 패치 개수 (Qwen2.5VL용)
 
 # 최대 PIXELS 제한
@@ -183,9 +183,9 @@ def create_conversation_stage1(image, instruction, resize_ratio):
                 {
                     "type": "text",
                     "text": (
-                        # 추가 content
+                        # Additional prompt
                         f"This is a resized screenshot of the whole GUI, scaled by {resize_ratio}. "
-                        # 기존 content
+                        # previous prompt
                         "You are a GUI agent. Given a screenshot of the current GUI and a human instruction, "
                         "your task is to locate the screen element that corresponds to the instruction. "
                         "You should output a PyAutoGUI action that performs a click on the correct position. "
@@ -226,9 +226,9 @@ def create_conversation_stage2(crop_list, instruction):
                 {
                     "type": "text",
                     "text": (
-                        # 추가 content
+                        # Additional prompt
                         f"This is a list of {len(crop_list)} cropped screenshots of the GUI, each showing a part of the GUI. "
-                        # 기존 content
+                        # previous prompt
                         "You are a GUI agent. Given a screenshot of the current GUI and a human instruction, "
                         "your task is to locate the screen element that corresponds to the instruction. "
                         "You should output a PyAutoGUI action that performs a click on the correct position. "
@@ -297,7 +297,7 @@ def get_connected_region_bboxes_from_scores(
     visited = np.zeros_like(mask, dtype=bool)
     regions = []
     neighbors = [(di, dj) for di in (-1,0,1) for dj in (-1,0,1) if not (di==0 and dj==0)]  # 8방향
-    # neighbors =   # TODO: 4방향 비교
+    # neighbors = [(-1,0), (1,0), (0,-1), (0,1)]  # 4 neighbors Ablation
     
     for y in range(n_h):
         for x in range(n_w):
@@ -455,14 +455,14 @@ def create_crops_from_connected_regions(regions, original_image):
     return crops
 
 def run_stage2_multi_image_inference(crop_list, instruction):
-    """Stage 2: multi image inference - 각 crop별로 개별 inference"""
+    """Stage 2: multi image inference"""
 
 
     
     # multi image inference용 대화 생성
     conversation = create_conversation_stage2(crop_list, instruction)
     
-    # multi image inference 실행 (각 이미지별 결과 반환)
+    # multi image inference
     pred = multi_image_inference(conversation, model, tokenizer, processor, use_placeholder=True, topk=10)
     
     return pred

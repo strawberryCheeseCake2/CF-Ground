@@ -32,8 +32,8 @@ MIN_PATCHES = 1                         # Minimum number of patches (remove too 
 BBOX_PADDING = args.p                   # Pixels to expand bbox in all directions
 
 # Ensemble Hyperparameters
-STAGE1_ENSEMBLE_RATIO = args.e                      # Stage1 attention 가중치
-STAGE2_ENSEMBLE_RATIO = 1 - STAGE1_ENSEMBLE_RATIO   # Stage2 crop 가중치
+STAGE1_ENSEMBLE_RATIO = args.e                      # Stage1 attention weight
+STAGE2_ENSEMBLE_RATIO = 1 - STAGE1_ENSEMBLE_RATIO   # Stage2 crop weight
 
 # Maximum PIXELS limit (applied at Process level)
 MAX_PIXELS = 3211264
@@ -43,7 +43,7 @@ MAX_PIXELS = 3211264
 model_name = "gui-actor-3B+GOLD"
 experiment = "visualize"
 parameter = f"resize{RESIZE_RATIO:.2f}_maxpixel{MAX_PIXELS}_ensemble{STAGE1_ENSEMBLE_RATIO:.2f}"
-SAVE_DIR = f"../../attn_output/" + f"{model_name}/" + f"{experiment}/" + parameter
+SAVE_DIR = f"../attn_output/" + f"{model_name}/" + f"{experiment}/" + parameter
 
 #! Argument ==========================================================================================
 
@@ -51,8 +51,8 @@ SEED = 0
 
 # Dataset & Model
 MLLM_PATH = "microsoft/GUI-Actor-3B-Qwen2.5-VL"
-SCREENSPOT_IMGS = "../../data/screenspotv2_image"
-SCREENSPOT_JSON = "../../data"
+SCREENSPOT_IMGS = "../data/screenspotv2_image"
+SCREENSPOT_JSON = "../data"
 TASKS = ["mobile", "web", "desktop"]
 SAMPLE_RANGE = slice(None)
 
@@ -218,17 +218,6 @@ def calculate_iou_with_union_of_boxes(gt_box, pred_boxes):
     union_area = np.sum(union_mask)
     iou = intersection_area / union_area if union_area > 0 else 0.0
     return iou
-
-
-
-
-
-
-
-
-
-
-
 
 def _find_vision_spans(input_ids_1d, processor):
     vs = processor.tokenizer.convert_tokens_to_ids("<|vision_start|>")
@@ -447,9 +436,9 @@ def create_conversation_stage1(image, instruction, resize_ratio):
                 {
                     "type": "text",
                     "text": (
-                        # 추가 content
+                        # Additional prompt
                         f"This is a resized screenshot of the whole GUI, scaled by {resize_ratio}. "
-                        # 기존 content
+                        # previous prompt
                         "You are a GUI agent. Given a screenshot of the current GUI and a human instruction, "
                         "your task is to locate the screen element that corresponds to the instruction. "
                         
@@ -492,9 +481,9 @@ def create_conversation_stage2(crop_list, instruction):
                 {
                     "type": "text",
                     "text": (
-                        # 추가 content
+                        # Additional prompt
                         f"This is a list of {len(crop_list)} cropped screenshots of the GUI, each showing a part of the GUI. "
-                        # 기존 content
+                        # previous prompt
                         "You are a GUI agent. Given a screenshot of the current GUI and a human instruction, "
                         "your task is to locate the screen element that corresponds to the instruction. "
                         "You should output a PyAutoGUI action that performs a click on the correct position. "
@@ -535,7 +524,7 @@ def get_connected_region_bboxes_from_scores(
     visited = np.zeros_like(mask, dtype=bool)
     regions = []
     neighbors = [(di, dj) for di in (-1,0,1) for dj in (-1,0,1) if not (di==0 and dj==0)]  # 8방향
-    # neighbors =   # TODO: 4방향 비교
+    # neighbors = [(-1,0), (1,0), (0,-1), (0,1)]  # 4 neighbors Ablation
     
     for y in range(n_h):
         for x in range(n_w):
@@ -700,12 +689,12 @@ def create_crops_from_connected_regions(regions, original_image):
     return crops
 
 def run_stage2_multi_image_inference(crop_list, instruction, vis_dir=None):
-    """Stage 2: multi image inference - 각 crop별로 개별 inference"""
+    """Stage 2: multi image inference"""
     
     # multi image inference용 대화 생성
     conversation = create_conversation_stage2(crop_list, instruction)
     
-    # multi image inference 실행 (각 이미지별 결과 반환)
+    # multi image inference
     # pred = multi_image_inference(conversation, model, tokenizer, processor, use_placeholder=True, topk=10)
     
 
@@ -1410,7 +1399,7 @@ if __name__ == '__main__':
             json.dump(data_source_metrics, dsf, ensure_ascii=False, indent=4)
 
         # 전체 결과를 CSV 파일에 한 줄 추가
-        results_csv_path = "../../_results"
+        results_csv_path = "../_results"
         os.makedirs(results_csv_path, exist_ok=True)
         csv_file_path = os.path.join(results_csv_path, f"results_{task}.csv")
         
@@ -1516,7 +1505,7 @@ if __name__ == '__main__':
     print(f"Total avg All Stage TFLOPS: {avg_total_tflops:.4f}")
     
     # 전체 결과를 CSV로 저장
-    cumulative_csv_path = os.path.join("../../_results", "results_all.csv")
+    cumulative_csv_path = os.path.join("../_results", "results_all.csv")
     
     # 전체 결과 CSV 행 생성
     cumulative_csv_row = [

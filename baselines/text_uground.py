@@ -36,8 +36,8 @@ MIN_PATCHES = 1                         # 최소 패치 수 (너무 작은 영�
 BBOX_PADDING = args.p                   # bbox 상하좌우로 확장할 픽셀  # TODO: 0 ~ 50 중 최적 찾기
 
 # Ensemble Hyperparameters
-STAGE1_ENSEMBLE_RATIO = 0.50                        # Stage1 attention 가중치
-STAGE2_ENSEMBLE_RATIO = 1 - STAGE1_ENSEMBLE_RATIO   # Stage2 crop 가중치
+STAGE1_ENSEMBLE_RATIO = 0.50                        # Stage1 attention weight
+STAGE2_ENSEMBLE_RATIO = 1 - STAGE1_ENSEMBLE_RATIO   # Stage2 crop weight
 ENSEMBLE_TOP_PATCHES = 100                          # Stage2에서 앙상블에 사용할 상위 패치 개수 (Qwen2.5VL용)
 
 # 최대 PIXELS 제한
@@ -56,8 +56,8 @@ SEED = 0
 # Dataset & Model
 MLLM_PATH = "osunlp/UGround-V1-2B"
 # MLLM_PATH = "ByteDance-Seed/UI-TARS-2B-SFT"
-SCREENSPOT_IMGS = "../../data/screenspotv2_image"       # input image 경로
-SCREENSPOT_JSON = "../../data"                          # input image json파일 경로
+SCREENSPOT_IMGS = "../data/screenspotv2_image"       # input image 경로
+SCREENSPOT_JSON = "../data"                          # input image json파일 경로
 TASKS = ["mobile", "web", "desktop"]
 SAMPLE_RANGE = slice(None)
 # SAMPLE_RANGE = slice(0, 10)
@@ -72,7 +72,7 @@ STAGE1_VIS = False
 STAGE2_VIS = False
 
 # Save Path
-SAVE_DIR = f"../../attn_output/" + method + "/" + memo
+SAVE_DIR = f"../attn_output/" + method + "/" + memo
 
 #! ==================================================================================================
 
@@ -109,7 +109,6 @@ from util.iter_logger import init_iter_logger, append_iter_log  # log csv 기록
 # Qwen2.5-VL base classes (Transformers)
 # from transformers import Qwen2_5_VLForConditionalGeneration
 from transformers import Qwen2VLForConditionalGeneration
-from vllm import LLM, SamplingParams
 from qwen_vl_utils import process_vision_info
 
 import matplotlib.pyplot as plt

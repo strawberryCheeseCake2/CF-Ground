@@ -8,6 +8,87 @@ from copy import deepcopy
 
 
 
+def draw_patch_grid(image: Image.Image, n_width: int, n_height: int, grid_color='white', grid_width=1) -> Image.Image:
+    """
+    이미지 위에 patch 크기만큼 격자를 그려서 반환합니다.
+    
+    Args:
+        image (Image.Image): 원본 PIL 이미지.
+        n_width (int): 가로 방향 패치 개수.
+        n_height (int): 세로 방향 패치 개수.
+        grid_color (str): 격자 색상.
+        grid_width (int): 격자 선 두께.
+    
+    Returns:
+        Image.Image: 격자가 그려진 PIL 이미지.
+    """
+    img_with_grid = image.copy()
+    draw = ImageDraw.Draw(img_with_grid)
+    
+    w, h = image.size
+    
+    # 각 패치의 크기 계산
+    patch_w = w / n_width
+    patch_h = h / n_height
+    
+    # 세로 격자선 그리기
+    for i in range(1, n_width):
+        x = int(i * patch_w)
+        draw.line([(x, 0), (x, h)], fill=grid_color, width=grid_width)
+    
+    # 가로 격자선 그리기
+    for i in range(1, n_height):
+        y = int(i * patch_h)
+        draw.line([(0, y), (w, y)], fill=grid_color, width=grid_width)
+    
+    return img_with_grid
+
+
+def get_attn_map_with_grid(image: Image.Image, attn_scores: list, n_width: int, n_height: int, show_grid=True, grid_color='white', grid_width=1) -> Image.Image:
+    """
+    주어진 이미지 위에 어텐션 스코어로 히트맵을 생성하고 격자를 추가하여 겹칩니다.
+
+    Args:
+        image (Image.Image): 원본 PIL 이미지.
+        attn_scores (list): 1차원으로 펼쳐진 어텐션 스코어 리스트.
+        n_width (int): 어텐션 맵의 너비 (패치 개수).
+        n_height (int): 어텐션 맵의 높이 (패치 개수).
+        show_grid (bool): 격자를 표시할지 여부.
+        grid_color (str): 격자 색상.
+        grid_width (int): 격자 선 두께.
+
+    Returns:
+        Image.Image: 히트맵과 격자가 겹쳐진 PIL 이미지.
+    """
+    w, h = image.size
+    # 1차원 스코어를 2차원 배열로 변환
+    scores = np.array(attn_scores).reshape(n_height, n_width)
+
+    # 스코어를 0~1 사이로 정규화
+    min_val, max_val = scores.min(), scores.max()
+    denom = (max_val - min_val) if (max_val - min_val) != 0 else 1.0
+    scores_norm = (scores - min_val) / denom
+
+    # 정규화된 스코어를 원본 이미지 크기에 맞게 리사이즈하여 흑백 맵 생성
+    score_map = Image.fromarray((scores_norm * 255).astype(np.uint8)).resize(
+        (w, h), resample=Image.NEAREST
+    )
+    
+    # Matplotlib의 'jet' 컬러맵을 사용하여 흑백 맵을 컬러 히트맵으로 변환
+    colormap = plt.get_cmap('jet')
+    colored_score_map_array = colormap(np.array(score_map) / 255.0)[:, :, :3]
+    colored_overlay = Image.fromarray((colored_score_map_array * 255).astype(np.uint8))
+    
+    # 원본 이미지와 히트맵을 투명도(alpha)를 조절하여 합성
+    blended_image = Image.blend(image.convert('RGB'), colored_overlay, alpha=0.4)
+    
+    # 격자 추가
+    if show_grid:
+        blended_image = draw_patch_grid(blended_image, n_width, n_height, grid_color, grid_width)
+    
+    return blended_image
+
+
 @torch.inference_mode()
 def get_attn_map(image: Image.Image, attn_scores: list, n_width: int, n_height: int) -> Image.Image:
     """
@@ -54,7 +135,7 @@ def get_attn_map(image: Image.Image, attn_scores: list, n_width: int, n_height: 
 def vis_gt():
     pass
 
-def visualize_stage1_attention_crops(s1_pred, resized_image, crop_list, original_image, save_dir, instruction, gt_bbox=None, s1_predicted_point=None):
+def visualize_stage1_attention_crops(s1_pred, resized_image, crop_list, original_image, save_dir, instruction, gt_bbox=None, s1_predicted_point=None, show_grid=True):
     """Stage 1 attention 맵과 생성된 crop들을 시각화"""
     
     print(save_dir)
@@ -64,6 +145,13 @@ def visualize_stage1_attention_crops(s1_pred, resized_image, crop_list, original
     original_image.save(f"{save_dir}/origianl.png")
     resized.save(f"{save_dir}/resized.png")
     gt_vis_img = deepcopy(resized_image)
+    
+    # 격자만 있는 이미지 저장
+    if show_grid and 'attn_scores' in s1_pred and s1_pred['attn_scores']:
+        n_width = s1_pred['n_width']
+        n_height = s1_pred['n_height']
+        grid_only_img = draw_patch_grid(resized, n_width, n_height, grid_color='red', grid_width=2)
+        grid_only_img.save(f"{save_dir}/s1_grid_only.png")
 
     # 1. Attention 맵 생성
     if 'attn_scores' in s1_pred and s1_pred['attn_scores']:
@@ -71,12 +159,15 @@ def visualize_stage1_attention_crops(s1_pred, resized_image, crop_list, original
         n_width = s1_pred['n_width']
         n_height = s1_pred['n_height']
         
-        # 리사이즈된 이미지에 attention 맵 오버레이
-        blended_img = get_attn_map(
+        # 리사이즈된 이미지에 attention 맵과 격자 오버레이
+        blended_img = get_attn_map_with_grid(
             image=resized,
             attn_scores=attn_scores,
             n_width=n_width,
-            n_height=n_height
+            n_height=n_height,
+            show_grid=show_grid,
+            grid_color='white',
+            grid_width=1
         )
         
         # 리사이즈 비율 계산

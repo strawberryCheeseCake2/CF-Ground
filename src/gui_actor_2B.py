@@ -32,8 +32,8 @@ MIN_PATCHES = 1                         # Minimum number of patches (remove too 
 BBOX_PADDING = args.p                   # Pixels to expand bbox in all directions
 
 # Ensemble Hyperparameters
-STAGE1_ENSEMBLE_RATIO = args.e                      # Stage1 attention 가중치
-STAGE2_ENSEMBLE_RATIO = 1 - STAGE1_ENSEMBLE_RATIO   # Stage2 crop 가중치
+STAGE1_ENSEMBLE_RATIO = args.e                      # Stage1 attention weight
+STAGE2_ENSEMBLE_RATIO = 1 - STAGE1_ENSEMBLE_RATIO   # Stage2 crop weight
 
 # Maximum PIXELS limit (applied at Process level)
 MAX_PIXELS = 3211264
@@ -41,7 +41,7 @@ MAX_PIXELS = 3211264
 
 # Experiment name to record in csv
 model_name = "gui-actor-2B+GOLD"
-experiment = "visualize"
+experiment = "resize_ratio"
 parameter = f"resize{RESIZE_RATIO:.2f}_maxpixel{MAX_PIXELS}_ensemble{STAGE1_ENSEMBLE_RATIO:.2f}"
 SAVE_DIR = f"../attn_output/" + f"{model_name}/" + f"{experiment}/" + parameter
 
@@ -125,14 +125,10 @@ def create_conversation_stage1(image, instruction, resize_ratio):
                 {
                     "type": "text",
                     "text": (
-                        # 추가 content
+                        # Additional prompt
                         f"This is a resized screenshot of the whole GUI, scaled by {resize_ratio}. "
-                        # 기존 content
-                        "You are a GUI agent. Given a screenshot of the current GUI and a human instruction, "
-                        "your task is to locate the screen element that corresponds to the instruction. "
-                        "You should output a PyAutoGUI action that performs a click on the correct position. "
-                        "To indicate the click location, we will use some special tokens, which is used to refer to a visual patch later. "
-                        "For example, you can output: pyautogui.click(<your_special_token_here>)."
+                        # previous prompt
+                        "You are a GUI agent. You are given a task and a screenshot of the screen. You need to perform a series of pyautogui actions to complete the task."
                     ),
                 }
             ]
@@ -168,14 +164,15 @@ def create_conversation_stage2(crop_list, instruction):
                 {
                     "type": "text",
                     "text": (
-                        # 추가 content
+                        # Additional prompt
                         f"This is a list of {len(crop_list)} cropped screenshots of the GUI, each showing a part of the GUI. "
-                        # 기존 content
-                        "You are a GUI agent. Given a screenshot of the current GUI and a human instruction, "
-                        "your task is to locate the screen element that corresponds to the instruction. "
-                        "You should output a PyAutoGUI action that performs a click on the correct position. "
-                        "To indicate the click location, we will use some special tokens, which is used to refer to a visual patch later. "
-                        "For example, you can output: pyautogui.click(<your_special_token_here>)."
+                        # previous prompt
+                        "You are a GUI agent. You are given a task and a screenshot of the screen. You need to perform a series of pyautogui actions to complete the task."
+                        # "You are a GUI agent. Given a screenshot of the current GUI and a human instruction, "
+                        # "your task is to locate the screen element that corresponds to the instruction. "
+                        # "You should output a PyAutoGUI action that performs a click on the correct position. "
+                        # "To indicate the click location, we will use some special tokens, which is used to refer to a visual patch later. "
+                        # "For example, you can output: pyautogui.click(<your_special_token_here>)."
                     ),
                 }
             ]
@@ -208,7 +205,7 @@ def get_connected_region_bboxes_from_scores(
     visited = np.zeros_like(mask, dtype=bool)
     regions = []
     neighbors = [(di, dj) for di in (-1,0,1) for dj in (-1,0,1) if not (di==0 and dj==0)]  # 8 directions
-    # neighbors = [(-1,0), (1,0), (0,-1), (0,1)]  # TODO: 4 neighbors
+    # neighbors = [(-1,0), (1,0), (0,-1), (0,1)]  # 4 neighbors Ablation
 
     for y in range(n_h):
         for x in range(n_w):
@@ -407,12 +404,10 @@ def create_crops_from_connected_regions(regions, original_image):
     return crops
 
 def run_stage2_multi_image_inference(crop_list, instruction):
-    """Stage 2: multi image inference - 각 crop별로 개별 inference"""
-    
-    # multi image inference용 대화 생성
+    """Stage 2: multi image inference"""
     conversation = create_conversation_stage2(crop_list, instruction)
     
-    # multi image inference 실행 (각 이미지별 결과 반환)
+    # multi image inference
     pred = multi_image_inference(conversation, model, tokenizer, processor, use_placeholder=True, topk=10)
     
     return pred
@@ -1052,7 +1047,7 @@ if __name__ == '__main__':
         # Add one line with overall results to CSV file
         results_csv_path = "../_results"
         os.makedirs(results_csv_path, exist_ok=True)
-        csv_file_path = os.path.join(results_csv_path, f"res_{task}.csv")
+        csv_file_path = os.path.join(results_csv_path, f"result_{task}.csv")
         
         # Generate CSV data row
         import datetime
@@ -1150,7 +1145,7 @@ if __name__ == '__main__':
     print(f"Total avg All Stage TFLOPS: {avg_total_tflops:.4f}")
     
     # Save overall results to CSV
-    cumulative_csv_path = os.path.join("../_results", "res_all.csv")
+    cumulative_csv_path = os.path.join("../_results", "result_all.csv")
     
     # Generate overall results CSV row
     cumulative_csv_row = [
@@ -1170,8 +1165,7 @@ if __name__ == '__main__':
         round(avg_total_tflops, 2),
         datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     ]
-    
-    # CSV 파일이 없으면 헤더와 함께 생성, 있으면 데이터 행만 추가
+
     file_exists = os.path.exists(cumulative_csv_path)
     
     with open(cumulative_csv_path, 'a', newline='', encoding='utf-8') as csvfile:

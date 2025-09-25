@@ -1,6 +1,0 @@
-model_name,experiment,resize_ratio,region_threshold,bbox_padding,ensemble_ratio,total_samples,crop_accuracy,stage1_accuracy,stage2_accuracy,stage3_accuracy,avg_stage1_time,avg_stage2_time,avg_stage3_time,avg_total_time,avg_stage1_tflops,avg_stage2_tflops,avg_total_tflops,timestamp
-gui-actor-2B+GOLD,visualize,0.5,0.12,0,0.7,1272,96.86,83.73,85.69,87.5,0.4964,0.1799,0.0002,0.6765,10.26,1.78,12.04,2025-09-24 01:28:18
-gui-actor-3B+GOLD,visualize,0.5,0.12,0,0.7,1272,97.8,85.3,89.62,91.43,0.716,0.224,0.0002,0.9401,13.58,2.32,15.9,2025-09-24 01:52:08
-gui-actor-3B+GOLD,visualize,0.3,0.12,0,0.7,1272,96.62,72.25,88.36,87.97,0.3363,0.2994,0.0001,0.6358,4.8,3.99,8.79,2025-09-24 02:23:02
-gui-actor-2B+GOLD,visualize,0.3,0.12,0,0.7,1272,96.7,71.23,86.08,85.14,0.2377,0.2241,0.0001,0.4619,3.36,3.13,6.49,2025-09-24 02:56:11
-gui-actor-3B+GOLD,prompt_appendix,0.5,0.12,0,0.7,1272,97.88,85.53,88.99,90.88,0.7202,0.2286,0.0002,0.949,13.46,2.19,15.65,2025-09-24 03:46:23

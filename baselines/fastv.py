@@ -1,13 +1,13 @@
 import os
+import argparse
+
+parser = argparse.ArgumentParser()
+parser.add_argument('gpu', type=int, default=0, help='GPU number')
+parser.add_argument('--r', type=float, default=0.7, help='FastV Ratio')
+args = parser.parse_args()
+
 os.environ["CUDA_DEVICE_ORDER"]="PCI_BUS_ID"
-os.environ["CUDA_VISIBLE_DEVICES"]= "0"  # 몇번 GPU 사용할지 ("0,1", "2" 등)
-device_map = "balanced"
-max_memory = {
-    0: "75GiB",
-    # 1: "75GiB",
-    # 2: "75GiB",
-    "cpu": "120GiB",  # 남는 건 CPU 오프로딩xs
-}
+os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu)
 
 import torch
 from copy import deepcopy
@@ -52,12 +52,11 @@ set_seed(0)
 MAX_PIXELS = 3211264
 # MAX_PIXELS = 1280 * 28 * 28
 
-SAVE_DIR = "../../output/fastv"
+SAVE_DIR = "../output/fastv"
 CALC_FLOPS = True
 
 # 버리는 비율
-FASTV_R = 0.5
-# FASTV_R = 0.7
+FASTV_R = args.r
 
 PRED_PATH = "{save_dir}/{FASTV_R}/{task}_{max_pixels}_preds.json"
 METRIC_PATH = "{save_dir}/{FASTV_R}/{task}_{max_pixels}_metrics.txt"
@@ -88,43 +87,16 @@ def normalize_bbox(bbox_x1y1x2y2, img_width, img_height):
         x2 = x2 / img_width
         y2 = y2 / img_height
         return x1, y1, x2, y2
-
+#!=================================================================================
 def calc_acc(score_list):
     return sum(score_list) / len(score_list) if len(score_list) != 0 else 0
 
-def evaluate(model_name_or_path, model_type, use_placeholder, topk, task, device_map, max_memory=max_memory):
+def evaluate(model_name_or_path, model_type, use_placeholder, task, prof=None):
     # initialize model
     data_processor = AutoProcessor.from_pretrained(model_name_or_path, max_pixels=MAX_PIXELS)
     tokenizer = data_processor.tokenizer
     for k, v in tokenizer.added_tokens_encoder.items():
         print(v, k)
-
-    if model_type == "qwen2vl":
-        print(f"Loading model with Qwen2-VL backbone from {model_name_or_path}")
-        model = Qwen2VLForConditionalGenerationWithPointer.from_pretrained(
-            model_name_or_path,
-            torch_dtype=torch.bfloat16,
-            device_map=device_map,
-            max_memory=max_memory,
-            attn_implementation="flash_attention_2",
-            do_sample=False
-        ).eval()
-        grounding_system_message = "You are a GUI agent. You are given a task and a screenshot of the screen. You need to perform a series of pyautogui actions to complete the task."
-    elif model_type == "qwen25vl":
-        print(f"Loading model with Qwen2.5-VL backbone from {model_name_or_path}")
-        model = Qwen2_5_VLForConditionalGenerationWithPointer.from_pretrained(
-            model_name_or_path,
-            torch_dtype=torch.bfloat16,
-            # device_map=device_map,
-            device_map="auto",
-            max_memory=max_memory,
-            attn_implementation="eager",  #!
-            do_sample=False
-        ).eval()
-        grounding_system_message = "You are a GUI agent. Given a screenshot of the current GUI and a human instruction, your task is to locate the screen element that corresponds to the instruction. You should output a PyAutoGUI action that performs a click on the correct position. To indicate the click location, we will use some special tokens, which is used to refer to a visual patch later. For example, you can output: pyautogui.click(<your_special_token_here>)."
-    else:
-        raise ValueError(f"Invalid model type: {model_type}")
-    print(f"Loaded model from {model_name_or_path}")
 
     logits_processor_pointer = ForceFollowTokensLogitsProcessor(
         token_a_id=tokenizer.encode(DEFAULT_POINTER_PAD_TOKEN)[0],
@@ -133,9 +105,7 @@ def evaluate(model_name_or_path, model_type, use_placeholder, topk, task, device
         ]
     )
     
-    
-    
-    dataset = json.load(open(os.path.join("../../data", f"screenspot_{task}_v2.json"), 'r'))
+    dataset = json.load(open(os.path.join("../data", f"screenspot_{task}_v2.json"), 'r'))
 
     results = []
 
@@ -146,9 +116,6 @@ def evaluate(model_name_or_path, model_type, use_placeholder, topk, task, device
     correct_predictions = 0  # 정확한 예측 횟수
     total_predictions = 0    # 전체 예측 횟수
     
-    if CALC_FLOPS:
-        prof = FlopsProfiler(model)
-        prof.start_profile()
     tflops_sum = 0.0
 
     for j, example in tqdm(enumerate(dataset)):
@@ -156,7 +123,7 @@ def evaluate(model_name_or_path, model_type, use_placeholder, topk, task, device
         mobile_num += 1
 
         filename = example["img_filename"]
-        img_path = os.path.join("../../data/screenspotv2_image", filename)
+        img_path = os.path.join("../data/screenspotv2_image", filename)
         if not os.path.exists(img_path):
             print("img not found", flush=True)
             input()
@@ -423,17 +390,38 @@ def get_metric(list_of_examples, time_mean, tflops_mean,
 python eval/screenSpot_v2.py --save_path <path_to_save_results>
 """
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--model_type", type=str, default="qwen2vl", choices=["qwen2vl", "qwen25vl"])
-    parser.add_argument("--model_name_or_path", type=str, default="microsoft/GUI-Actor-2B-Qwen2-VL")
-    parser.add_argument("--save_path", type=str, default="../")
-    parser.add_argument('--topk', type=int, default=3, help='Topk')
-    parser.add_argument('--no-placeholder', dest='use_placeholder', action='store_false', help='Disable the placeholder')
-    parser.set_defaults(use_placeholder=True)
+    model_name_or_path = "microsoft/GUI-Actor-3B-Qwen2.5-VL"  # microsoft/GUI-Actor-2B-Qwen2-VL
+    model_type = "qwen25vl"
+    use_placeholder=False # TODO
+    topk = 3
 
-    args = parser.parse_args()
-    args.model_name_or_path = "microsoft/GUI-Actor-3B-Qwen2.5-VL"
-    args.model_type = "qwen25vl"
+    if model_type == "qwen2vl":
+        print(f"Loading model with Qwen2-VL backbone from {model_name_or_path}")
+        model = Qwen2VLForConditionalGenerationWithPointer.from_pretrained(
+            model_name_or_path,
+            torch_dtype="auto",
+            device_map="auto",
+            attn_implementation="eager",
+            do_sample=False
+        ).eval()
+        grounding_system_message = "You are a GUI agent. You are given a task and a screenshot of the screen. You need to perform a series of pyautogui actions to complete the task."
+    elif model_type == "qwen25vl":
+        print(f"Loading model with Qwen2.5-VL backbone from {model_name_or_path}")
+        model = Qwen2_5_VLForConditionalGenerationWithPointer.from_pretrained(
+            model_name_or_path,
+            torch_dtype="auto",
+            device_map="auto",
+            attn_implementation="eager",  #!
+            do_sample=False
+        ).eval()
+        grounding_system_message = "You are a GUI agent. Given a screenshot of the current GUI and a human instruction, your task is to locate the screen element that corresponds to the instruction. You should output a PyAutoGUI action that performs a click on the correct position. To indicate the click location, we will use some special tokens, which is used to refer to a visual patch later. For example, you can output: pyautogui.click(<your_special_token_here>)."
+    else:
+        raise ValueError(f"Invalid model type: {model_type}")
+    print(f"Loaded model from {model_name_or_path}")
+
+    if CALC_FLOPS:
+        prof = FlopsProfiler(model)
+        prof.start_profile()
 
     # 전체 태스크 결과를 저장할 리스트
     all_task_results = []
@@ -449,10 +437,10 @@ if __name__ == "__main__":
         pred_path = PRED_PATH.format(save_dir=SAVE_DIR, FASTV_R=FASTV_R, task=task, max_pixels=MAX_PIXELS)
         metric_path = METRIC_PATH.format(save_dir=SAVE_DIR, FASTV_R=FASTV_R, task=task, max_pixels=MAX_PIXELS)
 
-        print(f"\n🔄 Evaluating {args.model_name_or_path} on {task} task...")
+        print(f"\n🔄 Evaluating {model_name_or_path} on {task} task...")
         results, time_mean, tflops_mean, accuracy, correct_count, total_count = evaluate(
-            args.model_name_or_path, args.model_type, args.use_placeholder, 
-            args.topk, task=task, device_map=device_map
+            model_name_or_path, model_type, use_placeholder, 
+            task=task, prof=prof if CALC_FLOPS else None
         )
         
         # 태스크별 결과 저장

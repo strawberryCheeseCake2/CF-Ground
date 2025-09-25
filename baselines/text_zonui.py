@@ -35,13 +35,14 @@ MIN_PATCHES = 1                         # 최소 패치 수 (너무 작은 영�
 BBOX_PADDING = args.p                   # bbox 상하좌우로 확장할 픽셀  # TODO: 0 ~ 50 중 최적 찾기
 
 # Ensemble Hyperparameters
-STAGE1_ENSEMBLE_RATIO = 0.50                        # Stage1 attention 가중치
-STAGE2_ENSEMBLE_RATIO = 1 - STAGE1_ENSEMBLE_RATIO   # Stage2 crop 가중치
+STAGE1_ENSEMBLE_RATIO = 0.50                        # Stage1 attention weight
+STAGE2_ENSEMBLE_RATIO = 1 - STAGE1_ENSEMBLE_RATIO   # Stage2 crop weight
 ENSEMBLE_TOP_PATCHES = 100                          # Stage2에서 앙상블에 사용할 상위 패치 개수 (Qwen2.5VL용)
 
 # 최대 PIXELS 제한
 MAX_PIXELS = 3211264  # Process단에서 적용
-MAX_PIXELS = 1003520  # Process단에서 적용
+MIN_PIXELS = 256*28*28  # zonui 논문 세팅 그대로
+# MAX_PIXELS = 1003520  # Process단에서 적용
 
 # csv에 기록할 method 이름
 method = "text_zonui"
@@ -55,8 +56,8 @@ SEED = 0
 
 # Dataset & Model
 MLLM_PATH = "zonghanHZH/ZonUI-3B"
-SCREENSPOT_IMGS = "../../data/screenspotv2_image"       # input image 경로
-SCREENSPOT_JSON = "../../data"                          # input image json파일 경로
+SCREENSPOT_IMGS = "../data/screenspotv2_image"       # input image 경로
+SCREENSPOT_JSON = "../data"                          # input image json파일 경로
 TASKS = ["mobile", "web", "desktop"]
 SAMPLE_RANGE = slice(None)
 # SAMPLE_RANGE = slice(0, 10)
@@ -71,7 +72,7 @@ STAGE1_VIS = False
 STAGE2_VIS = False
 
 # Save Path
-SAVE_DIR = f"../../attn_output/" + method + "/" + memo
+SAVE_DIR = f"../attn_output/" + method + "/" + memo
 
 #! ==================================================================================================
 
@@ -129,36 +130,39 @@ class NpEncoder(json.JSONEncoder):
             return bool(obj)
         return super(NpEncoder, self).default(obj)
 
+_SYSTEM = "Based on the screenshot of the page, I give a text description and you give its corresponding location. The coordinate represents a clickable location [x, y] for an element."
 
-_SCREENSPOT_SYSTEM = "Based on the screenshot of the page, I give a text description and you give its corresponding location."
-_SYSTEM_point = "The coordinate represents a clickable location [x, y] for an element, which is a relative coordinate on the screenshot, scaled from 0 to 1."
-_SYSTEM_point_int = "The coordinate represents a clickable location [x, y] for an element, which is a relative coordinate on the screenshot, scaled from 1 to 1000."
 
-_SCREENSPOT_USER = '<|image_1|>{system}{element}'
+# _SCREENSPOT_SYSTEM = "Based on the screenshot of the page, I give a text description and you give its corresponding location."
+# _SYSTEM_point = "The coordinate represents a clickable location [x, y] for an element, which is a relative coordinate on the screenshot, scaled from 0 to 1."
+# _SYSTEM_point_int = "The coordinate represents a clickable location [x, y] for an element, which is a relative coordinate on the screenshot, scaled from 1 to 1000."
 
-def screenspot_to_qwen(element_name, image, xy_int=True):
-    transformed_data = []
-    user_content = []
+# _SCREENSPOT_USER = '<|image_1|>{system}{element}'
 
-    if xy_int:
-        system_prompt = _SCREENSPOT_SYSTEM + ' ' + _SYSTEM_point_int
-    else:
-        system_prompt = _SCREENSPOT_SYSTEM + ' ' + _SYSTEM_point
-
-    '{system}<|image_1|>{element}'
-    user_content.append({"type": "text", "text": system_prompt})
-    user_content.append({"type": "image", "image": image})
+# def screenspot_to_qwen(element_name, image, xy_int=True):
     
-    user_content.append({"type": "text",  "text": element_name})
+#     transformed_data = []
+#     user_content = []
 
-    # question = _SCREENSPOT_USER.format(system=_SCREENSPOT_SYSTEM, element=element_name)
-    transformed_data.append(
-                {
-                    "role": "user",
-                    "content": user_content,
-                },
-            )
-    return transformed_data
+#     if xy_int:
+#         system_prompt = _SCREENSPOT_SYSTEM + ' ' + _SYSTEM_point_int
+#     else:
+#         system_prompt = _SCREENSPOT_SYSTEM + ' ' + _SYSTEM_point
+
+#     '{system}<|image_1|>{element}'
+#     user_content.append({"type": "text", "text": system_prompt})
+#     user_content.append({"type": "image", "image": image})
+    
+#     user_content.append({"type": "text",  "text": element_name})
+
+#     # question = _SCREENSPOT_USER.format(system=_SCREENSPOT_SYSTEM, element=element_name)
+#     transformed_data.append(
+#                 {
+#                     "role": "user",
+#                     "content": user_content,
+#                 },
+#             )
+#     return transformed_data
 
 
 def warm_up_model(model, processor, device):
@@ -254,9 +258,9 @@ def create_conversation(image, instruction, resize_ratio=1.0):
                 {
                     "type": "text",
                     "text": (
-                        # 추가 content
+                        # Additional prompt
                         # f"This is a resized screenshot of the whole GUI, scaled by {resize_ratio}. "
-                        # 기존 content
+                        # previous prompt
                         "You are a GUI agent. Given a screenshot of the current GUI and a human instruction, "
                         "your task is to locate the screen element that corresponds to the instruction. "
                         
@@ -314,7 +318,25 @@ def inference(converstaion):
 
 def run_model(image, instruction):
     # conversation = create_conversation(image=image, instruction=instruction)
-    conversation = screenspot_to_qwen(element_name=instruction, image=image)
+    
+    # conversation = screenspot_to_qwen(element_name=instruction, image=image) # 메세지 생성
+
+    _SYSTEM = "Based on the screenshot of the page, I give a text description and you give its corresponding location. The coordinate represents a clickable location [x, y] for an element."
+
+    conversation = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": _SYSTEM},
+                {"type": "image", "image": image, "min_pixels": MIN_PIXELS, "max_pixels": MAX_PIXELS},
+                {"type": "text", "text": instruction}
+            ],
+        }
+    ]
+
+
+
+
     response = inference(conversation)
     print(response)
     print(type(response))

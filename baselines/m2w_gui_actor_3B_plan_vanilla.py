@@ -158,7 +158,7 @@ def create_conversation_stage1(image, instruction):
                 {
                     "type": "text",
                     "text": (
-                        # 기존 content
+                        # previous prompt
                         "You are a GUI agent. Given a screenshot of the current GUI and a human instruction, "
                         "your task is to locate the screen element that corresponds to the instruction. "
                         "You should output a PyAutoGUI action that performs a click on the correct position. "

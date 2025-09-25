@@ -1,7 +1,15 @@
 import os
+import argparse
+
+parser = argparse.ArgumentParser()
+parser.add_argument('gpu', type=int, default=0, help='GPU number')
+parser.add_argument('--r', type=float, default=1.00, help='Resize ratio')
+parser.add_argument('--max_pixels', type=int, default=3211264, help='Max pixels for the image encoder')
+parser.add_argument('--2b', action='store_true', help='Use 2B model if set, otherwise use 3B model')
+args = parser.parse_args()
+
 os.environ["CUDA_DEVICE_ORDER"]="PCI_BUS_ID"
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"
-device_map = "balanced"
+os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu)
 
 import torch
 
@@ -23,29 +31,25 @@ from gui_actor.modeling_qwen25vl import Qwen2_5_VLForConditionalGenerationWithPo
 from gui_actor.inference import inference, ForceFollowTokensLogitsProcessor
 from gui_actor.utils import do_boxes_overlap
 from gui_actor.constants import DEFAULT_POINTER_PAD_TOKEN, DEFAULT_POINTER_END_TOKEN
-
 from copy import deepcopy
 
-#!=================================================================================
-import numpy as np
 from deepspeed.profiling.flops_profiler import FlopsProfiler
-#!=================================================================================
+
 
 IMAGE_PATCH_SIZE =14
 
-RESIZE_RATIO=0.9
+RESIZE_RATIO=args.r
 
-MAX_PIXELS=3211264
+model_type = "qwen25vl" if not args.__dict__['2b'] else "qwen2vl"
+model_name = "gui-actor-3B" if not args.__dict__['2b'] else "gui-actor-2B"
+MAX_PIXELS=args.max_pixels
 set_seed(0)
-SAVE_DIR = "../../attn_output/vanilla_eval"
+SAVE_DIR = "../attn_output/gui-actor-2B" if model_type == "qwen2vl" else "../attn_output/gui-actor-3B"
 
 PRED_PATH = "{save_dir}/{task}_{resize_ratio}_preds.json"
 METRIC_PATH = "{save_dir}/{task}_{resize_ratio}_metrics.txt"
 
 TASKS = ["mobile", "web", "desktop"]
-# TASKS = ["mobile"]
-# TASKS = ["web"]
-# TASKS = ["desktop"]
 
 #!=================================================================================
 
@@ -64,38 +68,12 @@ def normalize_bbox(bbox_x1y1x2y2, img_width, img_height):
         y2 = y2 / img_height
         return x1, y1, x2, y2
 
-def evaluate(model_name_or_path, model_type, use_placeholder, topk, task, device_map):
+def evaluate(model_name_or_path, use_placeholder, topk, task, prof):
     # initialize model
     data_processor = AutoProcessor.from_pretrained(model_name_or_path, max_pixels=MAX_PIXELS)
     tokenizer = data_processor.tokenizer
     for k, v in tokenizer.added_tokens_encoder.items():
         print(v, k)
-
-    if model_type == "qwen2vl":
-        print(f"Loading model with Qwen2-VL backbone from {model_name_or_path}")
-        model = Qwen2VLForConditionalGenerationWithPointer.from_pretrained(
-            model_name_or_path,
-            torch_dtype=torch.bfloat16,
-            device_map=device_map,
-            attn_implementation="eager",
-            do_sample=False
-        ).eval()
-        grounding_system_message = "You are a GUI agent. You are given a task and a screenshot of the screen. You need to perform a series of pyautogui actions to complete the task."
-    elif model_type == "qwen25vl":
-        print(f"Loading model with Qwen2.5-VL backbone from {model_name_or_path}")
-        model = Qwen2_5_VLForConditionalGenerationWithPointer.from_pretrained(
-            model_name_or_path,
-            # torch_dtype=torch.bfloat16,
-            torch_dtype="auto",
-            # device_map=device_map,
-            device_map="auto",
-            attn_implementation="eager",
-            do_sample=False
-        ).eval()
-        grounding_system_message = "You are a GUI agent. Given a screenshot of the current GUI and a human instruction, your task is to locate the screen element that corresponds to the instruction. You should output a PyAutoGUI action that performs a click on the correct position. To indicate the click location, we will use some special tokens, which is used to refer to a visual patch later. For example, you can output: pyautogui.click(<your_special_token_here>)."
-    else:
-        raise ValueError(f"Invalid model type: {model_type}")
-    print(f"Loaded model from {model_name_or_path}")
 
     logits_processor_pointer = ForceFollowTokensLogitsProcessor(
         token_a_id=tokenizer.encode(DEFAULT_POINTER_PAD_TOKEN)[0],
@@ -104,7 +82,7 @@ def evaluate(model_name_or_path, model_type, use_placeholder, topk, task, device
         ]
     )
 
-    dataset = json.load(open(os.path.join("../../data", f"screenspot_{task}_v2.json"), 'r'))
+    dataset = json.load(open(os.path.join("../data", f"screenspot_{task}_v2.json"), 'r'))
 
     results = []
     score_list = []
@@ -112,18 +90,13 @@ def evaluate(model_name_or_path, model_type, use_placeholder, topk, task, device
     inference_time_sum = 0.0
     iter = 0
     correct_count = 0
-
-    #! =======================================================
-    prof = FlopsProfiler(model)
-    prof.start_profile()
     total_flops = 0.0
-    #! =======================================================
 
     for j, example in tqdm(enumerate(dataset)):
         iter += 1
         
         filename = example["img_filename"]
-        img_path = os.path.join("../../data/screenspotv2_image", filename)
+        img_path = os.path.join("../data/screenspotv2_image", filename)
         if not os.path.exists(img_path):
             print("img not found", flush=True)
             input()
@@ -407,17 +380,37 @@ def get_metric(list_of_examples, time_mean, tflops_mean,
 python eval/screenSpot_v2.py --save_path <path_to_save_results>
 """
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--model_type", type=str, default="qwen2vl", choices=["qwen2vl", "qwen25vl"])
-    parser.add_argument("--model_name_or_path", type=str, default="microsoft/GUI-Actor-2B-Qwen2-VL")
-    parser.add_argument("--save_path", type=str, default="../")
-    parser.add_argument('--topk', type=int, default=3, help='Topk')
-    parser.add_argument('--no-placeholder', dest='use_placeholder', action='store_false', help='Disable the placeholder')
-    parser.set_defaults(use_placeholder=True)
 
-    args = parser.parse_args()
-    args.model_name_or_path = "microsoft/GUI-Actor-3B-Qwen2.5-VL"
-    args.model_type = "qwen25vl"
+    if model_type == "qwen2vl":
+        model_name_or_path = "microsoft/GUI-Actor-2B-Qwen2-VL"
+        print(f"Loading model with Qwen2-VL backbone from {model_name_or_path}")
+        model = Qwen2VLForConditionalGenerationWithPointer.from_pretrained(
+            model_name_or_path,
+            # torch_dtype=torch.bfloat16,
+            torch_dtype="auto",
+            device_map="auto",
+            attn_implementation="eager",
+            do_sample=False
+        ).eval()
+        grounding_system_message = "You are a GUI agent. You are given a task and a screenshot of the screen. You need to perform a series of pyautogui actions to complete the task."
+    elif model_type == "qwen25vl":
+        model_name_or_path = "microsoft/GUI-Actor-3B-Qwen2.5-VL"
+        print(f"Loading model with Qwen2.5-VL backbone from {model_name_or_path}")
+        model = Qwen2_5_VLForConditionalGenerationWithPointer.from_pretrained(
+            model_name_or_path,
+            # torch_dtype=torch.bfloat16,
+            torch_dtype="auto",
+            device_map="auto",
+            attn_implementation="eager",
+            do_sample=False
+        ).eval()
+        grounding_system_message = "You are a GUI agent. Given a screenshot of the current GUI and a human instruction, your task is to locate the screen element that corresponds to the instruction. You should output a PyAutoGUI action that performs a click on the correct position. To indicate the click location, we will use some special tokens, which is used to refer to a visual patch later. For example, you can output: pyautogui.click(<your_special_token_here>)."
+    else:
+        raise ValueError(f"Invalid model type: {model_type}")
+    print(f"Loaded model from {model_name_or_path}")
+
+    prof = FlopsProfiler(model)
+    prof.start_profile()
 
     # 전체 task 통계 변수 초기화
     total_samples = 0
@@ -435,14 +428,14 @@ if __name__ == "__main__":
         metric_path = METRIC_PATH.format(save_dir=SAVE_DIR, task=task, resize_ratio=RESIZE_RATIO)
    
     
-        print(f"Evaluating {args.model_name_or_path}...")
+        print(f"Evaluating {model_name_or_path}...")
         results, time_mean, tflops_mean = evaluate(
-          args.model_name_or_path, 
-          args.model_type, 
-          args.use_placeholder, 
-          args.topk,
-          task=task,
-          device_map=device_map)
+            model_name_or_path, 
+            use_placeholder=False, 
+            topk=3,
+            task=task,
+            prof=prof
+        )
         # with open(pred_path, "w") as f:
         #     json.dump(results, f)
         # print(f"Saved {len(results)} predictions to {pred_path}")
@@ -480,17 +473,18 @@ if __name__ == "__main__":
     print(f"Average TFLOPs: {avg_tflops:.2f}")
     
     # CSV로 저장
-    results_csv_path = "../../_results"
+    results_csv_path = "../_results"
     os.makedirs(results_csv_path, exist_ok=True)
-    csv_file_path = os.path.join(results_csv_path, "results_vanilla_eval.csv")
+    csv_file_path = os.path.join(results_csv_path, "result_vanilla.csv")
     
     # CSV 헤더 정의
     csv_headers = [
-        "resize_ratio", "avg_accuracy", "avg_time", "avg_tflops", "total_samples", "timestamp"
+        "model", "resize_ratio", "avg_accuracy", "avg_time", "avg_tflops", "total_samples", "timestamp"
     ]
     
     # CSV 데이터 행 생성
     csv_row = [
+        model_name,
         RESIZE_RATIO,
         round(avg_accuracy, 2),
         round(avg_time, 4),
